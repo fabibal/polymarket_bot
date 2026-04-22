@@ -1,0 +1,102 @@
+services:
+
+  # ── WireGuard VPN (gluetun) ─────────────────────────────────────────────
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8082:8080"        # polymarket bot dashboard
+      - "6901:3000"        # kasmchrome (chromium remote desktop)
+    volumes:
+      - gluetun_data:/gluetun
+    environment:
+      - VPN_SERVICE_PROVIDER=custom
+      - VPN_TYPE=wireguard
+      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
+      - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY}
+      - WIREGUARD_ENDPOINT_IP=${WIREGUARD_ENDPOINT_IP}
+      - WIREGUARD_ENDPOINT_PORT=51820
+      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ip link show tun0 | grep -q UP"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # ── Copy trading bot ─────────────────────────────────────────────────────
+  bot:
+    build: .
+    container_name: polymarket_bot
+    # Route ALL traffic through the gluetun VPN container
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      # Persisted trade log
+      - ./data:/app/data
+      # Mount bullpen auth config from host (run `bullpen login` on host first)
+      - ${BULLPEN_CONFIG_PATH:-~/.bullpen}:/root/.bullpen:ro
+      # Docker socket (read-only) — used by dashboard to query container CPU/RAM stats
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=450
+      - DRY_RUN=true
+      - PORT=8080
+      - LEADERBOARD_REFRESH_MS=300000   # 5 minutes
+      - POLL_INTERVAL_MS=30000          # 30 seconds
+      - PRICE_UPDATE_INTERVAL_MS=300000 # 5 minutes
+      - AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42  # auto-exclude traders below 42% 7d win rate (RN1 has 44.9% WR but is profitable due to high W/L ratio)
+      - MIN_PRICE=0.65       # skip BUYs below this entry price (raised from 0.40 — 0.65-0.80 is the sweet spot for PNL/trade)
+      - MIN_PRICE_SPORTS=0.60  # sports-specific floor — sports <0.60 had 43% WR historically; only copy favorites
+      - MAX_PRICE=0.88       # skip BUYs above this entry price (lowered from 0.95 — 0.90-0.95 bucket has 96% WR but only 4.85% ROI, tail risk not worth it)
+      - MAX_SPREAD=0.05      # tightened from 0.15 — 15% spread was eating ~$0.75/round-trip
+      - FORCE_EXCLUDE_CATEGORIES=esports  # excluded at startup: -$0.43/trade cost-adj historically
+      - MAX_POSITIONS_PER_MARKET=2   # max open positions per market slug (lowered from 5 — prevents stacking same game)
+      - MAX_POSITIONS_PER_MARKET_SPORTS=1  # sports/esports cap — prevents single-trader domination (swisstony had 95 open)
+      - MAX_TOTAL_OPEN_POSITIONS=300  # global cap: skip all new BUYs when reached (lowered from 750)
+      - MIN_TRADER_SAMPLE=5  # don't copy a leaderboard trader until we have ≥5 closed trades from them locally
+      - GAS_COST_PER_BUY=0  # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
+      - SLIPPAGE_RATE=0.02   # 2% slippage each side (entry at ask, exit at bid)
+      - FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+    restart: unless-stopped
+
+  # ── Chromium browser (routed through gluetun VPN) ──────────────────────
+  kasmchrome:
+    image: lscr.io/linuxserver/chromium
+    container_name: kasmchrome
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    shm_size: "2g"
+    environment:
+      - KASM_SVC_ENABLE_CLIPBOARD=true
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    restart: unless-stopped
+
+volumes:
+  gluetun_data:

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+.env
+*.conf
+key/
+.claude/
+.tmp_verify/
+# Added by code-review-graph
+.code-review-graph/
