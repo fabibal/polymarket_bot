@@ -98,11 +98,41 @@ async function getContainerUptimeMs(name: string): Promise<number | null> {
 }
 
 // ── Container stats ────────────────────────────────────────────────────────
-interface ContainerStat { name: string; cpuPct: number | null; ramMB: number | null; ramLimitMB: number | null; ramPct: number | null; }
+interface ContainerStat {
+  name: string;
+  cpuPct: number | null;
+  ramMB: number | null;
+  ramLimitMB: number | null;
+  ramPct: number | null;
+  restartCount: number | null;
+  startedAt: string | null;
+  uptimeMs: number | null;
+}
 
 async function fetchOneContainerStat(name: string): Promise<ContainerStat> {
-  const s = await dockerGet(`/containers/${name}/stats?stream=false`) as Record<string, unknown> | null;
-  if (!s) return { name, cpuPct: null, ramMB: null, ramLimitMB: null, ramPct: null };
+  const empty: ContainerStat = { name, cpuPct: null, ramMB: null, ramLimitMB: null, ramPct: null, restartCount: null, startedAt: null, uptimeMs: null };
+  const [s, info] = await Promise.all([
+    dockerGet(`/containers/${name}/stats?stream=false`) as Promise<Record<string, unknown> | null>,
+    dockerGet(`/containers/${name}/json`)                as Promise<Record<string, unknown> | null>,
+  ]);
+
+  // Extract restart count + uptime from inspect (independent of stats availability)
+  let restartCount: number | null = null;
+  let startedAt: string | null = null;
+  let uptimeMs: number | null = null;
+  if (info) {
+    const rc = info.RestartCount;
+    if (typeof rc === 'number') restartCount = rc;
+    const state = info.State as Record<string, unknown> | undefined;
+    const sa = state?.StartedAt;
+    if (typeof sa === 'string' && sa.length > 0) {
+      startedAt = sa;
+      const t = new Date(sa).getTime();
+      if (!isNaN(t)) uptimeMs = Date.now() - t;
+    }
+  }
+
+  if (!s) return { ...empty, restartCount, startedAt, uptimeMs };
   try {
     const cpu = s.cpu_stats as Record<string, unknown>;
     const precpu = s.precpu_stats as Record<string, unknown>;
@@ -120,9 +150,9 @@ async function fetchOneContainerStat(name: string): Promise<ContainerStat> {
     const ramMB = ramUsed / 1_048_576;
     const ramLimitMB = ramLimit > 0 ? ramLimit / 1_048_576 : null;
     const ramPct = ramLimit > 0 ? (ramUsed / ramLimit) * 100 : null;
-    return { name, cpuPct, ramMB, ramLimitMB, ramPct };
+    return { name, cpuPct, ramMB, ramLimitMB, ramPct, restartCount, startedAt, uptimeMs };
   } catch {
-    return { name, cpuPct: null, ramMB: null, ramLimitMB: null, ramPct: null };
+    return { ...empty, restartCount, startedAt, uptimeMs };
   }
 }
 

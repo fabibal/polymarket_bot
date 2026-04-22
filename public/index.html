@@ -631,6 +631,7 @@
     .cstat-fill.ok   { background: var(--green); }
     .cstat-fill.warn { background: var(--red); }
     .cstat-ram  { font-size: 11px; font-family: 'Consolas', monospace; color: var(--muted); }
+    .cstat-meta { font-size: 11px; font-family: 'Consolas', monospace; color: var(--muted); opacity: 0.75; }
     #containers-ts { margin-left: auto; font-size: 10px; color: var(--muted); font-family: system-ui; }
 
     /* ── Charts 2×2 grid ── */
@@ -1831,6 +1832,16 @@
     return mb >= 1024 ? (mb / 1024).toFixed(1) + 'GB' : Math.round(mb) + 'MB';
   }
 
+  function fmtUptime(ms) {
+    if (ms == null || ms < 0) return null;
+    const mins = Math.floor(ms / 60000);
+    if (mins < 60)        return 'up ' + mins + 'm';
+    const hours = Math.floor(mins / 60);
+    if (hours < 24)       return 'up ' + hours + 'h';
+    const days = Math.floor(hours / 24);
+    return 'up ' + days + 'd';
+  }
+
   async function loadContainers() {
     try {
       const d = await fetch('/api/containers').then(r => r.json());
@@ -1848,11 +1859,16 @@
         const shortName = c.name === 'polymarket_bot' ? 'bot' : c.name;
         const card = document.createElement('div');
         card.className = 'cstat-card' + (isWarn ? ' warn' : '');
+        const restartStr = c.restartCount != null ? `restarts: ${c.restartCount}` : '';
+        const uptimeStr  = fmtUptime(c.uptimeMs) || '';
+        const metaTitle  = c.startedAt ? ` title="started ${c.startedAt}"` : '';
+        const metaParts  = [restartStr, uptimeStr].filter(Boolean).join(' · ');
         card.innerHTML =
           `<span class="cstat-name">${shortName}</span>` +
           `<span class="cstat-cpu">${cpuStr}</span>` +
           `<div class="cstat-bar"><div class="cstat-fill ${isWarn ? 'warn' : 'ok'}" style="width:${barPct}%"></div></div>` +
-          `<span class="cstat-ram">${ramStr}</span>`;
+          `<span class="cstat-ram">${ramStr}</span>` +
+          (metaParts ? `<span class="cstat-meta"${metaTitle}>${metaParts}</span>` : '');
         strip.insertBefore(card, ts);
       }
     } catch {
