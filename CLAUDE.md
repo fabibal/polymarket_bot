@@ -1,222 +1,88 @@
 # Polymarket Copy Trading Bot
 
-## Project Overview
-A Polymarket copy trading bot running in DRY_RUN mode (simulation only, no real trades).
-
-## Milestones
-- **2026-04-21**: Statistical significance reached. 3013 closed trades, 74.9% WR, mean +$0.282/trade, **t-statistic = 4.67 (p < 0.001)**. Edge is real, not noise.
-- **2026-04-21**: Corrected cost model — Polymarket charges NO fees on sports markets (only 15-min crypto). `GAS_COST_PER_BUY=0`. Historical `entryGasCost` zeroed via `migrate_zero_gas.js`. Slippage-adjusted PNL flipped from −$945 → **+$201**.
+DRY_RUN simulation-only copy bot. Tracks top 10 traders by weekly PNL plus a persistent watchlist; simulates each BUY as a $5 position (watchlist entries can override via `copyAmount`) and closes FIFO on matching SELL.
 
 ## Stack
-- Node.js / TypeScript
-- Bullpen CLI (`npm install -g @bullpenfi/cli`) for Polymarket API access
-  - Docs: https://cli.bullpen.fi/
-  - Auth: `bullpen login` on host, config stored at `~/.bullpen/`
-- Docker + gluetun WireGuard VPN (Polymarket is geo-blocked in Hungary)
-- Express web dashboard on port 8080
+- Node.js / TypeScript, vitest tests under `tests/`
+- Bullpen CLI (`@bullpenfi/cli`) — docs https://cli.bullpen.fi/ — requires `bullpen login` on host; config at `~/.bullpen/`
+- Docker + gluetun WireGuard VPN (Polymarket geo-blocks Hungary); VPN config `protonvpn-NL-FREE-161.conf`
+- Express dashboard on container port 8080 → host 8082
 
-## Key Bullpen Commands Used
-```bash
-# Top traders by weekly PNL (no --period or --limit flags - slice in JS)
-bullpen polymarket data leaderboard --output json
+## Key rules
+- **Never flip `DRY_RUN=false`** without an explicit instruction in the current conversation.
+- Ask before guessing — use AskUserQuestion for anything ambiguous.
+- `store.ts` persistence: `writeStore()` is an immediate atomic flush (temp+rename) used for financial mutations (addOpenTrade, closeOpenTrade, resolveByPrice) and user-driven dashboard actions. `markDirty()` defers the write; a 60 s background flusher started by `startAutoFlush()` in `index.ts` coalesces bursts. Signal handlers force a final flush on exit.
 
-# Poll trader's recent activity (returns direct array, not wrapped object)
-bullpen polymarket activity --address <addr> --output json --limit 25
+## Bullpen API gotchas
+- `data leaderboard` and `activity` return direct JSON arrays, **not** `{items: []}`.
+- `price` returns `{outcomes: [{outcome, midpoint, last_trade, best_bid, best_ask}]}` — `outcomes` is an ARRAY, not a keyed map.
+- Leaderboard `pnl` / `volume` are STRINGS → wrap in `Number()`.
+- Activity items use `transaction_hash` (not `id`) and `slug` (not `market_slug`).
+- Only process items where `type === 'TRADE'` and `side` is `BUY` or `SELL`.
+- `data leaderboard` ignores `--period` / `--limit`; slice in JS.
 
-# Get current market price (outcomes is an ARRAY not a map)
-bullpen polymarket price <slug> --output json
+## Environment (docker-compose.yml)
 ```
-
-## Important API Notes
-- `data leaderboard` returns a direct JSON array (not {items: []})
-- `activity` returns a direct JSON array (not {items: []})
-- `price` returns {outcomes: [{outcome, midpoint, last_trade, best_bid, best_ask}]} - outcomes is an ARRAY
-- `pnl` and `volume` fields in leaderboard are STRINGS not numbers - wrap in Number()
-- Activity item fields: transaction_hash (not id), slug (not market_slug), title exists
-- Only process activity items where type === 'TRADE' and side === 'BUY' or 'SELL'
-
-## Key Rules
-- **Always run in DRY_RUN=true mode** until explicitly told otherwise
-- WireGuard config: `protonvpn-NL-FREE-161.conf` (in project root, ProtonVPN NL FREE#161, Netherlands)
-- Fixed trade size: **$5 per trade** (simulated)
-- Track **top 10 active traders by weekly PNL** (leaderboard)
-- Log all trades to `data/trades.json`
-- **Use ask user question until you reach clarity on any ambiguity**
-
-## Trade Filters (monitor.ts)
-- Skip BUY if entry price < MIN_PRICE (0.05) or > MAX_PRICE (0.95)
-- Skip BUY if bid/ask spread > MAX_SPREAD (0.15)
-- Skip if already in processedTradeIds
-
-## Auto-exclusion (leaderboard.ts)
-- Every leaderboard refresh: calculate each trader's 7-day win rate from closedTrades
-- If win rate < AUTO_EXCLUDE_WIN_RATE_THRESHOLD (0.45) and >= 3 trades → auto-exclude
-- If win rate recovers → auto-include
-- Manual exclusions (dashboard toggle) are never overridden by auto-logic
-
-## Trade Simulation Logic
-- Trader BUY → Simulate BUY $5 worth (5/P shares)
-- Trader SELL → Close matching open simulated position at sell price (realized PNL)
-- PNL (unrealized) = (current_price - entry_price) × shares
-- PNL (realized) = (exit_price - entry_price) × shares
-- Closed trade fields: exitPrice, closedAt, holdingPeriodMs, realizedPnl
-
-## Project Structure
-```
-polymarket_bot/
-├── src/
-│   ├── index.ts          # Main entry point + polling loop
-│   ├── types.ts          # TypeScript interfaces
-│   ├── config.ts         # Runtime configuration
-│   ├── bullpen.ts        # Bullpen CLI subprocess wrapper
-│   ├── store.ts          # trades.json read/write
-│   ├── leaderboard.ts    # Refresh top 10 traders + auto-exclusion
-│   ├── monitor.ts        # Poll trader activity, detect new trades, apply filters
-│   ├── simulator.ts      # Update mark-to-market prices, resolve trades
-│   └── dashboard.ts      # Express server + API endpoints for web UI
-├── public/
-│   └── index.html        # Dark-themed trading dashboard
-├── data/
-│   └── trades.json       # Persisted trade log (openTrades, closedTrades, trackedTraders, processedTradeIds, traderLastSeen, excludedTraders, autoExcludedTraders)
-├── docker-compose.yml    # gluetun VPN + bot services
-├── Dockerfile
-├── protonvpn-US-FREE-43.conf
-├── package.json
-└── tsconfig.json
-```
-
-## Environment Variables (docker-compose.yml)
-```
-# ── Runtime ────────────────────────────────────────────────────────────
-NODE_OPTIONS=--max-old-space-size=450   # cap Node heap at 450MB (container limit 512MB)
-DRY_RUN=true                            # simulation only — never place real orders
+NODE_OPTIONS=--max-old-space-size=450   # Node heap cap; container limit 512MB
+DRY_RUN=true
 PORT=8080
 
-# ── Polling / refresh cadence ──────────────────────────────────────────
 LEADERBOARD_REFRESH_MS=300000           # 5 min
 POLL_INTERVAL_MS=30000                  # 30 s per cycle
-PRICE_UPDATE_INTERVAL_MS=300000         # 5 min — mark-to-market sweep
+PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
-# ── Auto-exclusion ─────────────────────────────────────────────────────
-AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42    # auto-exclude traders <42% 7d WR (lowered from 0.45 to keep RN1-style high W/L traders)
-MIN_TRADER_SAMPLE=5                     # don't copy a leaderboard trader until ≥5 closed trades logged locally
+AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42    # auto-exclude when 7d WR < threshold
+MIN_TRADER_SAMPLE=5                     # min locally-closed trades before copying
 
-# ── Entry-price / spread filters (monitor.ts) ─────────────────────────
-MIN_PRICE=0.65                          # skip BUYs below this entry price (raised from 0.40 — 0.65-0.80 is the sweet spot)
-MIN_PRICE_SPORTS=0.60                   # sports-specific floor — sports <0.60 had 43% WR historically; only copy favorites
-MAX_PRICE=0.88                          # skip BUYs above this (lowered from 0.95 — 0.90-0.95 has 96% WR but only 4.85% ROI)
-MAX_SPREAD=0.05                         # tightened from 0.15 — 15% spread was eating ~$0.75/round-trip
+MIN_PRICE=0.65
+MIN_PRICE_SPORTS=0.60                   # sports floor (favorites only)
+MAX_PRICE=0.88
+MAX_SPREAD=0.05
 
-# ── Category / position caps ───────────────────────────────────────────
-FORCE_EXCLUDE_CATEGORIES=esports        # always-excluded categories; merged into store.excludedCategories at read time; dashboard can add/remove more via /api/categories/:name/exclusion (persisted in trades.json → excludedCategories[])
-MAX_POSITIONS_PER_MARKET=2              # max open positions per market slug (lowered from 5)
-MAX_POSITIONS_PER_MARKET_SPORTS=1       # sports/esports cap — prevents single-trader domination
-MAX_TOTAL_OPEN_POSITIONS=300            # global cap: skip all new BUYs when reached (lowered from 750)
+FORCE_EXCLUDE_CATEGORIES=esports        # merged with dashboard-driven exclusions
+MAX_POSITIONS_PER_MARKET=2
+MAX_POSITIONS_PER_MARKET_SPORTS=1
+MAX_TOTAL_OPEN_POSITIONS=300
 
-# ── Cost model ─────────────────────────────────────────────────────────
-GAS_COST_PER_BUY=0                      # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
-SLIPPAGE_RATE=0.02                      # 2% slippage each side (entry at ask, exit at bid)
+GAS_COST_PER_BUY=0                      # Polymarket charges no fees on sports markets
+SLIPPAGE_RATE=0.02                      # 2% each side (entry at ask, exit at bid)
 
-# ── External APIs ──────────────────────────────────────────────────────
-FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}   # Falcon (Polymarket Analytics) key for leaderboard/winrate cache
+FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
 ```
 
-### /api/stats — trading-cost fields
-In addition to raw PnL, the stats endpoint returns cost-adjusted figures derived from `GAS_COST_PER_BUY` + `SLIPPAGE_RATE` (applied per-trade in `simulator.ts` / `store.applyExitCosts`):
+## Server + SSH
+- Host: `<server-host>` (fallback IP `<server-ip>`), port `<ssh-port>`, user `user`
+- Key: `~/.ssh/id_ed25519`
+- Runtime dir: `/home/user/polymarket_bot/` — **not a git repo**, deploys land via SCP
+- Bullpen CLI on server: `/home/user/.npm-global/lib/node_modules/@bullpenfi/cli/bin/bullpen`
+- Dashboard: http://localhost:8082
 
-- `totalRealizedPnlAdjusted`   — realized PnL minus gas + entry/exit slippage (closed trades)
-- `totalUnrealizedPnlAdjusted` — unrealized PnL minus projected costs (open trades)
-- `totalPnlAdjusted`           — sum of the two above
-- `totalTradingCosts`          — aggregate gas + slippage over every trade
-- `avgRawPnlPerTrade`          — mean realized PnL per closed trade (pre-costs)
-- `avgSlippagePerTrade`        — mean total cost per closed trade
-- `avgNetEdgePerTrade`         — mean cost-adjusted realized PnL per closed trade (the "true" edge)
-- `excludedCategories`         — categories currently filtered (union of `FORCE_EXCLUDE_CATEGORIES` + dashboard additions)
+## Deploy (container rebuild)
+```bash
+SSH='ssh -p <ssh-port> -i "~/.ssh/id_ed25519" user@<server-host>'
+SCP='scp -P <ssh-port> -i "~/.ssh/id_ed25519"'
 
-## Server
-- Linux/Ubuntu (Stremio szerver)
-- Docker already installed
-- Bullpen CLI installed at: /home/user/.npm-global/lib/node_modules/@bullpenfi/cli/bin/bullpen
-- Run via `docker compose up -d`
+$SCP src/*.ts user@<server-host>:/home/user/polymarket_bot/src/
+$SCP public/index.html user@<server-host>:/home/user/polymarket_bot/public/
+# SCP docker-compose.yml too if changed
 
-## Dashboard
-- URL: http://localhost:8082 (host port 8082 → container port 8080)
-- Auto-refreshes every 5 seconds
-- Features: Total/Realized/Unrealized PNL, Win Rate, Trade counts
-- Leaderboard table: clickable rows for trader stats, Exclude/Include toggle
-- Trades table: date range filter (All/30d/7d/Today), category filter (All/Politics/Crypto/Sports/Other)
-- API endpoints: GET /api/traders, POST /api/traders/:address/exclusion, GET /api/traders/:address/history, GET /api/trades?range=
+$SSH "cd ~/polymarket_bot && docker compose up -d --build && docker logs polymarket_bot --tail 20"
+```
 
-## Deploy Process
-Always follow these steps when deploying:
-1. SCP all changed files to the server:
-   ```bash
-   scp -P <ssh-port> -i "~/.ssh/id_ed25519" \
-     src/*.ts \
-     user@<server-host>:/home/user/polymarket_bot/src/
-   scp -P <ssh-port> -i "~/.ssh/id_ed25519" \
-     public/index.html \
-     user@<server-host>:/home/user/polymarket_bot/public/
-   # Also SCP docker-compose.yml if changed
-   scp -P <ssh-port> -i "~/.ssh/id_ed25519" \
-     docker-compose.yml \
-     user@<server-host>:/home/user/polymarket_bot/
-   ```
-2. SSH and rebuild:
-   ```bash
-   ssh -p <ssh-port> -i "~/.ssh/id_ed25519" \
-     user@<server-host> \
-     "cd ~/polymarket_bot && docker compose up -d --build"
-   ```
-3. Check build logs for TypeScript errors
-4. Verify container is running:
-   ```bash
-   ssh -p <ssh-port> -i "~/.ssh/id_ed25519" \
-     user@<server-host> \
-     "docker ps | grep polymarket_bot && docker logs polymarket_bot --tail 20"
-   ```
+## GitHub push (separate from container deploy)
+- Repo: `git@github.com:fabibal/polymarket_bot.git` (private, default branch `main`)
+- Windows workstation has no GitHub SSH key — push must go through the server, which has `~/.ssh/deploy-key` wired via `Host github.com` in `~/.ssh/config`.
+- Commit author: `Balazs <fabibal@users.noreply.github.com>` (pass with `-c user.name= -c user.email=` since the server-wide git identity may differ).
 
-## Git / GitHub Deploy Workflow
-- **GitHub repo**: `git@github.com:fabibal/polymarket_bot.git` (private)
-- **Push routing**: only through the server. The Windows workstation's SSH key is NOT registered with GitHub — pushes from Windows will fail. The server has `~/.ssh/deploy-key` (referenced via `Host github.com` in `~/.ssh/config` with `IdentitiesOnly yes`) and that is the only working path to `origin`.
-- **Runtime dir is NOT a git repo**: `/home/user/polymarket_bot/` receives SCP deploys and hosts the running container. It has no `.git/`. Do not try to `git pull` there.
-- **Commit author**: `Balazs <fabibal@users.noreply.github.com>` (pass via `-c user.name=... -c user.email=...` on the server since the server-wide git identity may differ).
+```bash
+$SSH "rm -rf /tmp/pb_gh_deploy && git clone git@github.com:fabibal/polymarket_bot.git /tmp/pb_gh_deploy"
+$SCP <changed files> user@<server-host>:/tmp/pb_gh_deploy/<matching subpath>/
+$SSH 'cd /tmp/pb_gh_deploy && git status --porcelain && \
+  git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" add <files> && \
+  git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" commit -m "<subject>" && \
+  git push origin HEAD:main && \
+  git ls-remote git@github.com:fabibal/polymarket_bot.git HEAD'
+$SSH "rm -rf /tmp/pb_gh_deploy"
+```
 
-### Workflow
-1. SSH to server and make a fresh temp clone:
-   ```bash
-   ssh -p <ssh-port> -i <key> user@<server-host> \
-     "rm -rf /tmp/pb_gh_deploy && git clone git@github.com:fabibal/polymarket_bot.git /tmp/pb_gh_deploy"
-   ```
-2. SCP the changed files from Windows into the clone's matching subdirs:
-   ```bash
-   scp -P <ssh-port> -i <key> src/store.ts src/index.ts \
-     user@<server-host>:/tmp/pb_gh_deploy/src/
-   ```
-3. Verify only the intended files are modified:
-   ```bash
-   ssh ... "cd /tmp/pb_gh_deploy && git status --porcelain && git diff --stat"
-   ```
-4. Commit with the correct author and push:
-   ```bash
-   ssh ... 'cd /tmp/pb_gh_deploy && \
-     git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" add <files> && \
-     git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" commit -m "<subject>" -m "<body>" && \
-     git push origin HEAD:main'
-   ```
-5. Verify the remote moved:
-   ```bash
-   ssh ... "git ls-remote git@github.com:fabibal/polymarket_bot.git HEAD"
-   ```
-6. Clean up:
-   ```bash
-   ssh ... "rm -rf /tmp/pb_gh_deploy"
-   ```
-
-The `/tmp/pb_gh_deploy` clone is disposable — recreate it fresh for every push. Code changes must ALSO be SCPed to `/home/user/polymarket_bot/src/` separately (see `## Deploy Process`); the GitHub push does not deploy the running container.
-
-## SSH Details
-- Host: <server-host> (if DNS fails, fallback IP: <server-ip>)
-- Port: <ssh-port>
-- User: user
-- Key: ~/.ssh/id_ed25519
+The GitHub push does NOT deploy. Container rebuild is the separate step above.
