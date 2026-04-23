@@ -176,6 +176,45 @@ Always follow these steps when deploying:
      "docker ps | grep polymarket_bot && docker logs polymarket_bot --tail 20"
    ```
 
+## Git / GitHub Deploy Workflow
+- **GitHub repo**: `git@github.com:fabibal/polymarket_bot.git` (private)
+- **Push routing**: only through the server. The Windows workstation's SSH key is NOT registered with GitHub — pushes from Windows will fail. The server has `~/.ssh/deploy-key` (referenced via `Host github.com` in `~/.ssh/config` with `IdentitiesOnly yes`) and that is the only working path to `origin`.
+- **Runtime dir is NOT a git repo**: `/home/user/polymarket_bot/` receives SCP deploys and hosts the running container. It has no `.git/`. Do not try to `git pull` there.
+- **Commit author**: `Balazs <fabibal@users.noreply.github.com>` (pass via `-c user.name=... -c user.email=...` on the server since the server-wide git identity may differ).
+
+### Workflow
+1. SSH to server and make a fresh temp clone:
+   ```bash
+   ssh -p <ssh-port> -i <key> user@<server-host> \
+     "rm -rf /tmp/pb_gh_deploy && git clone git@github.com:fabibal/polymarket_bot.git /tmp/pb_gh_deploy"
+   ```
+2. SCP the changed files from Windows into the clone's matching subdirs:
+   ```bash
+   scp -P <ssh-port> -i <key> src/store.ts src/index.ts \
+     user@<server-host>:/tmp/pb_gh_deploy/src/
+   ```
+3. Verify only the intended files are modified:
+   ```bash
+   ssh ... "cd /tmp/pb_gh_deploy && git status --porcelain && git diff --stat"
+   ```
+4. Commit with the correct author and push:
+   ```bash
+   ssh ... 'cd /tmp/pb_gh_deploy && \
+     git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" add <files> && \
+     git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" commit -m "<subject>" -m "<body>" && \
+     git push origin HEAD:main'
+   ```
+5. Verify the remote moved:
+   ```bash
+   ssh ... "git ls-remote git@github.com:fabibal/polymarket_bot.git HEAD"
+   ```
+6. Clean up:
+   ```bash
+   ssh ... "rm -rf /tmp/pb_gh_deploy"
+   ```
+
+The `/tmp/pb_gh_deploy` clone is disposable — recreate it fresh for every push. Code changes must ALSO be SCPed to `/home/user/polymarket_bot/src/` separately (see `## Deploy Process`); the GitHub push does not deploy the running container.
+
 ## SSH Details
 - Host: <server-host> (if DNS fails, fallback IP: <server-ip>)
 - Port: <ssh-port>
