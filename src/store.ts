@@ -38,9 +38,24 @@ const EMPTY_STORE: TradesStore = {
   shadowLastSeen: {},
 };
 
+// ── In-memory cache + debounced flush ────────────────────────────────────────
+// Mutations update `cachedStore` synchronously and set `isDirty`. A background
+// timer (started via startAutoFlush) persists to disk every N seconds if dirty.
+// Critical financial mutations call writeStore() which flushes immediately.
+let cachedStore: TradesStore | null = null;
+let isDirty = false;
+let flushTimer: NodeJS.Timeout | null = null;
+
+/** Test hook: clear module-level cache so readStore() re-reads disk. */
+export function _resetStoreCache(): void {
+  cachedStore = null;
+  isDirty = false;
+}
+
 export function readStore(): TradesStore {
+  if (cachedStore) return cachedStore;
   const file = CONFIG.DATA_FILE;
-  if (!fs.existsSync(file)) return { ...EMPTY_STORE };
+  if (!fs.existsSync(file)) { const empty: TradesStore = { ...EMPTY_STORE }; cachedStore = empty; return empty; }
   try {
     const raw = fs.readFileSync(file, 'utf-8');
     const parsed = JSON.parse(raw);
@@ -78,13 +93,16 @@ export function readStore(): TradesStore {
     for (const c of CONFIG.FORCE_EXCLUDE_CATEGORIES) {
       if (!merged.excludedCategories.includes(c)) merged.excludedCategories.push(c);
     }
+    cachedStore = merged;
     return merged;
   } catch {
-    return { ...EMPTY_STORE, excludedCategories: [...CONFIG.FORCE_EXCLUDE_CATEGORIES] };
+    const fallback: TradesStore = { ...EMPTY_STORE, excludedCategories: [...CONFIG.FORCE_EXCLUDE_CATEGORIES] };
+    cachedStore = fallback;
+    return fallback;
   }
 }
 
-export function writeStore(store: TradesStore): void {
+function flushToDisk(store: TradesStore): void {
   const file = CONFIG.DATA_FILE;
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -92,6 +110,50 @@ export function writeStore(store: TradesStore): void {
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf-8');
   fs.renameSync(tmp, file);
+}
+
+/**
+ * Immediate atomic flush. Use for financial state changes where loss could
+ * cause duplicate trades or missing realized PnL (addOpenTrade, closeOpenTrade,
+ * resolveByPrice, user-driven dashboard actions, daily cleanup).
+ */
+export function writeStore(store: TradesStore): void {
+  cachedStore = store;
+  isDirty = false;
+  flushToDisk(store);
+}
+
+/**
+ * Deferred write. Updates in-memory cache and marks dirty; the background
+ * flusher persists on the next tick. Use for high-frequency metric/cache
+ * mutations (price marks, last-seen timestamps, leaderboard stats, trader
+ * history append) where losing the last few seconds on crash is acceptable.
+ */
+export function markDirty(store: TradesStore): void {
+  cachedStore = store;
+  isDirty = true;
+}
+
+/** Persist pending in-memory mutations if any. Safe to call at any time. */
+export function flushIfDirty(): void {
+  if (isDirty && cachedStore) {
+    flushToDisk(cachedStore);
+    isDirty = false;
+  }
+}
+
+/** Start the background debounced flusher. Idempotent. */
+export function startAutoFlush(intervalMs: number = 5_000): void {
+  if (flushTimer) return;
+  flushTimer = setInterval(flushIfDirty, intervalMs);
+  // Don't keep the event loop alive just for the flush timer.
+  if (typeof flushTimer.unref === 'function') flushTimer.unref();
+}
+
+/** Stop the flusher and perform one last synchronous flush. */
+export function stopAutoFlush(): void {
+  if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
+  flushIfDirty();
 }
 
 function maybeWriteDailySnapshot(): void {
@@ -139,7 +201,7 @@ export function updateTrackedTraders(traders: LeaderboardTrader[]): void {
   }
   store.trackedTraders = traders;
   store.lastLeaderboardUpdate = now;
-  writeStore(store);
+  markDirty(store);
 }
 
 const PROCESSED_IDS_CAP = 100_000; // raised from 50k
@@ -211,7 +273,7 @@ export function updateOpenTradePrices(
     const t = store.openTrades.find(x => x.id === u.id);
     if (t) { t.currentPrice = u.currentPrice; t.unrealizedPnl = u.unrealizedPnl; }
   }
-  writeStore(store);
+  markDirty(store);
 }
 
 export function resolveByPrice(
@@ -256,7 +318,7 @@ export function markShadowProcessed(id: string): void {
     if (store.processedShadowIds.length > SHADOW_IDS_CAP) {
       store.processedShadowIds = store.processedShadowIds.slice(-SHADOW_IDS_CAP);
     }
-    writeStore(store);
+    markDirty(store);
   }
 }
 
@@ -271,7 +333,7 @@ export function addShadowOpenTrade(trade: SimulatedTrade): void {
       store.processedShadowIds = store.processedShadowIds.slice(-SHADOW_IDS_CAP);
     }
   }
-  writeStore(store);
+  markDirty(store);
 }
 
 export function closeShadowOpenTrade(
@@ -299,7 +361,7 @@ export function closeShadowOpenTrade(
   store.shadowOpenTrades.splice(idx, 1);
   if (!store.shadowClosedTrades) store.shadowClosedTrades = [];
   store.shadowClosedTrades.push(trade);
-  writeStore(store);
+  markDirty(store);
   return true;
 }
 
@@ -313,7 +375,7 @@ export function updateShadowPrices(
     const t = store.shadowOpenTrades.find(x => x.id === u.id);
     if (t) { t.currentPrice = u.currentPrice; t.unrealizedPnl = u.unrealizedPnl; }
   }
-  writeStore(store);
+  markDirty(store);
 }
 
 export function resolveShadowByPrice(
@@ -340,14 +402,14 @@ export function resolveShadowByPrice(
     return false;
   });
   store.shadowClosedTrades.push(...resolved);
-  writeStore(store);
+  markDirty(store);
 }
 
 export function setShadowLastSeen(address: string, timestamp: string): void {
   const store = readStore();
   if (!store.shadowLastSeen) store.shadowLastSeen = {};
   store.shadowLastSeen[address] = timestamp;
-  writeStore(store);
+  markDirty(store);
 }
 
 export function markProcessed(id: string): void {
@@ -357,7 +419,7 @@ export function markProcessed(id: string): void {
     if (store.processedTradeIds.length > PROCESSED_IDS_CAP) {
       store.processedTradeIds = store.processedTradeIds.slice(-PROCESSED_IDS_CAP);
     }
-    writeStore(store);
+    markDirty(store);
   }
 }
 
@@ -385,7 +447,7 @@ export function setCategoryExclusion(category: string, excluded: boolean): void 
 export function setTraderLastSeen(address: string, timestamp: string): void {
   const store = readStore();
   store.traderLastSeen[address] = timestamp;
-  writeStore(store);
+  markDirty(store);
 }
 
 /**
@@ -431,7 +493,7 @@ export function appendTraderHistory(address: string, items: TraderHistoryEntry[]
   const sells = Array.from(sellMap.values()).sort(byDesc).slice(0, SIDE_CAP);
 
   store.traderHistory[address] = { buys, sells, lastFetched: new Date().toISOString() };
-  writeStore(store);
+  markDirty(store);
 }
 
 export function setLeaderboardFilters(filters: LeaderboardFilters): void {
@@ -443,7 +505,7 @@ export function setLeaderboardFilters(filters: LeaderboardFilters): void {
 export function setLeaderboardStats(stats: LeaderboardStats): void {
   const store = readStore();
   store.lastLeaderboardStats = stats;
-  writeStore(store);
+  markDirty(store);
 }
 
 export function updateTraderLastOnLeaderboard(addresses: string[]): void {
@@ -452,7 +514,7 @@ export function updateTraderLastOnLeaderboard(addresses: string[]): void {
   if (!store.traderLastOnLeaderboard) store.traderLastOnLeaderboard = {};
   const now = new Date().toISOString();
   for (const addr of addresses) store.traderLastOnLeaderboard[addr] = now;
-  writeStore(store);
+  markDirty(store);
 }
 
 export function setAutoExclusion(address: string, excluded: boolean): void {
@@ -521,7 +583,7 @@ export function updateWatchlistFalconData(
   if (data.falconWinRate !== undefined) w.falconWinRate = data.falconWinRate;
   if (data.falconRoi     !== undefined) w.falconRoi     = data.falconRoi;
   if (data.falconSharpe  !== undefined) w.falconSharpe  = data.falconSharpe;
-  writeStore(store);
+  markDirty(store);
 }
 
 export function updateTraderFalconCache(data: Record<string, { winRate?: number }>): void {
@@ -531,7 +593,7 @@ export function updateTraderFalconCache(data: Record<string, { winRate?: number 
   for (const [addr, d] of Object.entries(data)) {
     store.traderFalconCache[addr.toLowerCase()] = { winRate: d.winRate, updatedAt };
   }
-  writeStore(store);
+  markDirty(store);
 }
 
 /**

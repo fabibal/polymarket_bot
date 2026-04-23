@@ -2,7 +2,7 @@ import { refreshLeaderboard } from './leaderboard';
 import { pollTrader } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
-import { readStore, runDailyCleanup } from './store';
+import { readStore, runDailyCleanup, startAutoFlush, stopAutoFlush, flushIfDirty } from './store';
 import { CONFIG } from './config';
 
 async function runPollingCycle(): Promise<void> {
@@ -87,6 +87,11 @@ async function main(): Promise<void> {
   console.log(`  Price update : every ${CONFIG.PRICE_UPDATE_INTERVAL_MS / 60_000} min`);
   console.log('');
 
+  // Background debounced flusher: persists pending store mutations every 60s
+  // to collapse bursts of metric/cache updates into one disk write. Critical
+  // financial mutations still flush immediately via writeStore().
+  startAutoFlush(60_000);
+
   startDashboard();
   scheduleMidnightCleanup();
 
@@ -121,13 +126,25 @@ async function main(): Promise<void> {
   setTimeout(poll, 5_000);
 }
 
+function shutdown(signal: string): void {
+  console.log(`[bot] Received ${signal} — flushing pending store writes and exiting.`);
+  try { stopAutoFlush(); } catch (err) { console.error('[bot] flush on shutdown failed:', err); }
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('exit', () => { try { flushIfDirty(); } catch {} });
+
 process.on('uncaughtException', (err) => {
   console.error('[fatal] uncaughtException:', err instanceof Error ? err.stack || err.message : err);
+  try { flushIfDirty(); } catch {}
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error('[fatal] unhandledRejection:', reason instanceof Error ? reason.stack || reason.message : reason);
+  try { flushIfDirty(); } catch {}
   process.exit(1);
 });
 
