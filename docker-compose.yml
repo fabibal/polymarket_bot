@@ -16,11 +16,11 @@ services:
     environment:
       - VPN_SERVICE_PROVIDER=custom
       - VPN_TYPE=wireguard
-      - WIREGUARD_PRIVATE_KEY=${WIREGUARD_PRIVATE_KEY}
-      - WIREGUARD_PUBLIC_KEY=${WIREGUARD_PUBLIC_KEY}
-      - WIREGUARD_ENDPOINT_IP=${WIREGUARD_ENDPOINT_IP}
+      - WIREGUARD_PRIVATE_KEY=AI8Q74p3pxR9f6MtubHivCGbfV8oWw65ju9oF+ZWnmE=
+      - WIREGUARD_PUBLIC_KEY=r3s/7PwXSBh0lmwbNB2ukDfGelfPJmEeYfnmEcL4Ozk=
+      - WIREGUARD_ENDPOINT_IP=185.107.57.6
       - WIREGUARD_ENDPOINT_PORT=51820
-      - WIREGUARD_ADDRESSES=${WIREGUARD_ADDRESSES}
+      - WIREGUARD_ADDRESSES=10.2.0.2/32
     deploy:
       resources:
         limits:
@@ -53,6 +53,7 @@ services:
       - NODE_OPTIONS=--max-old-space-size=450
       - DRY_RUN=true
       - PORT=8080
+      - DB_FILE=/app/data/store.db
       - LEADERBOARD_REFRESH_MS=300000   # 5 minutes
       - POLL_INTERVAL_MS=30000          # 30 seconds
       - PRICE_UPDATE_INTERVAL_MS=300000 # 5 minutes
