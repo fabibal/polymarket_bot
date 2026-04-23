@@ -8,6 +8,7 @@ export const CONFIG = {
   ACTIVITY_LIMIT: 10,
   PORT: parseInt(process.env.PORT ?? '8080', 10),
   DATA_FILE: process.env.DATA_FILE ?? './data/trades.json',
+  DB_FILE: process.env.DB_FILE ?? './data/store.db',
   // If price crosses this threshold treat the market as resolved
   RESOLVED_THRESHOLD: 0.93,
   // Auto-close positions older than this many days at current price (status: expired)
