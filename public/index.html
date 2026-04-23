@@ -786,6 +786,14 @@
 </head>
 <body>
 
+<!--
+  Cutover banner: stats zeroed on SQLite migration.
+  TODO: remove this block ~7 days after cutover (around 2026-04-30).
+-->
+<div id="cutover-banner" style="background:var(--yellow-soft);border-bottom:1px solid var(--yellow);color:var(--text);padding:8px 16px;font-size:13px;text-align:center;">
+  Stats reset 2026-04-23 &mdash; storage migrated to SQLite. Historical PnL and trade counts start fresh from this date.
+</div>
+
 <header>
   <div class="header-left">
     <span id="status-dot"></span>
