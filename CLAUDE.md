@@ -58,6 +58,9 @@ FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
 - Bullpen CLI on server: `/home/user/.npm-global/lib/node_modules/@bullpenfi/cli/bin/bullpen`
 - Dashboard: http://localhost:8082
 
+## Secrets (`.env` on server)
+WireGuard creds (`WIREGUARD_PRIVATE_KEY`, `WIREGUARD_PUBLIC_KEY`, `WIREGUARD_ENDPOINT_IP`, `WIREGUARD_ADDRESSES`) live in `/home/user/polymarket_bot/.env` and are referenced from `docker-compose.yml` as `${…}`. The port stays hardcoded at `51820`. Do not hardcode the creds in compose — that caused VPN drift previously (compose froze while `.env` was rotated). `.env` is gitignored; to rotate, edit on the server and `docker compose up -d gluetun bot`.
+
 ## Deploy (container rebuild)
 ```bash
 SSH='ssh -p <ssh-port> -i "~/.ssh/id_ed25519" user@<server-host>'
