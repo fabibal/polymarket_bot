@@ -11,6 +11,17 @@ import { detectCategory } from './categories';
 import { computeEntryCosts } from './simulator';
 import { v4 as uuidv4 } from 'uuid';
 
+export function hasSufficientSample(
+  realClosed: number,
+  shadowClosed: number,
+  realThreshold: number = CONFIG.MIN_TRADER_SAMPLE,
+  shadowThreshold: number = CONFIG.MIN_TRADER_SHADOW_SAMPLE,
+): { passes: boolean; via: 'real' | 'shadow' | null } {
+  if (realClosed >= realThreshold) return { passes: true, via: 'real' };
+  if (shadowClosed >= shadowThreshold) return { passes: true, via: 'shadow' };
+  return { passes: false, via: null };
+}
+
 function parseActivity(raw: RawActivityItem): ActivityTrade | null {
   // Only process TRADE type items
   if (String(raw.type ?? '').toUpperCase() !== 'TRADE') return null;
@@ -209,10 +220,14 @@ export async function pollTrader(
         const closedForTrader = currentStore.closedTrades.filter(
           c => c.copiedTrader === trader.address
         ).length;
-        if (closedForTrader < CONFIG.MIN_TRADER_SAMPLE) {
+        const shadowForTrader = (currentStore.shadowClosedTrades ?? []).filter(
+          c => c.copiedTrader === trader.address
+        ).length;
+        const gate = hasSufficientSample(closedForTrader, shadowForTrader);
+        if (!gate.passes) {
           const label = trader.username ?? trader.address.slice(0, 10);
           console.log(
-            `[monitor] Skip BUY ${label} — insufficient sample (${closedForTrader}/${CONFIG.MIN_TRADER_SAMPLE} trades)`
+            `[monitor] Skip BUY ${label} — insufficient sample (real ${closedForTrader}/${CONFIG.MIN_TRADER_SAMPLE}, shadow ${shadowForTrader}/${CONFIG.MIN_TRADER_SHADOW_SAMPLE})`
           );
           markProcessed(activity.id);
           continue;

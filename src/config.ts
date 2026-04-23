@@ -36,6 +36,11 @@ export const CONFIG = {
   // Minimum closed-trade sample size before a leaderboard trader's signals are copied.
   // Watchlist traders bypass this gate.
   MIN_TRADER_SAMPLE: parseInt(process.env.MIN_TRADER_SAMPLE ?? '5', 10),
+  // Alternative unlock: a trader also passes the gate once their shadow-closed
+  // trade count reaches this threshold. Shadow trades are filter-passing trades
+  // the bot declined to copy (e.g. during sample buildup), so this breaks the
+  // chicken-and-egg where leaderboard traders can never accumulate real samples.
+  MIN_TRADER_SHADOW_SAMPLE: parseInt(process.env.MIN_TRADER_SHADOW_SAMPLE ?? '20', 10),
   // Cost-simulation constants — used to project live-trading PNL from DRY_RUN trades.
   // Polymarket charges NO fees on sports markets (only 15-min crypto). Gas on Polygon is negligible.
   // 2% slippage each side (entry at ask, exit at bid) still applies.

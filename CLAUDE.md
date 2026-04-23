@@ -32,7 +32,8 @@ POLL_INTERVAL_MS=30000                  # 30 s per cycle
 PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
 AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42    # auto-exclude when 7d WR < threshold
-MIN_TRADER_SAMPLE=5                     # min locally-closed trades before copying
+MIN_TRADER_SAMPLE=5                     # min locally-closed trades before copying (real)
+MIN_TRADER_SHADOW_SAMPLE=20             # shadow-closed alt unlock; breaks chicken-and-egg
 
 MIN_PRICE=0.65
 MIN_PRICE_SPORTS=0.60                   # sports floor (favorites only)
