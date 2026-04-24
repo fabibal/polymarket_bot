@@ -1,6 +1,6 @@
 import { getLeaderboard, getTraderActivity, getFalconLeaderboard, RawActivityItem, RawLeaderboardItem, RawLeaderboardResponse, RawFalconTrader } from './bullpen';
 import { updateTrackedTraders, updateTraderLastOnLeaderboard, readStore, setAutoExclusion, setLeaderboardStats, appendTraderHistory, updateWatchlistFalconData, updateTraderFalconCache } from './store';
-import { LeaderboardTrader, TradesStore, TraderHistoryEntry } from './types';
+import { LeaderboardTrader, TradesStore, TraderHistoryEntry, SimulatedTrade } from './types';
 import { CONFIG } from './config';
 import { detectCategory } from './categories';
 
@@ -25,7 +25,40 @@ function isRecentlyActive(address: string, store: TradesStore): boolean {
   return true; // no data → assume active
 }
 
-function checkAutoExclusion(
+// Compute win-rate for trades closed after `cutoff` for a given trader.
+// Returns null if fewer than AUTO_EXCLUDE_MIN_TRADES — caller decides fallback.
+function winRateSince(
+  trades: SimulatedTrade[] | undefined,
+  addr: string,
+  cutoff: number,
+): { n: number; winners: number; winRate: number } | null {
+  if (!trades || trades.length === 0) return null;
+  const recent = trades.filter(t =>
+    t.copiedTrader === addr &&
+    new Date(t.closedAt ?? t.timestamp).getTime() >= cutoff
+  );
+  if (recent.length < CONFIG.AUTO_EXCLUDE_MIN_TRADES) return null;
+  const winners = recent.filter(t => (t.realizedPnl ?? 0) > 0).length;
+  return { n: recent.length, winners, winRate: winners / recent.length };
+}
+
+// Prefer real closed trades; fall back to shadow when real sample is thin.
+// This lets us evaluate traders we haven't copied yet using our filtered-signal
+// shadow book, and un-block traders that were auto-excluded before the
+// SQLite cutover erased their real-trade history.
+function sampledWinRate(
+  store: TradesStore,
+  addr: string,
+  cutoff: number,
+): { n: number; winners: number; winRate: number; source: 'real' | 'shadow' } | null {
+  const real = winRateSince(store.closedTrades, addr, cutoff);
+  if (real) return { ...real, source: 'real' };
+  const shadow = winRateSince(store.shadowClosedTrades, addr, cutoff);
+  if (shadow) return { ...shadow, source: 'shadow' };
+  return null;
+}
+
+export function checkAutoExclusion(
   traders: LeaderboardTrader[],
   falconByAddress: Map<string, RawFalconTrader>
 ): void {
@@ -49,64 +82,46 @@ function checkAutoExclusion(
     const addr = trader.address;
     if (manuallyExcluded.has(addr)) continue;
     if (watchlistAddrs.has(addr.toLowerCase())) continue;
+    if (autoExcluded.has(addr)) continue;
 
-    const recentClosed = store.closedTrades.filter(t =>
-      t.copiedTrader === addr &&
-      new Date(t.closedAt ?? t.timestamp).getTime() >= cutoff
-    );
+    const sample = sampledWinRate(store, addr, cutoff);
+    if (!sample) continue;
 
-    if (recentClosed.length < CONFIG.AUTO_EXCLUDE_MIN_TRADES) continue;
-
-    const winners = recentClosed.filter(t => (t.realizedPnl ?? 0) > 0).length;
-    const winRate = winners / recentClosed.length;
-    const name = trader.username ?? addr.slice(0, 10) + '...';
-    const wrPct  = (winRate * 100).toFixed(1);
-    const thrPct = (threshold * 100).toFixed(1);
-    const isAutoExcluded = autoExcluded.has(addr);
-
-    if (winRate < threshold && !isAutoExcluded) {
+    if (sample.winRate < threshold) {
       setAutoExclusion(addr, true);
+      const name = trader.username ?? addr.slice(0, 10) + '...';
+      const wrPct  = (sample.winRate * 100).toFixed(1);
+      const thrPct = (threshold * 100).toFixed(1);
       console.warn(
-        `[leaderboard] Auto-excluded ${name} — 7d win rate ${wrPct}% < ${thrPct}%` +
-        ` (${winners}W/${recentClosed.length - winners}L over ${recentClosed.length} trades)`
+        `[leaderboard] Auto-excluded ${name} — 7d ${sample.source} win rate ${wrPct}% < ${thrPct}%` +
+        ` (${sample.winners}W/${sample.n - sample.winners}L over ${sample.n} trades)`
       );
     }
   }
 
   // ── 2. Check auto-excluded traders for recovery ────────────────────────────
   // Recovery criteria (either sufficient):
-  //   a) 7d simulated win rate >= threshold
-  //   b) Falcon win rate >= 60%
-  // On recovery, trader is removed from both excludedTraders and autoExcludedTraders
-  // and becomes eligible to re-enter the tracked list on the next leaderboard refresh.
+  //   a) 7d simulated win rate >= threshold (real if available, else shadow)
+  //   b) Falcon win rate >= 80% when we have NO sim data at all
   for (const addr of [...autoExcluded]) {
-    const recentClosed = store.closedTrades.filter(t =>
-      t.copiedTrader === addr &&
-      new Date(t.closedAt ?? t.timestamp).getTime() >= cutoff
-    );
-
-    const hasSufficientSimData = recentClosed.length >= CONFIG.AUTO_EXCLUDE_MIN_TRADES;
-    const simWinRate = hasSufficientSimData
-      ? recentClosed.filter(t => (t.realizedPnl ?? 0) > 0).length / recentClosed.length
-      : null;
+    const sample = sampledWinRate(store, addr, cutoff);
 
     const falconEntry   = falconByAddress.get(addr.toLowerCase());
     const falconWinRate = falconEntry?.win_rate
       ?? (store.traderFalconCache?.[addr.toLowerCase()]?.winRate ?? null);
 
-    // Recovery criteria — require SIMULATED win rate to recover when we have data.
-    // Falcon WR is only used as a tiebreaker when we have NO sim data for this trader
-    // (i.e. they were excluded before we had a chance to observe their performance).
-    // This prevents the churn loop where a trader with 0% simulated WR is re-included
-    // every leaderboard cycle because their long-term Falcon WR looks good.
-    const simRecovered = hasSufficientSimData && simWinRate !== null && simWinRate >= threshold;
-    const falconOnlyRecovered = !hasSufficientSimData && falconWinRate !== null && falconWinRate >= 0.80;
+    // Recovery — prefer SIMULATED win rate when any real or shadow sample exists.
+    // Falcon WR (≥0.80) is only a tiebreaker when we have no sim data in either
+    // book, preventing the churn loop where a long-term Falcon WR re-includes
+    // a trader with a failing simulated record.
+    const simRecovered = sample !== null && sample.winRate >= threshold;
+    const falconOnlyRecovered = sample === null && falconWinRate !== null && falconWinRate >= 0.80;
     const recovered = simRecovered || falconOnlyRecovered;
 
     if (recovered) {
       setAutoExclusion(addr, false);
       const parts: string[] = [];
-      if (simWinRate   !== null) parts.push(`sim 7d WR ${(simWinRate   * 100).toFixed(1)}%`);
+      if (sample !== null) parts.push(`sim 7d ${sample.source} WR ${(sample.winRate * 100).toFixed(1)}% over ${sample.n}`);
       if (falconWinRate !== null) parts.push(`Falcon WR ${(falconWinRate * 100).toFixed(1)}%`);
       console.log(
         `[leaderboard] Auto-re-included ${addr.slice(0, 10)}... — recovered (${parts.join(', ')})` +

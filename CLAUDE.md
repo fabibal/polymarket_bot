@@ -32,6 +32,11 @@ POLL_INTERVAL_MS=30000                  # 30 s per cycle
 PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
 AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42    # auto-exclude when 7d WR < threshold
+# WR source order: real closedTrades (preferred) → shadowClosedTrades (fallback when
+# real n<3) → Falcon ≥0.80 only when BOTH books are empty. Shadow fallback matters
+# because raw Falcon/Polymarket WR reflects a trader's full activity, while our copy
+# performance is gated by filters (MIN_PRICE, MAX_SPREAD, sports floor, etc.) — the
+# shadow book is the only accurate signal-quality estimate before any real copies land.
 MIN_TRADER_SAMPLE=5                     # min locally-closed trades before copying (real)
 MIN_TRADER_SHADOW_SAMPLE=20             # shadow-closed alt unlock; breaks chicken-and-egg
 
