@@ -79,3 +79,41 @@ export function getOutcomeSpread(data: RawPriceResponse, outcome: string): numbe
   }
   return null;
 }
+
+export interface WatchlistEntry {
+  marketSlug: string;
+  copiedTraderSource?: 'leaderboard' | 'watchlist';
+  timestamp: string; // ISO
+}
+
+/**
+ * Counts watchlist BUYs on a given market within a rolling window.
+ * Inspects both still-open and previously-closed trades — the existing
+ * MAX_POSITIONS_PER_MARKET counts only concurrent positions, so sequential
+ * BUY-SELL-BUY cycles on fast sports/tennis markets slip past it.
+ */
+export function countWatchlistEntriesInWindow(
+  openTrades: ReadonlyArray<WatchlistEntry>,
+  closedTrades: ReadonlyArray<WatchlistEntry>,
+  marketSlug: string,
+  nowMs: number,
+  windowMs: number,
+): number {
+  const cutoff = nowMs - windowMs;
+  let n = 0;
+  for (const t of openTrades) {
+    if (t.copiedTraderSource !== 'watchlist') continue;
+    if (t.marketSlug !== marketSlug) continue;
+    const tsMs = Date.parse(t.timestamp);
+    if (Number.isNaN(tsMs)) continue;
+    if (tsMs >= cutoff) n++;
+  }
+  for (const t of closedTrades) {
+    if (t.copiedTraderSource !== 'watchlist') continue;
+    if (t.marketSlug !== marketSlug) continue;
+    const tsMs = Date.parse(t.timestamp);
+    if (Number.isNaN(tsMs)) continue;
+    if (tsMs >= cutoff) n++;
+  }
+  return n;
+}

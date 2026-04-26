@@ -8,6 +8,7 @@ import { readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSe
 import { LeaderboardTrader, ActivityTrade, SimulatedTrade, TraderHistoryEntry } from './types';
 import { CONFIG } from './config';
 import { detectCategory } from './categories';
+import { countWatchlistEntriesInWindow } from './filters';
 import { computeEntryCosts } from './simulator';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -188,6 +189,28 @@ export async function pollTrader(
       }
 
       const currentStore = readStore();
+
+      // ── Watchlist-only: per-market entry cap within a rolling window ──
+      // Watchlist bypasses MAX_POSITIONS_PER_MARKET, but rapid BUY-SELL-BUY cycles
+      // on fast sports/tennis markets still drag PnL. Counts both open and closed
+      // watchlist entries on this slug within the window.
+      if (isWatchlist) {
+        const watchlistEntries = countWatchlistEntriesInWindow(
+          currentStore.openTrades,
+          currentStore.closedTrades,
+          activity.marketSlug,
+          Date.now(),
+          CONFIG.MAX_WATCHLIST_ENTRY_WINDOW_MS,
+        );
+        if (watchlistEntries >= CONFIG.MAX_WATCHLIST_ENTRIES_PER_MARKET) {
+          const windowH = Math.round(CONFIG.MAX_WATCHLIST_ENTRY_WINDOW_MS / 3600000);
+          console.log(
+            `[monitor] Skip BUY ${activity.marketSlug} — watchlist entry cap ${CONFIG.MAX_WATCHLIST_ENTRIES_PER_MARKET}/${windowH}h reached (n=${watchlistEntries})`
+          );
+          markProcessed(activity.id);
+          continue;
+        }
+      }
 
       // ── Global and per-market caps (leaderboard only — watchlist bypasses) ──
       if (!isWatchlist) {

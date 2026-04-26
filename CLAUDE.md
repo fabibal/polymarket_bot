@@ -50,6 +50,13 @@ MAX_POSITIONS_PER_MARKET=2
 MAX_POSITIONS_PER_MARKET_SPORTS=1
 MAX_TOTAL_OPEN_POSITIONS=300
 
+# Watchlist-only per-market entry cap. Existing MAX_POSITIONS_PER_MARKET counts
+# only concurrent open positions, so BUY-SELL-BUY cycles (e.g. 4× DFB stack on a
+# 90-min match) slip past it. This cap counts open + closed watchlist entries on
+# the same slug within the window. Default: 2 entries per 12h.
+MAX_WATCHLIST_ENTRIES_PER_MARKET=2
+MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000
+
 GAS_COST_PER_BUY=0                      # Polymarket charges no fees on sports markets
 SLIPPAGE_RATE=0.02                      # 2% each side (entry at ask, exit at bid)
 

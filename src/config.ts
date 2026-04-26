@@ -17,6 +17,13 @@ export const CONFIG = {
   MAX_POSITIONS_PER_MARKET: parseInt(process.env.MAX_POSITIONS_PER_MARKET ?? '5', 10),
   // Sports/esports-specific cap — tighter limit to prevent single-trader sports domination
   MAX_POSITIONS_PER_MARKET_SPORTS: parseInt(process.env.MAX_POSITIONS_PER_MARKET_SPORTS ?? '1', 10),
+  // Watchlist-only per-market entry cap within a rolling window. Watchlist bypasses
+  // MAX_POSITIONS_PER_MARKET (which only counts concurrently-open positions). On fast
+  // sports/tennis markets, BUY-SELL-BUY cycles slip past the concurrent check and
+  // produce stacks of 3-4 entries on the same losing market. This cap counts both
+  // open and closed watchlist entries on the slug within the window.
+  MAX_WATCHLIST_ENTRIES_PER_MARKET: parseInt(process.env.MAX_WATCHLIST_ENTRIES_PER_MARKET ?? '2', 10),
+  MAX_WATCHLIST_ENTRY_WINDOW_MS: parseInt(process.env.MAX_WATCHLIST_ENTRY_WINDOW_MS ?? '43200000', 10),
   // Auto-exclusion: exclude traders whose 7-day win rate drops below this (0 = disabled)
   AUTO_EXCLUDE_WIN_RATE_THRESHOLD: parseFloat(process.env.AUTO_EXCLUDE_WIN_RATE_THRESHOLD ?? '0'),
   AUTO_EXCLUDE_MIN_TRADES: 3, // minimum closed trades in 7d window before auto-exclusion triggers
