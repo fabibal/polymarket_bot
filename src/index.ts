@@ -2,7 +2,7 @@ import { refreshLeaderboard } from './leaderboard';
 import { pollTrader } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
-import { readStore, runDailyCleanup, startAutoFlush, stopAutoFlush, flushIfDirty } from './store';
+import { readStore, runDailyCleanup, startAutoFlush, stopAutoFlush, flushIfDirty, initInsertionCounter } from './store';
 import { CONFIG } from './config';
 
 async function runPollingCycle(): Promise<void> {
@@ -86,6 +86,10 @@ async function main(): Promise<void> {
   console.log(`  Poll interval: every ${CONFIG.POLL_INTERVAL_MS / 1_000}s per trader`);
   console.log(`  Price update : every ${CONFIG.PRICE_UPDATE_INTERVAL_MS / 60_000} min`);
   console.log('');
+
+  // Resume insertion_order past any existing rows before any writes happen,
+  // so post-restart trades sort correctly in FIFO close queries.
+  initInsertionCounter();
 
   // Background debounced flusher: persists pending store mutations every 60s
   // to collapse bursts of metric/cache updates into one disk write. Critical

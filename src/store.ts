@@ -283,8 +283,16 @@ function getDb(): Db {
   d.pragma('foreign_keys = ON');
   d.exec(SCHEMA);
   seedIfFresh(d);
-  // Resume the insertion counter past any existing rows so a warm DB preserves
-  // FIFO ordering across restarts.
+  _initInsertionCounterFromDb(d);
+  db = d;
+  return d;
+}
+
+// Resume the insertion counter past any existing rows so a warm DB preserves
+// FIFO ordering across restarts. Without this, post-restart trades would carry
+// insertion_order=1,2,3... and sort as "older" than pre-restart rows in the
+// thousands, breaking BUY-SELL pairing in closeOpenTrade.
+function _initInsertionCounterFromDb(d: Db): void {
   const row = d.prepare(
     `SELECT MAX(ord) AS m FROM (
        SELECT MAX(insertion_order) AS ord FROM open_trades
@@ -294,8 +302,18 @@ function getDb(): Db {
      )`
   ).get() as { m: number | null };
   insertionCounter = (row?.m ?? 0) + 1;
-  db = d;
-  return d;
+  console.log(`[store] Initialized insertionCounter to ${insertionCounter} (from existing data)`);
+}
+
+/**
+ * Public startup hook: opens the DB if needed and resumes the insertion
+ * counter past any existing rows. Idempotent — first call performs the init
+ * and logs; subsequent calls are no-ops because getDb() caches the connection.
+ * Returns the next insertion_order value that will be assigned.
+ */
+export function initInsertionCounter(): number {
+  getDb();
+  return insertionCounter;
 }
 
 function seedIfFresh(d: Db): void {
@@ -326,6 +344,11 @@ export function _setDbPathForTests(p: string | null): void {
   cachedStore = null;
   isDirty = false;
   insertionCounter = 0;
+}
+
+/** Test hook: read the current in-memory insertion counter. */
+export function _getInsertionCounter(): number {
+  return insertionCounter;
 }
 
 /** Test hook: drop the in-memory snapshot cache. */
