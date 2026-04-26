@@ -124,6 +124,54 @@ describe('checkAutoExclusion: shadow-sample fallback', () => {
     expect(store.readStore().autoExcludedTraders).toContain(addr);
   });
 
+  it('counts gross-positive but net-negative trades as losses (slippage erodes thin edges)', () => {
+    // entry=0.95, exit=0.97 → gross +$0.105, but slippage ~$0.20 → net -$0.097.
+    // All 4 trades are gross winners but net losers — must not pass the gate.
+    const addr = '0xfafafafafafafafafafafafafafafafafafafafa';
+    const ids: Array<{ id: string; exitPrice: number }> = [];
+    for (let i = 0; i < 4; i++) {
+      const t = makeClosed({
+        copiedTrader: addr,
+        id: `thin-${i}`,
+        sourceTradeId: `thin-src-${i}`,
+        entryPrice: 0.95,
+        simulatedShares: 5 / 0.95,
+        status: 'open',
+      });
+      store.addShadowOpenTrade(t);
+      ids.push({ id: t.id, exitPrice: 0.97 });
+    }
+    store.resolveShadowByPrice(ids);
+
+    // Sanity: gross PnL is positive on all 4, but cost-adjusted is negative.
+    const closed = store.readStore().shadowClosedTrades?.filter(c => c.copiedTrader === addr) ?? [];
+    expect(closed).toHaveLength(4);
+    expect(closed.every(c => (c.realizedPnl ?? 0) > 0)).toBe(true);
+    expect(closed.every(c => (c.costAdjustedPnl ?? 0) <= 0)).toBe(true);
+
+    const traders: LeaderboardTrader[] = [{ rank: 5, address: addr, username: null, weeklyPnl: 0 }];
+    checkAutoExclusion(traders, emptyFalcon);
+
+    // 0% net WR < 42% threshold → must be auto-excluded.
+    expect(store.readStore().autoExcludedTraders).toContain(addr);
+  });
+
+  it('counts cost-positive trades as wins (sanity: existing behavior preserved)', () => {
+    // entry=0.70, exit=1.00 → gross +$2.14, slippage ~$0.24 → net +$1.90 (still a win).
+    const addr = '0xfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfbfb';
+    seedTrades(addr, 'shadow', 4, 0); // 4 wins, 0 losses, all binary-resolved
+
+    const closed = store.readStore().shadowClosedTrades?.filter(c => c.copiedTrader === addr) ?? [];
+    expect(closed).toHaveLength(4);
+    expect(closed.every(c => (c.costAdjustedPnl ?? 0) > 0)).toBe(true);
+
+    const traders: LeaderboardTrader[] = [{ rank: 6, address: addr, username: null, weeklyPnl: 0 }];
+    checkAutoExclusion(traders, emptyFalcon);
+
+    // 100% net WR >= 42% threshold → must NOT be auto-excluded.
+    expect(store.readStore().autoExcludedTraders ?? []).not.toContain(addr);
+  });
+
   it('does nothing when neither real nor shadow has >= AUTO_EXCLUDE_MIN_TRADES', () => {
     const addr = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
     seedTrades(addr, 'shadow', 1, 1); // only 2 trades — below min 3

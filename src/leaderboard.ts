@@ -38,7 +38,10 @@ function winRateSince(
     new Date(t.closedAt ?? t.timestamp).getTime() >= cutoff
   );
   if (recent.length < CONFIG.AUTO_EXCLUDE_MIN_TRADES) return null;
-  const winners = recent.filter(t => (t.realizedPnl ?? 0) > 0).length;
+  // Use costAdjustedPnl: a trade with raw +$0.05 but -$0.15 net is a loss
+  // in live trading, so it must not count as a "winner" toward the gate.
+  // Fall back to realizedPnl for legacy rows that lack the field.
+  const winners = recent.filter(t => (t.costAdjustedPnl ?? t.realizedPnl ?? 0) > 0).length;
   return { n: recent.length, winners, winRate: winners / recent.length };
 }
 

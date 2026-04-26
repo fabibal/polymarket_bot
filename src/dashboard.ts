@@ -302,7 +302,7 @@ function computeTraderStats(address: string, trades: ActivityLike[]) {
 function computeInlineStats(
   address: string,
   allTrades: ActivityLike[],
-  simClosed: Array<{ realizedPnl?: number | null; timestamp: string; closedAt?: string }>
+  simClosed: Array<{ realizedPnl?: number | null; costAdjustedPnl?: number | null; timestamp: string; closedAt?: string }>
 ) {
   const now    = Date.now();
   const cut7d  = now - 7  * 86_400_000;
@@ -335,7 +335,9 @@ function computeInlineStats(
   // Win rate & avg W/L from our simulated closed trades (traders rarely SELL on Polymarket —
   // they hold to resolution, so BUY/SELL pairs in raw history are almost always zero)
   const sim7d     = simClosed.filter(t => new Date(t.closedAt ?? t.timestamp).getTime() >= cut7d);
-  const winners7d = sim7d.filter(t => (t.realizedPnl ?? 0) > 0);
+  // WR uses costAdjustedPnl so it's consistent with the auto-exclusion gate
+  // (leaderboard.ts winRateSince) and the recovery check at line ~506.
+  const winners7d = sim7d.filter(t => (t.costAdjustedPnl ?? t.realizedPnl ?? 0) > 0);
   const winRate7d = sim7d.length >= 2 ? winners7d.length / sim7d.length : null;
 
   const winners = simClosed.filter(t => (t.realizedPnl ?? 0) > 0);
@@ -368,8 +370,9 @@ export function startDashboard(): void {
 
     const realizedPnl = closedTrades.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
     const unrealizedPnl = openTrades.reduce((s, t) => s + (t.unrealizedPnl ?? 0), 0);
-    const winners = closedTrades.filter(t => (t.realizedPnl ?? 0) > 0).length;
-    const losers = closedTrades.filter(t => (t.realizedPnl ?? 0) <= 0).length;
+    // WR uses costAdjustedPnl to match the auto-exclusion gate.
+    const winners = closedTrades.filter(t => (t.costAdjustedPnl ?? t.realizedPnl ?? 0) > 0).length;
+    const losers  = closedTrades.filter(t => (t.costAdjustedPnl ?? t.realizedPnl ?? 0) <= 0).length;
     const resolved = winners + losers;
 
     // Slippage-adjusted projections — Polymarket has NO fees on sports markets,
@@ -477,7 +480,7 @@ export function startDashboard(): void {
 
       // All-time win rate from simulated closed trades.
       // Note: Polymarket's profile API always returns win_rate=null so we compute it ourselves.
-      const simAllWinners = simClosed.filter(c => (c.realizedPnl ?? 0) > 0).length;
+      const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
       const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
 
       const shadowStats = shadowStatsMap[t.address];
@@ -492,7 +495,7 @@ export function startDashboard(): void {
       const simClosed  = store.closedTrades.filter(c => c.copiedTrader === addr);
       const inlineStats = computeInlineStats(addr, histTrades, simClosed);
 
-      const simAllWinners = simClosed.filter(c => (c.realizedPnl ?? 0) > 0).length;
+      const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
       const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
       const realizedPnl = simClosed.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
 
@@ -698,7 +701,7 @@ export function startDashboard(): void {
       const simClosed  = store.closedTrades.filter(c => c.copiedTrader === w.address);
       const inlineStats = computeInlineStats(w.address, histTrades, simClosed);
 
-      const simAllWinners = simClosed.filter(c => (c.realizedPnl ?? 0) > 0).length;
+      const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
       const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
       const realizedPnl = simClosed.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
       const openPositions = store.openTrades.filter(t => t.copiedTrader === w.address).length;
