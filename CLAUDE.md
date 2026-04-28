@@ -5,7 +5,7 @@ DRY_RUN simulation-only copy bot. Tracks top 10 traders by weekly PNL plus a per
 ## Stack
 - Node.js / TypeScript, vitest tests under `tests/`
 - Bullpen CLI (`@bullpenfi/cli`) — docs https://cli.bullpen.fi/ — requires `bullpen login` on host; config at `~/.bullpen/`
-- Docker + gluetun WireGuard VPN (Polymarket geo-blocks Hungary); VPN config `protonvpn-NL-FREE-161.conf`
+- Docker + gluetun WireGuard VPN (Polymarket geo-blocks Hungary)
 - Express dashboard on container port 8080 → host 8082
 
 ## Key rules
@@ -32,11 +32,6 @@ POLL_INTERVAL_MS=30000                  # 30 s per cycle
 PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
 AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42    # auto-exclude when 7d WR < threshold
-# WR source order: real closedTrades (preferred) → shadowClosedTrades (fallback when
-# real n<3) → Falcon ≥0.80 only when BOTH books are empty. Shadow fallback matters
-# because raw Falcon/Polymarket WR reflects a trader's full activity, while our copy
-# performance is gated by filters (MIN_PRICE, MAX_SPREAD, sports floor, etc.) — the
-# shadow book is the only accurate signal-quality estimate before any real copies land.
 MIN_TRADER_SAMPLE=5                     # min locally-closed trades before copying (real)
 MIN_TRADER_SHADOW_SAMPLE=20             # shadow-closed alt unlock; breaks chicken-and-egg
 
@@ -50,12 +45,10 @@ MAX_POSITIONS_PER_MARKET=2
 MAX_POSITIONS_PER_MARKET_SPORTS=1
 MAX_TOTAL_OPEN_POSITIONS=300
 
-# Watchlist-only per-market entry cap. Existing MAX_POSITIONS_PER_MARKET counts
-# only concurrent open positions, so BUY-SELL-BUY cycles (e.g. 4× DFB stack on a
-# 90-min match) slip past it. This cap counts open + closed watchlist entries on
-# the same slug within the window. Default: 2 entries per 12h.
+# Watchlist-only entry cap (open+closed within window) — closes the BUY-SELL-BUY
+# loophole that MAX_POSITIONS_PER_MARKET (open-only) lets through.
 MAX_WATCHLIST_ENTRIES_PER_MARKET=2
-MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000
+MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000   # 12h
 
 GAS_COST_PER_BUY=0                      # Polymarket charges no fees on sports markets
 SLIPPAGE_RATE=0.02                      # 2% each side (entry at ask, exit at bid)
@@ -72,6 +65,28 @@ FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
 
 ## Secrets (`.env` on server)
 WireGuard creds (`WIREGUARD_PRIVATE_KEY`, `WIREGUARD_PUBLIC_KEY`, `WIREGUARD_ENDPOINT_IP`, `WIREGUARD_ADDRESSES`) live in `/home/user/polymarket_bot/.env` and are referenced from `docker-compose.yml` as `${…}`. The port stays hardcoded at `51820`. Do not hardcode the creds in compose — that caused VPN drift previously (compose froze while `.env` was rotated). `.env` is gitignored; to rotate, edit on the server and `docker compose up -d gluetun bot`.
+
+## Shared alerting infrastructure (`~/.env.shared`)
+Telegram bot credentials are **not** in `~/polymarket_bot/.env`. They live at `~/.env.shared` (chmod 600, server-only) and are reused by `paper_trader` on the same host. Format:
+```
+TELEGRAM_BOT_TOKEN=<...>
+TELEGRAM_CHAT_ID=<...>
+```
+Host shell scripts source `~/.env.shared` directly. Future Docker services that need Telegram should add `env_file: [/home/user/.env.shared]` (see `paper_trader/docker-compose.yml` for the pattern).
+
+### Alerts
+Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/logs/`. **Neither directory is in the git repo** (server runtime only).
+
+Cron lines redirect both stdout and stderr to a `.cron.log` file (no host MTA configured, so unredirected stderr would be lost). The script's own `.log` file is for application-level entries; the `.cron.log` is for cron-side surface (anything printed to stdout/stderr). Two tokens are monitored: Bullpen refresh token (auto-refreshed by CLI as long as the refresh token itself is alive) and Falcon JWT (manual rotation only).
+
+Both scripts: alert at ≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=1` for test runs, app log `<name>-expiry.log` + cron stdout/stderr log `<name>-expiry.cron.log`.
+
+| Script | Cron | Token source | Refresh |
+|---|---|---|---|
+| `check-bullpen-expiry.sh` | `0 9 * * *` | `~/.bullpen/credentials.json` (refresh_token JWT) | `bullpen login` on server |
+| `check-falcon-expiry.sh` | `0 9 * * *` | `POLYMARKET_ANALYTICS_API_KEY` (= `FALCON_API_KEY`) in `~/polymarket_bot/.env`, raw JWT, no auto-refresh, ~60 day TTL | Generate new JWT at https://polymarketanalytics.com → update `.env` → `docker compose up -d --no-deps bot` |
+
+New alerts: copy `send_telegram()` from `check-bullpen-expiry.sh` (self-contained, sources `~/.env.shared`). Use `[polymarket_bot]` prefix so messages group separately from `paper_trader`. Always log one line per run so a quiet log proves the cron ran.
 
 ## Deploy (container rebuild)
 ```bash
