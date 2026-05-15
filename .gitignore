@@ -1,10 +1,13 @@
 node_modules/
 dist/
 data/
+logs/
 .env
+*.log
 *.conf
 key/
 .claude/
 .tmp_verify/
+CLAUDE.md.backup-*
 # Added by code-review-graph
 .code-review-graph/

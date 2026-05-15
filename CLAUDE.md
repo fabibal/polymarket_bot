@@ -11,6 +11,7 @@ DRY_RUN simulation-only copy bot. Tracks top 10 traders by weekly PNL plus a per
 ## Key rules
 - **Never flip `DRY_RUN=false`** without an explicit instruction in the current conversation.
 - Ask before guessing — use AskUserQuestion for anything ambiguous.
+- **Watchlist traders bypass ALL filters by design.** Price floor/ceiling, spread cap, category exclusions (incl. `FORCE_EXCLUDE_CATEGORIES`), and min-sample gates do NOT apply to watchlist entries. Watchlist = explicit user trust override; only `MAX_WATCHLIST_ENTRIES_PER_MARKET` / `MAX_WATCHLIST_ENTRY_WINDOW_MS` and `MAX_TOTAL_OPEN_POSITIONS` still constrain them.
 - `store.ts` persistence: `writeStore()` is an immediate atomic flush (temp+rename) used for financial mutations (addOpenTrade, closeOpenTrade, resolveByPrice) and user-driven dashboard actions. `markDirty()` defers the write; a 60 s background flusher started by `startAutoFlush()` in `index.ts` coalesces bursts. Signal handlers force a final flush on exit.
 
 ## Bullpen API gotchas
@@ -56,12 +57,13 @@ SLIPPAGE_RATE=0.02                      # 2% each side (entry at ask, exit at bi
 FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
 ```
 
-## Server + SSH
+## Server Environment
 - Host: `<server-host>` (fallback IP `<server-ip>`), port `<ssh-port>`, user `user`
-- Key: `~/.ssh/id_ed25519`
-- Runtime dir: `/home/user/polymarket_bot/` — **not a git repo**, deploys land via SCP
+- Key: `~/.ssh/id_ed25519` (server local key)
+- Runtime dir: `/home/user/polymarket_bot/` — **source of truth filesystem**
 - Bullpen CLI on server: `/home/user/.npm-global/lib/node_modules/@bullpenfi/cli/bin/bullpen`
 - Dashboard: http://localhost:8082
+- Claude Code runs directly on the server — no Windows dependency
 
 ## Secrets (`.env` on server)
 WireGuard creds (`WIREGUARD_PRIVATE_KEY`, `WIREGUARD_PUBLIC_KEY`, `WIREGUARD_ENDPOINT_IP`, `WIREGUARD_ADDRESSES`) live in `/home/user/polymarket_bot/.env` and are referenced from `docker-compose.yml` as `${…}`. The port stays hardcoded at `51820`. Do not hardcode the creds in compose — that caused VPN drift previously (compose froze while `.env` was rotated). `.env` is gitignored; to rotate, edit on the server and `docker compose up -d gluetun bot`.
@@ -88,32 +90,68 @@ Both scripts: alert at ≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=
 
 New alerts: copy `send_telegram()` from `check-bullpen-expiry.sh` (self-contained, sources `~/.env.shared`). Use `[polymarket_bot]` prefix so messages group separately from `paper_trader`. Always log one line per run so a quiet log proves the cron ran.
 
-## Deploy (container rebuild)
+## Deploy Process (container rebuild)
+Code changes are made directly on the server filesystem. Source of truth is `/home/user/polymarket_bot/`.
+
 ```bash
-SSH='ssh -p <ssh-port> -i "~/.ssh/id_ed25519" user@<server-host>'
-SCP='scp -P <ssh-port> -i "~/.ssh/id_ed25519"'
-
-$SCP src/*.ts user@<server-host>:/home/user/polymarket_bot/src/
-$SCP public/index.html user@<server-host>:/home/user/polymarket_bot/public/
-# SCP docker-compose.yml too if changed
-
-$SSH "cd ~/polymarket_bot && docker compose up -d --build && docker logs polymarket_bot --tail 20"
+# After editing files on server
+cd ~/polymarket_bot 
+docker compose up -d --build
+docker logs polymarket_bot --tail 20
 ```
 
-## GitHub push (separate from container deploy)
+## GitHub Repository Sync
 - Repo: `git@github.com:fabibal/polymarket_bot.git` (private, default branch `main`)
-- Windows workstation has no GitHub SSH key — push must go through the server, which has `~/.ssh/deploy-key` wired via `Host github.com` in `~/.ssh/config`.
-- Commit author: `Balazs <fabibal@users.noreply.github.com>` (pass with `-c user.name= -c user.email=` since the server-wide git identity may differ).
+- Server has GitHub SSH key configured: `~/.ssh/deploy-key` wired via `Host github.com` in `~/.ssh/config`
+- Commit author: `Balazs <fabibal@users.noreply.github.com>` (pass with `-c user.name= -c user.email=`)
 
+To push changes to GitHub (run from server):
 ```bash
-$SSH "rm -rf /tmp/pb_gh_deploy && git clone git@github.com:fabibal/polymarket_bot.git /tmp/pb_gh_deploy"
-$SCP <changed files> user@<server-host>:/tmp/pb_gh_deploy/<matching subpath>/
-$SSH 'cd /tmp/pb_gh_deploy && git status --porcelain && \
-  git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" add <files> && \
-  git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" commit -m "<subject>" && \
-  git push origin HEAD:main && \
-  git ls-remote git@github.com:fabibal/polymarket_bot.git HEAD'
-$SSH "rm -rf /tmp/pb_gh_deploy"
+cd ~/polymarket_bot
+git status --porcelain
+git add <files>
+git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" commit -m "<subject>"
+git push origin HEAD:main
+git ls-remote git@github.com:fabibal/polymarket_bot.git HEAD
 ```
 
-The GitHub push does NOT deploy. Container rebuild is the separate step above.
+Note: GitHub push is separate from container deployment. Both are manual operations.
+
+<!-- code-review-graph MCP tools -->
+## MCP Tools: code-review-graph
+
+**IMPORTANT: This project has a knowledge graph. ALWAYS use the
+code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
+the codebase.** The graph is faster, cheaper (fewer tokens), and gives
+you structural context (callers, dependents, test coverage) that file
+scanning cannot.
+
+### When to use graph tools FIRST
+
+- **Exploring code**: `semantic_search_nodes` or `query_graph` instead of Grep
+- **Understanding impact**: `get_impact_radius` instead of manually tracing imports
+- **Code review**: `detect_changes` + `get_review_context` instead of reading entire files
+- **Finding relationships**: `query_graph` with callers_of/callees_of/imports_of/tests_for
+- **Architecture questions**: `get_architecture_overview` + `list_communities`
+
+Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
+
+### Key Tools
+
+| Tool | Use when |
+|------|----------|
+| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
+| `get_review_context` | Need source snippets for review — token-efficient |
+| `get_impact_radius` | Understanding blast radius of a change |
+| `get_affected_flows` | Finding which execution paths are impacted |
+| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
+| `semantic_search_nodes` | Finding functions/classes by name or keyword |
+| `get_architecture_overview` | Understanding high-level codebase structure |
+| `refactor_tool` | Planning renames, finding dead code |
+
+### Workflow
+
+1. The graph auto-updates on file changes (via hooks).
+2. Use `detect_changes` for code review.
+3. Use `get_affected_flows` to understand impact.
+4. Use `query_graph` pattern="tests_for" to check coverage.
