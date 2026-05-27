@@ -85,7 +85,7 @@ Both scripts: alert at ≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=
 
 | Script | Cron | Token source | Refresh |
 |---|---|---|---|
-| `check-bullpen-expiry.sh` | `0 9 * * *` | `~/.bullpen/credentials.json` (refresh_token JWT) | `bullpen login` on server |
+| `check-bullpen-expiry.sh` | `0 9 * * *` | `bullpen --output json status` → `account.session_expires` (CLI ≥0.1.98 stores creds encrypted as `credentials.json.enc`, so JWT is no longer decodable from disk; script shells out to the CLI instead) | `bullpen login` on server |
 | `check-falcon-expiry.sh` | `0 9 * * *` | `POLYMARKET_ANALYTICS_API_KEY` (= `FALCON_API_KEY`) in `~/polymarket_bot/.env`, raw JWT, no auto-refresh, ~60 day TTL | Generate new JWT at https://polymarketanalytics.com → update `.env` → `docker compose up -d --no-deps bot` |
 | `git-sync.sh` | `0 3 * * *` | Tracked changes under `src/`, `tests/`, `scripts/`, `public/`, plus `CLAUDE.md`, `Dockerfile`, `docker-compose.yml`, `package*.json`, `tsconfig.json`, `.gitignore`, `.env.example` | Auto: stages `git add -u` on those paths, commits as `chore(sync): daily auto-sync <date>`, pushes to `origin/main` via `~/.ssh/deploy-key`. Skips silently when no diff. Untracked files are NOT auto-added — add them manually if they belong in git. Log: `logs/git-sync.log` (rotated to last 100 lines) + `logs/git-sync.cron.log` |
 
