@@ -1,5 +1,5 @@
 import { refreshLeaderboard } from './leaderboard';
-import { pollTrader } from './monitor';
+import { pollTrader, resetSkipDedup } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
 import { readStore, runDailyCleanup, startAutoFlush, stopAutoFlush, flushIfDirty, initInsertionCounter, updateOpenTradeDepth } from './store';
@@ -35,6 +35,7 @@ async function backfillOpenTradeDepth(): Promise<void> {
 }
 
 async function runPollingCycle(): Promise<void> {
+  resetSkipDedup();
   const store = readStore();
   const excluded = new Set(store.excludedTraders ?? []);
   const traders = store.trackedTraders.filter(t => !excluded.has(t.address));

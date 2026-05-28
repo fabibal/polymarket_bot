@@ -282,6 +282,8 @@ function getDb(): Db {
   d.pragma('journal_mode = WAL');
   d.pragma('foreign_keys = ON');
   d.exec(SCHEMA);
+  // Truncate stale WAL on startup; saw 44MB WAL alongside 41MB db on 2026-05-28.
+  try { d.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* non-fatal */ }
   migrateDepthColumns(d);
   seedIfFresh(d);
   _initInsertionCounterFromDb(d);

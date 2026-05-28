@@ -12,6 +12,16 @@ import { countWatchlistEntriesInWindow } from './filters';
 import { computeEntryCosts } from './simulator';
 import { v4 as uuidv4 } from 'uuid';
 
+// Per-cycle skip-log dedup. Same market_slug fires repeatedly across traders
+// and Yes/No outcomes, flooding logs. Cleared at the start of each poll cycle.
+const loggedSkipsThisCycle = new Set<string>();
+export function resetSkipDedup(): void { loggedSkipsThisCycle.clear(); }
+function logSkipOnce(key: string, msg: string): void {
+  if (loggedSkipsThisCycle.has(key)) return;
+  loggedSkipsThisCycle.add(key);
+  console.log(msg);
+}
+
 export function hasSufficientSample(
   realClosed: number,
   shadowClosed: number,
@@ -212,6 +222,25 @@ export async function pollTrader(
         }
       }
 
+      // ── Simulated wallet cap (applies to BOTH watchlist and leaderboard) ──
+      // Models a fixed-size real wallet. When sum of open simulatedAmount reaches
+      // SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION, refuse new BUYs.
+      if (CONFIG.SIMULATED_WALLET_SIZE > 0) {
+        const inUse = currentStore.openTrades.reduce(
+          (s, t) => s + (t.simulatedAmount ?? CONFIG.TRADE_AMOUNT), 0
+        );
+        const cap = CONFIG.SIMULATED_WALLET_SIZE * CONFIG.WALLET_CAP_UTILIZATION;
+        if (inUse + tradeAmount > cap) {
+          console.log(
+            `[monitor] Skip BUY ${activity.marketSlug} — wallet_cap: ` +
+            `$${inUse.toFixed(0)}/$${CONFIG.SIMULATED_WALLET_SIZE} in use ` +
+            `(cap $${cap.toFixed(0)} @ ${(CONFIG.WALLET_CAP_UTILIZATION * 100).toFixed(0)}%)`
+          );
+          markProcessed(activity.id);
+          continue;
+        }
+      }
+
       // ── Global and per-market caps (leaderboard only — watchlist bypasses) ──
       if (!isWatchlist) {
         if (currentStore.openTrades.length >= CONFIG.MAX_TOTAL_OPEN_POSITIONS) {
@@ -228,7 +257,8 @@ export async function pollTrader(
           ? CONFIG.MAX_POSITIONS_PER_MARKET_SPORTS
           : CONFIG.MAX_POSITIONS_PER_MARKET;
         if (marketPositions >= marketLimit) {
-          console.log(
+          logSkipOnce(
+            `mlimit:${activity.marketSlug}`,
             `[monitor] Skip BUY ${activity.marketSlug} — market limit of ${marketLimit} positions reached (${marketPositions} open)${isSportsMarket ? ' [sports]' : ''}`
           );
           markProcessed(activity.id);
@@ -264,7 +294,8 @@ export async function pollTrader(
         const cat = detectCategory(activity.marketSlug);
         const excludedCats = currentStore.excludedCategories ?? [];
         if (excludedCats.includes(cat)) {
-          console.log(
+          logSkipOnce(
+            `excat:${cat}:${activity.marketSlug}`,
             `[monitor] Skip BUY ${activity.marketSlug} — category ${cat} is excluded`
           );
           markProcessed(activity.id);

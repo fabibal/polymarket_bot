@@ -194,7 +194,7 @@
     }
     .stat-card .sub {
       color: var(--muted);
-      font-size: 11px;
+      font-size: 13px;
       margin-top: 4px;
     }
     .green { color: var(--green); }
@@ -553,17 +553,19 @@
 
 <main>
   <!-- Watchlist stat cards -->
+  <h2 style="margin:0 0 10px 0; font-size:15px; color:var(--muted); font-weight:600; letter-spacing:.04em; text-transform:uppercase;">
+    Watchlist Performance <span style="color:var(--text); text-transform:none; letter-spacing:0; font-weight:400; font-size:12px;">— excludes leaderboard &amp; legacy trades</span>
+  </h2>
   <div class="stats-grid">
     <div class="stat-card">
-      <div class="label">Total PNL</div>
+      <div class="label">Total PNL <span style="color:var(--muted); font-weight:400;">· watchlist only</span></div>
       <div class="value" id="wl-s-total-pnl">—</div>
       <div class="sub">realized + unrealized</div>
     </div>
     <div class="stat-card">
       <div class="label">Slippage-Adjusted PNL</div>
       <div class="value" id="wl-s-adj-pnl">—</div>
-      <div class="sub" id="wl-s-adj-pnl-sub">no gas fees on sports · 2% slippage/side</div>
-      <div class="sub" id="wl-s-adj-pnl-edge">—</div>
+      <div class="sub" id="wl-s-adj-pnl-sub">—</div>
     </div>
     <div class="stat-card">
       <div class="label">Realized PNL</div>
@@ -586,14 +588,19 @@
       <div class="sub" id="wl-s-trades-sub">—</div>
     </div>
     <div class="stat-card">
-      <div class="label">Winners</div>
-      <div class="value green" id="wl-s-winners">—</div>
-      <div class="sub">resolved profitable</div>
+      <div class="label">💰 Wallet</div>
+      <div class="value" id="wl-s-wallet">—</div>
+      <div class="sub" id="wl-s-wallet-sub">simulated, hard cap</div>
     </div>
     <div class="stat-card">
-      <div class="label">Losers</div>
-      <div class="value red" id="wl-s-losers">—</div>
-      <div class="sub">resolved at loss</div>
+      <div class="label">Wallet Cap Skips</div>
+      <div class="value" id="wl-s-wallet-skips">—</div>
+      <div class="sub">trades skipped (last 7d)</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">📊 Open Positions</div>
+      <div class="value" id="wl-s-open-limit">—</div>
+      <div class="sub" id="wl-s-open-limit-sub">wallet cap: $800 / $5</div>
     </div>
   </div>
 
@@ -615,22 +622,26 @@
       <div class="chart-card-title">Realized PNL by Trader</div>
       <div class="chart-wrap"><canvas id="wl-chart-traders"></canvas></div>
     </div>
-    <div class="chart-card" style="grid-column: 1 / -1">
+  </div>
+
+  <!-- Open positions + category breakdown side by side -->
+  <div class="charts-grid">
+    <div class="chart-card">
       <div class="chart-card-title">Open Positions Over Time</div>
       <div class="chart-wrap"><canvas id="wl-chart-open-history"></canvas></div>
     </div>
-  </div>
-
-  <!-- Watchlist category breakdown -->
-  <div class="section" id="wl-cat-section" style="display:none">
-    <div class="section-header">
-      <div class="section-header-left">
-        <span class="section-title">Closed Trades by Category</span>
-        <span class="section-count" id="wl-cat-total">0</span>
-      </div>
-      <span style="font-size:10px;color:var(--muted);font-family:system-ui">all watchlist closed trades · slug-derived</span>
+    <div class="chart-card">
+      <div class="chart-card-title">Wallet Utilization Over Time</div>
+      <div class="chart-wrap"><canvas id="wl-chart-wallet-history"></canvas></div>
     </div>
-    <div id="wl-cat-bars" style="padding:10px 12px"></div>
+    <div class="chart-card" id="wl-cat-section" style="display:none">
+      <div class="chart-card-title">
+        Closed Trades by Category
+        <span class="section-count" id="wl-cat-total" style="margin-left:6px">0</span>
+        <span style="font-size:10px;color:var(--muted);font-family:system-ui;font-weight:400;margin-left:8px">all watchlist closed trades · slug-derived</span>
+      </div>
+      <div id="wl-cat-bars"></div>
+    </div>
   </div>
 
   <!-- Discovery candidates (collapsible) -->
@@ -960,7 +971,7 @@
       }
       if (d.realizedPnl != null) {
         html += `<div class="wl-stat-row">
-          <span class="wl-stat-label">Realized PNL</span>
+          <span class="wl-stat-label">Total PNL (M2M)</span>
           <span class="wl-stat-val ${pnlClass(d.realizedPnl)}">${fmtPnl(d.realizedPnl)}</span>
         </div>`;
       }
@@ -969,6 +980,17 @@
           <span class="wl-stat-label">Win Rate</span>
           <span class="wl-stat-val ${d.winRate >= 0.5 ? 'green' : 'red'}">${(d.winRate * 100).toFixed(1)}%
             <span style="color:var(--muted);font-size:10px">${d.winCount}W / ${d.lossCount}L</span>
+          </span>
+        </div>`;
+      }
+      if (d.activeSince) {
+        const since = new Date(d.activeSince);
+        const months = Math.max(1, Math.round((Date.now() - since.getTime()) / (30 * 86400000)));
+        const dateStr = since.toISOString().slice(0, 10);
+        html += `<div class="wl-stat-row">
+          <span class="wl-stat-label">Active since</span>
+          <span class="wl-stat-val">${dateStr}
+            <span style="color:var(--muted);font-size:10px">${months} mo</span>
           </span>
         </div>`;
       }
@@ -1373,6 +1395,7 @@
       data: { labels, datasets: [{ data: series, backgroundColor: colors, borderWidth: 0, barPercentage: 0.9, categoryPercentage: 0.95 }] },
       options: {
         responsive: true, maintainAspectRatio: false, animation: false,
+        devicePixelRatio: Math.max(window.devicePixelRatio || 1, 2),
         plugins: { legend: { display: false }, tooltip: { callbacks: { label: (ctx) => fmtPnl(ctx.parsed.y) } } },
         scales: {
           x: { ticks: { color: 'rgba(255,255,255,0.4)', font: { size: 9 }, maxRotation: 0, autoSkip: true, maxTicksLimit: 8 }, grid: { display: false } },
@@ -1654,14 +1677,7 @@
       const wlAdjPnl = (s.totalRealizedPnlAdjusted || 0) + (s.totalUnrealizedPnlAdjusted || 0);
       setVal('wl-s-adj-pnl', fmtPnl(wlAdjPnl), pnlClass(wlAdjPnl));
       const wlAdjSub = $('wl-s-adj-pnl-sub');
-      if (wlAdjSub) wlAdjSub.textContent = `slippage cost: ${fmtPnl(-(s.totalTradingCosts || 0))} (no gas on sports)`;
-      const wlEdge = $('wl-s-adj-pnl-edge');
-      if (wlEdge) {
-        const raw = (s.avgRawPnlPerTrade ?? 0);
-        const slip = (s.avgSlippagePerTrade ?? 0);
-        const net = (s.avgNetEdgePerTrade ?? 0);
-        wlEdge.textContent = `avg/trade: raw ${fmtPnl(raw)} − slip $${slip.toFixed(3)} = net ${fmtPnl(net)}`;
-      }
+      if (wlAdjSub) wlAdjSub.textContent = `avg/trade net: ${fmtPnl(s.avgNetEdgePerTrade ?? 0)}`;
       setVal('wl-s-realized-pnl',  fmtPnl(s.totalRealizedPnl), pnlClass(s.totalRealizedPnl));
       setVal('wl-s-unrealized-pnl',fmtPnl(s.totalUnrealizedPnl), pnlClass(s.totalUnrealizedPnl));
 
@@ -1673,9 +1689,47 @@
       }
       const wrSub = $('wl-s-win-rate-sub'); if (wrSub) wrSub.textContent = `${s.closedTrades} resolved`;
       const ttEl = $('wl-s-total-trades'); if (ttEl) { ttEl.textContent = s.totalTrades; ttEl.className = 'value blue'; }
-      const tSub = $('wl-s-trades-sub'); if (tSub) tSub.textContent = `${s.openTrades} open · ${s.closedTrades} closed`;
-      const winEl = $('wl-s-winners'); if (winEl) winEl.textContent = s.winners;
-      const lossEl = $('wl-s-losers'); if (lossEl) lossEl.textContent = s.losers;
+      const tSub = $('wl-s-trades-sub'); if (tSub) tSub.innerHTML = `<span style="color:#4ade80">${s.winners} W</span> / <span style="color:#f87171">${s.losers} L</span>`;
+
+      // Wallet card — color by utilization band (<60 green, 60–80 yellow, >80 red)
+      const walletEl = $('wl-s-wallet');
+      const walletSubEl = $('wl-s-wallet-sub');
+      if (walletEl) {
+        const size = Number(s.simulatedWalletSize || 0);
+        const inUse = Number(s.walletInUse || 0);
+        const util = size > 0 ? inUse / size : 0;
+        const pct = (util * 100).toFixed(0);
+        walletEl.textContent = `$${inUse.toFixed(0)} / $${size.toFixed(0)} (${pct}%)`;
+        const cls = util > 0.80 ? 'red' : util >= 0.60 ? 'yellow' : 'green';
+        walletEl.className = 'value ' + cls;
+        if (walletSubEl) {
+          const cap = size * (Number(s.walletCapUtilization || 0));
+          walletSubEl.textContent = `cap $${cap.toFixed(0)} @ ${((s.walletCapUtilization || 0) * 100).toFixed(0)}%`;
+        }
+      }
+      const skipsEl = $('wl-s-wallet-skips');
+      if (skipsEl) {
+        const n = Number(s.walletCapSkips7d || 0);
+        skipsEl.textContent = n;
+        skipsEl.className = 'value ' + (n > 0 ? 'red' : 'blue');
+      }
+
+      // Effective open-position limit derived from wallet cap (cap $ / $5 per trade)
+      const openLimEl = $('wl-s-open-limit');
+      const openLimSub = $('wl-s-open-limit-sub');
+      if (openLimEl) {
+        const tradeAmt = 5;
+        const size = Number(s.simulatedWalletSize || 0);
+        const util = Number(s.walletCapUtilization || 0);
+        const cap = size * util;
+        const limit = Math.floor(cap / tradeAmt);
+        const open = Number(s.openTrades || 0);
+        openLimEl.textContent = `${open} / ${limit}`;
+        const cls = open > 140 ? 'red' : open >= 80 ? 'yellow' : 'green';
+        openLimEl.className = 'value ' + cls;
+        if (openLimSub) openLimSub.textContent = `wallet cap: $${cap.toFixed(0)} / $${tradeAmt}`;
+      }
+
       $('last-updated').textContent = 'Updated ' + timeAgo(s.lastUpdated);
       $('status-dot').className = 'ok';
     } catch (e) {
@@ -1731,7 +1785,7 @@
   }
 
   // ── Watchlist charts ───────────────────────────────────────────────────────
-  let wlChartEquity = null, wlChartDrawdown = null, wlChartWinRate = null, wlChartTraders = null, wlChartOpenHistory = null;
+  let wlChartEquity = null, wlChartDrawdown = null, wlChartWinRate = null, wlChartTraders = null, wlChartOpenHistory = null, wlChartWalletHistory = null;
 
   function initWatchlistCharts() {
     const ctx = id => document.getElementById(id).getContext('2d');
@@ -1784,6 +1838,19 @@
         { label: 'MAX_TOTAL_OPEN_POSITIONS', data: [], borderColor: '#f85149', borderWidth: 1.5, pointRadius: 0, borderDash: [6, 4], fill: false },
       ]},
       options: makeChartOpts(c => c.datasetIndex === 0 ? `${c.raw} open` : `limit ${c.raw}`),
+    });
+    wlChartWalletHistory = new Chart(ctx('wl-chart-wallet-history'), {
+      type: 'line',
+      data: { labels: [], datasets: [
+        { label: '$ in use', data: [], borderColor: '#bc8cff', borderWidth: 2, pointRadius: 0, fill: true, backgroundColor: 'rgba(188,140,255,0.10)', tension: 0.2 },
+        { label: 'cap ($800 @ 80%)', data: [], borderColor: '#f85149', borderWidth: 1.5, pointRadius: 0, borderDash: [6, 4], fill: false },
+      ]},
+      options: (() => {
+        const opts = makeChartOpts(c => c.datasetIndex === 0 ? `$${Number(c.raw).toFixed(0)} in use` : `cap $${Number(c.raw).toFixed(0)}`);
+        opts.scales.y.min = 0;
+        opts.scales.y.suggestedMax = 1000;
+        return opts;
+      })(),
     });
   }
 
@@ -1843,6 +1910,17 @@
       wlChartOpenHistory.update('none');
     } catch (e) {
       console.error('[wl-open-history] Load failed:', e);
+    }
+    try {
+      const r = await fetch('/api/wallet/history');
+      const d = await r.json();
+      const cap = Number(d.cap) || 800;
+      wlChartWalletHistory.data.labels = d.days || [];
+      wlChartWalletHistory.data.datasets[0].data = d.amounts || [];
+      wlChartWalletHistory.data.datasets[1].data = (d.days || []).map(() => cap);
+      wlChartWalletHistory.update('none');
+    } catch (e) {
+      console.error('[wl-wallet-history] Load failed:', e);
     }
   }
 
