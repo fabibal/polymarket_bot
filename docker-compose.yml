@@ -49,6 +49,8 @@ services:
       - ${BULLPEN_CONFIG_PATH:-~/.bullpen}:/root/.bullpen:ro
       # Docker socket (read-only) — used by dashboard to query container CPU/RAM stats
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Host logs dir (read-only) — dashboard reads weekly-macro-scan output
+      - ./logs:/app/logs:ro
     environment:
       - NODE_OPTIONS=--max-old-space-size=450
       - DRY_RUN=true

@@ -53,6 +53,12 @@ export const CONFIG = {
   // 2% slippage each side (entry at ask, exit at bid) still applies.
   GAS_COST_PER_BUY: parseFloat(process.env.GAS_COST_PER_BUY ?? '0'),
   SLIPPAGE_RATE:    parseFloat(process.env.SLIPPAGE_RATE    ?? '0.02'),
+  // Watchlist-only depth gate: skip BUY when CLOB ask_depth_5 (USD available within
+  // 5% of best ask) is below this floor. Added 2026-05-27 — protects against thin
+  // books where a $5-15 copy would itself move the market, and improves statistical
+  // validity of the watchlist edge by removing low-liquidity tail trades. Non-blocking
+  // on depth-fetch failure (copy proceeds when orderbook unavailable).
+  DEPTH_GATE_MIN_DEPTH_5: parseFloat(process.env.DEPTH_GATE_MIN_DEPTH_5 ?? '500'),
   // Falcon (Polymarket Analytics) API key — optional, enables Falcon leaderboard enrichment
   FALCON_API_KEY: process.env.FALCON_API_KEY ?? '',
 };

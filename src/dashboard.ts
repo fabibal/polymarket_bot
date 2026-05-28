@@ -2,12 +2,11 @@ import express from 'express';
 import https from 'https';
 import http from 'http';
 import path from 'path';
-import { readStore, setTraderExclusion, setAutoExclusion, setCategoryExclusion, setLeaderboardFilters, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount } from './store';
-import { refreshLeaderboard } from './leaderboard';
-import { LeaderboardFilters } from './types';
+import fs from 'fs';
+import { readStore, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount } from './store';
 import { DashboardStats } from './types';
 import { CONFIG } from './config';
-import { getTraderActivity, getGammaTrendingMarkets, RawGammaMarket, checkVpnConnectivity, RawActivityItem } from './bullpen';
+import { checkVpnConnectivity, RawActivityItem } from './bullpen';
 import { detectCategory } from './categories';
 import { tradeCostAdjustedPnl, tradeTotalCosts } from './simulator';
 
@@ -23,10 +22,6 @@ type ActivityLike = {
   size?: number | null;
   usdc_size?: number | null;
 };
-
-// In-memory cache for trader history (TTL: 5 min)
-const statsCache = new Map<string, { data: unknown; ts: number }>();
-const STATS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // In-memory cache for Polymarket positions (TTL: 2 min)
 const positionsCache = new Map<string, { data: unknown[]; ts: number }>();
@@ -159,59 +154,6 @@ async function fetchOneContainerStat(name: string): Promise<ContainerStat> {
 const MONITORED_CONTAINERS = ['gluetun', 'polymarket_bot'];
 let containerStatsCache: { data: ContainerStat[]; ts: number } | null = null;
 const CONTAINER_STATS_TTL_MS = 25_000;
-
-// In-memory cache for trending markets (TTL: 5 min)
-interface TrendingOutcome { name: string; price: number }
-interface TrendingMarket {
-  slug: string;
-  title: string;
-  category: string;
-  volume24h: number;
-  outcomes: TrendingOutcome[];
-  url: string;
-}
-let trendingCache: { data: TrendingMarket[]; ts: number } | null = null;
-const TRENDING_CACHE_TTL_MS = 5 * 60 * 1000;
-
-function buildTrendingMarkets(markets: RawGammaMarket[]): TrendingMarket[] {
-  const result: TrendingMarket[] = [];
-  for (const m of markets) {
-    // Parse outcomes and prices from JSON strings
-    let outcomeNames: string[] = [];
-    let outcomePrices: number[] = [];
-    try { outcomeNames  = JSON.parse(m.outcomes ?? '[]'); }      catch {}
-    try { outcomePrices = JSON.parse(m.outcomePrices ?? '[]').map(Number); } catch {}
-
-    const outcomes: TrendingOutcome[] = [];
-    const pairs = outcomeNames.map((name, i) => ({ name, price: outcomePrices[i] ?? 0 }));
-    const yesOut = pairs.find(o => o.name === 'Yes');
-    const noOut  = pairs.find(o => o.name === 'No');
-    if (yesOut && noOut) {
-      outcomes.push({ name: 'Yes', price: yesOut.price });
-      outcomes.push({ name: 'No',  price: noOut.price  });
-    } else {
-      // Multi-outcome: top 2 by price
-      for (const o of [...pairs].sort((a, b) => b.price - a.price).slice(0, 2)) {
-        outcomes.push({ name: o.name, price: o.price });
-      }
-    }
-
-    // Prefer event-level slug/title for the URL and display
-    const event    = m.events?.[0];
-    const urlSlug  = event?.slug ?? m.slug;
-    const title    = event?.title ?? m.question;
-
-    result.push({
-      slug:      m.slug,
-      title,
-      category:  detectCategory(m.slug),
-      volume24h: m.volume24hr ?? 0,
-      outcomes,
-      url: `https://polymarket.com/event/${urlSlug}`,
-    });
-  }
-  return result;
-}
 
 function computeTraderStats(address: string, trades: ActivityLike[]) {
   type BuyEntry = { price: number; size: number; slug: string; title: string; outcome: string };
@@ -360,10 +302,7 @@ export function startDashboard(): void {
 
     let openTrades  = store.openTrades;
     let closedTrades = store.closedTrades;
-    if (source === 'leaderboard') {
-      openTrades   = openTrades.filter(t => t.copiedTraderSource !== 'watchlist');
-      closedTrades = closedTrades.filter(t => t.copiedTraderSource !== 'watchlist');
-    } else if (source === 'watchlist') {
+    if (source === 'watchlist') {
       openTrades   = openTrades.filter(t => t.copiedTraderSource === 'watchlist');
       closedTrades = closedTrades.filter(t => t.copiedTraderSource === 'watchlist');
     }
@@ -408,7 +347,7 @@ export function startDashboard(): void {
       avgSlippagePerTrade:        avgSlippage,
       avgNetEdgePerTrade:         avgNetEdge,
     } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number };
-    res.json({ ...stats, excludedCategories: store.excludedCategories ?? [] });
+    res.json(stats);
   });
 
   app.get('/api/trades', (req, res) => {
@@ -427,9 +366,7 @@ export function startDashboard(): void {
     }
 
     let all = [...store.openTrades, ...store.closedTrades];
-    if (source === 'leaderboard') {
-      all = all.filter(t => t.copiedTraderSource !== 'watchlist');
-    } else if (source === 'watchlist') {
+    if (source === 'watchlist') {
       all = all.filter(t => t.copiedTraderSource === 'watchlist');
     }
     if (cutoff !== null) {
@@ -437,229 +374,6 @@ export function startDashboard(): void {
     }
     all.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
     res.json({ count: all.length, items: all });
-  });
-
-  app.get('/api/traders', (_req, res) => {
-    const store = readStore();
-    const excluded = new Set(store.excludedTraders);
-    const cutoff = Date.now() - 30 * 86_400_000;
-
-    // Aggregate shadow stats per trader address
-    const shadowStatsMap: Record<string, { openCount: number; wins: number; losses: number; pnl: number; lastSeen?: string }> = {};
-    for (const t of (store.shadowOpenTrades ?? [])) {
-      const a = t.copiedTrader;
-      shadowStatsMap[a] ||= { openCount: 0, wins: 0, losses: 0, pnl: 0 };
-      shadowStatsMap[a].openCount++;
-    }
-    for (const t of (store.shadowClosedTrades ?? [])) {
-      const a = t.copiedTrader;
-      shadowStatsMap[a] ||= { openCount: 0, wins: 0, losses: 0, pnl: 0 };
-      const pnl = t.realizedPnl ?? 0;
-      if (pnl > 0) shadowStatsMap[a].wins++; else shadowStatsMap[a].losses++;
-      shadowStatsMap[a].pnl += pnl;
-      const ts = t.closedAt ?? t.timestamp;
-      if (!shadowStatsMap[a].lastSeen || ts > shadowStatsMap[a].lastSeen!) shadowStatsMap[a].lastSeen = ts;
-    }
-
-    const items = store.trackedTraders.map(t => {
-      const hist       = store.traderHistory?.[t.address];
-      const histTrades = hist ? [...hist.buys, ...hist.sells] : [];
-
-      // Active/inactive flag
-      let inactive = false;
-      if (histTrades.length > 0) {
-        inactive = histTrades.filter(e => new Date(e.timestamp).getTime() >= cutoff).length < 3;
-      } else {
-        const lastSeen = store.traderLastSeen?.[t.address];
-        if (lastSeen) inactive = new Date(lastSeen).getTime() < cutoff;
-      }
-
-      // Inline stats for the table row (win rate from simulated closed trades, category/volume from local history)
-      const simClosed = store.closedTrades.filter(c => c.copiedTrader === t.address);
-      const inlineStats = computeInlineStats(t.address, histTrades, simClosed);
-
-      // All-time win rate from simulated closed trades.
-      // Note: Polymarket's profile API always returns win_rate=null so we compute it ourselves.
-      const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
-      const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
-
-      const shadowStats = shadowStatsMap[t.address];
-      return { ...t, excluded: excluded.has(t.address), inactive, inlineStats, allTimeWinRate, shadowStats };
-    });
-
-    // Append auto-excluded traders at the bottom (not in trackedTraders, but still shown in UI)
-    const threshold = CONFIG.AUTO_EXCLUDE_WIN_RATE_THRESHOLD;
-    const autoExclItems = (store.autoExcludedTraders ?? []).map(addr => {
-      const hist       = store.traderHistory?.[addr];
-      const histTrades = hist ? [...hist.buys, ...hist.sells] : [];
-      const simClosed  = store.closedTrades.filter(c => c.copiedTrader === addr);
-      const inlineStats = computeInlineStats(addr, histTrades, simClosed);
-
-      const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
-      const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
-      const realizedPnl = simClosed.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
-
-      const tradeWithName = store.closedTrades.find(t => t.copiedTrader === addr && t.copiedTraderUsername);
-
-      // Falcon win rate from persistent cache (populated during leaderboard refresh)
-      const falconWinRate = (store.traderFalconCache ?? {})[addr.toLowerCase()]?.winRate ?? null;
-
-      // Recovery: 7d sim win rate back above threshold OR Falcon win rate >= 60%
-      const current7dWr = inlineStats.hasEnoughData ? inlineStats.winRate7d : null;
-      const recovered = (current7dWr != null && current7dWr >= threshold) ||
-                        (falconWinRate != null && falconWinRate >= 0.6);
-
-      return {
-        address:          addr,
-        username:         tradeWithName?.copiedTraderUsername ?? undefined,
-        rank:             null,
-        weeklyPnl:        null,
-        excluded:         true,
-        autoExcluded:     true,
-        inactive:         false,
-        inlineStats,
-        allTimeWinRate,
-        realizedPnl,
-        recovered,
-        excludeThreshold: threshold,
-        falconWinRate,
-        shadowStats:      shadowStatsMap[addr],
-      };
-    });
-
-    res.json({ count: items.length, items: [...items, ...autoExclItems] });
-  });
-
-  app.post('/api/traders/:address/exclusion', (req, res) => {
-    const { address } = req.params;
-    const { excluded } = req.body as { excluded: boolean };
-    if (typeof excluded !== 'boolean') {
-      res.status(400).json({ error: 'excluded must be a boolean' });
-      return;
-    }
-    if (excluded) {
-      setTraderExclusion(address, true);
-    } else {
-      // Clear both manual and auto-exclusion so the trader can re-enter the leaderboard
-      setAutoExclusion(address, false);
-    }
-    statsCache.delete(address);
-    console.log(`[dashboard] Trader ${address.slice(0, 10)}... ${excluded ? 'excluded' : 'included (auto-exclusion cleared)'}`);
-    res.json({ address, excluded });
-  });
-
-  app.post('/api/categories/exclusion', (req, res) => {
-    const { category, excluded } = req.body as { category: string; excluded: boolean };
-    if (typeof category !== 'string' || !category) {
-      res.status(400).json({ error: 'category must be a non-empty string' });
-      return;
-    }
-    if (typeof excluded !== 'boolean') {
-      res.status(400).json({ error: 'excluded must be a boolean' });
-      return;
-    }
-    setCategoryExclusion(category, excluded);
-    console.log(`[dashboard] Category "${category}" ${excluded ? 'excluded' : 'included'} from trading`);
-    res.json({ category, excluded });
-  });
-
-  app.get('/api/settings/leaderboard-filters', (_req, res) => {
-    const store = readStore();
-    res.json({
-      filters: store.leaderboardFilters ?? { categories: [], minWinRate: 0, minTrades: 0, minSharpe: 0, minRoi: 0 },
-      stats: store.lastLeaderboardStats ?? null,
-    });
-  });
-
-  app.post('/api/settings/leaderboard-filters', (req, res) => {
-    const { categories, minWinRate, minTrades, minSharpe, minRoi } = req.body as {
-      categories?: unknown; minWinRate?: unknown; minTrades?: unknown;
-      minSharpe?: unknown; minRoi?: unknown;
-    };
-    const filters: LeaderboardFilters = {
-      categories: Array.isArray(categories)
-        ? (categories as string[]).filter(c => typeof c === 'string' && c !== 'all')
-        : [],
-      minWinRate: typeof minWinRate === 'number' ? Math.max(0, Math.min(1, minWinRate)) : 0,
-      minTrades:  typeof minTrades  === 'number' ? Math.max(0, Math.floor(minTrades))   : 0,
-      minSharpe:  typeof minSharpe  === 'number' ? Math.max(0, minSharpe)               : 0,
-      minRoi:     typeof minRoi     === 'number' ? Math.max(0, minRoi)                  : 0,
-    };
-    setLeaderboardFilters(filters);
-    console.log(`[dashboard] Leaderboard filters updated:`, JSON.stringify(filters));
-    // Trigger immediate refresh so filter takes effect without waiting 5 minutes
-    refreshLeaderboard().catch(err =>
-      console.error('[dashboard] Immediate leaderboard refresh failed:', err instanceof Error ? err.message : err)
-    );
-    res.json({ filters });
-  });
-
-  app.get('/api/markets/trending', async (_req, res) => {
-    const now = Date.now();
-    if (trendingCache && now - trendingCache.ts < TRENDING_CACHE_TTL_MS) {
-      res.json({ items: trendingCache.data, fetchedAt: new Date(trendingCache.ts).toISOString(), cached: true });
-      return;
-    }
-    try {
-      const raw = await getGammaTrendingMarkets();
-      const data = buildTrendingMarkets(raw);
-      trendingCache = { data, ts: now };
-      res.json({ items: data, fetchedAt: new Date(now).toISOString(), cached: false });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error('[dashboard] Trending markets fetch failed:', msg);
-      // Return stale cache if available
-      if (trendingCache) {
-        res.json({ items: trendingCache.data, fetchedAt: new Date(trendingCache.ts).toISOString(), cached: true, stale: true });
-      } else {
-        // No cache yet — return empty list so dashboard shows graceful empty state instead of error
-        res.json({ items: [], fetchedAt: new Date().toISOString(), cached: false, error: msg });
-      }
-    }
-  });
-
-  app.get('/api/traders/:address/history', async (req, res) => {
-    const { address } = req.params;
-    const cacheKey = address;
-
-    const cached = statsCache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < STATS_CACHE_TTL_MS) {
-      res.json(cached.data);
-      return;
-    }
-
-    try {
-      const store = readStore();
-      const localHist = store.traderHistory?.[address];
-      const localHistoryCount = localHist ? localHist.buys.length + localHist.sells.length : 0;
-
-      let trades: ActivityLike[];
-      let source: 'local' | 'api';
-
-      if (localHistoryCount > 0) {
-        // Use accumulated local history — fast, no CLI call required
-        trades = [...localHist!.buys, ...localHist!.sells];
-        source = 'local';
-      } else {
-        // No local data yet — fall back to live API (last 100 trades)
-        const activity = await getTraderActivity(address, 100);
-        const raw = Array.isArray(activity) ? activity : [];
-        trades = raw.filter(a => (a.type ?? '').toUpperCase() === 'TRADE');
-        source = 'api';
-      }
-
-      const data = {
-        ...computeTraderStats(address, trades),
-        localHistoryCount,
-        source,
-      };
-      statsCache.set(cacheKey, { data, ts: Date.now() });
-      res.json(data);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[dashboard] History fetch failed for ${address.slice(0, 10)}:`, msg);
-      res.status(500).json({ error: msg });
-    }
   });
 
   app.get('/api/vpn-status', async (_req, res) => {
@@ -704,7 +418,92 @@ export function startDashboard(): void {
       const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
       const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
       const realizedPnl = simClosed.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
-      const openPositions = store.openTrades.filter(t => t.copiedTrader === w.address).length;
+      const traderOpenTrades = store.openTrades.filter(t => t.copiedTrader === w.address);
+      const openPositions = traderOpenTrades.length;
+
+      // Average holding period (ms) over closed sim trades that have it
+      const closedWithHold = simClosed.filter(c => typeof c.holdingPeriodMs === 'number' && c.holdingPeriodMs > 0);
+      const avgHoldMs = closedWithHold.length > 0
+        ? closedWithHold.reduce((s, c) => s + (c.holdingPeriodMs ?? 0), 0) / closedWithHold.length
+        : null;
+
+      // 30d daily realized PNL (UTC buckets, oldest -> newest). Uses cost-adjusted PNL.
+      const dayMs = 86_400_000;
+      const todayUtc = Math.floor(Date.now() / dayMs) * dayMs;
+      const dailyPnl30d: number[] = new Array(30).fill(0);
+      for (const t of simClosed) {
+        if (!t.closedAt) continue;
+        const ts = Date.parse(t.closedAt);
+        if (Number.isNaN(ts)) continue;
+        const dayBucket = Math.floor(ts / dayMs) * dayMs;
+        const idx = 29 - Math.floor((todayUtc - dayBucket) / dayMs);
+        if (idx < 0 || idx > 29) continue;
+        dailyPnl30d[idx] += (t.costAdjustedPnl ?? t.realizedPnl ?? 0);
+      }
+
+      // Category breakdown for this trader's closed sim trades (using shared detectCategory).
+      const categoryBreakdown: Record<string, number> = {};
+      for (const t of simClosed) {
+        const cat = detectCategory(t.marketSlug || '');
+        categoryBreakdown[cat] = (categoryBreakdown[cat] || 0) + 1;
+      }
+
+      // Aggregate open trades by (market_slug, outcome) for the expand-row
+      // "Bot Open Positions (with age)" block — mirrors the Polymarket panel grouping.
+      const aggMap = new Map<string, {
+        slug: string;
+        title: string;
+        outcome: string;
+        side: string;
+        entryPriceWeightedSum: number;
+        simulatedAmount: number;
+        currentPrice: number | null;
+        unrealizedPnl: number;
+        oldestTimestamp: string;
+        fillCount: number;
+      }>();
+      for (const t of traderOpenTrades) {
+        const key = `${t.marketSlug}||${t.outcome}`;
+        const amt = Number(t.simulatedAmount) || 0;
+        const cur = aggMap.get(key);
+        if (!cur) {
+          aggMap.set(key, {
+            slug: t.marketSlug,
+            title: t.marketTitle,
+            outcome: t.outcome,
+            side: t.side,
+            entryPriceWeightedSum: (Number(t.entryPrice) || 0) * amt,
+            simulatedAmount: amt,
+            currentPrice: t.currentPrice ?? null,
+            unrealizedPnl: Number(t.unrealizedPnl) || 0,
+            oldestTimestamp: t.timestamp,
+            fillCount: 1,
+          });
+        } else {
+          cur.entryPriceWeightedSum += (Number(t.entryPrice) || 0) * amt;
+          cur.simulatedAmount += amt;
+          cur.unrealizedPnl += Number(t.unrealizedPnl) || 0;
+          cur.fillCount += 1;
+          if (t.timestamp && t.timestamp < cur.oldestTimestamp) cur.oldestTimestamp = t.timestamp;
+          if (t.currentPrice != null) cur.currentPrice = t.currentPrice;
+          if (!cur.title && t.marketTitle) cur.title = t.marketTitle;
+        }
+      }
+      const openTradesData = Array.from(aggMap.values())
+        .map(a => ({
+          slug: a.slug,
+          title: a.title,
+          outcome: a.outcome,
+          side: a.side,
+          entryPrice: a.simulatedAmount > 0 ? a.entryPriceWeightedSum / a.simulatedAmount : null,
+          simulatedAmount: a.simulatedAmount,
+          currentPrice: a.currentPrice,
+          unrealizedPnl: a.unrealizedPnl,
+          timestamp: a.oldestTimestamp,
+          fillCount: a.fillCount,
+        }))
+        .sort((a, b) => (b.timestamp > a.timestamp ? 1 : -1))
+        .slice(0, 25);
 
       // Recent 20 TRADE items sorted newest-first
       const recentTrades = [...(hist?.buys ?? []), ...(hist?.sells ?? [])]
@@ -719,7 +518,18 @@ export function startDashboard(): void {
       const tradeWithName = store.closedTrades.find(t => t.copiedTrader === w.address && t.copiedTraderUsername)
         ?? store.openTrades.find(t => t.copiedTrader === w.address && t.copiedTraderUsername);
 
-      return { ...w, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, realizedPnl, openPositions, recentTrades, traderStats };
+      // Liquidity profile from logged CLOB depth at fill time (watchlist BUYs only).
+      // Averages across all this trader's open + closed sim trades that have data.
+      const liqSamples = [...traderOpenTrades, ...simClosed]
+        .filter(t => typeof t.askDepth5 === 'number' && typeof t.spreadAtEntry === 'number');
+      const avgAskDepth5 = liqSamples.length > 0
+        ? liqSamples.reduce((s, t) => s + (t.askDepth5 ?? 0), 0) / liqSamples.length
+        : null;
+      const avgSpread = liqSamples.length > 0
+        ? liqSamples.reduce((s, t) => s + (t.spreadAtEntry ?? 0), 0) / liqSamples.length
+        : null;
+
+      return { ...w, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length };
     });
 
     // Watchlist-wide PNL totals (simulated)
@@ -728,7 +538,44 @@ export function startDashboard(): void {
       .filter(t => t.copiedTraderSource === 'watchlist')
       .reduce((s, t) => s + (t.unrealizedPnl ?? 0), 0);
 
-    res.json({ count: items.length, items, totalRealizedPnl, totalUnrealizedPnl });
+    // Watchlist-wide category breakdown across ALL watchlist closed trades
+    const categoryBreakdownAll: Record<string, number> = {};
+    for (const t of store.closedTrades) {
+      if (t.copiedTraderSource !== 'watchlist') continue;
+      const cat = detectCategory(t.marketSlug || '');
+      categoryBreakdownAll[cat] = (categoryBreakdownAll[cat] || 0) + 1;
+    }
+
+    res.json({ count: items.length, items, totalRealizedPnl, totalUnrealizedPnl, categoryBreakdownAll });
+  });
+
+  app.get('/api/watchlist/open-history', (_req, res) => {
+    const store = readStore();
+    const watchOpen   = store.openTrades.filter(t => t.copiedTraderSource === 'watchlist');
+    const watchClosed = store.closedTrades.filter(t => t.copiedTraderSource === 'watchlist');
+    const all = [...watchOpen, ...watchClosed];
+
+    const DAY_MS = 86_400_000;
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const days: string[] = [];
+    const counts: number[] = [];
+    for (let i = 29; i >= 0; i--) {
+      const dayStart = new Date(today.getTime() - i * DAY_MS);
+      const dayEnd   = dayStart.getTime() + DAY_MS;
+      const label    = dayStart.toISOString().slice(0, 10);
+      let open = 0;
+      for (const t of all) {
+        const opened = new Date(t.timestamp).getTime();
+        if (opened >= dayEnd) continue;
+        if (!t.closedAt) { open++; continue; }
+        const closed = new Date(t.closedAt).getTime();
+        if (closed >= dayEnd) open++;
+      }
+      days.push(label);
+      counts.push(open);
+    }
+    res.json({ days, counts, maxTotalOpenPositions: CONFIG.MAX_TOTAL_OPEN_POSITIONS });
   });
 
   app.post('/api/watchlist', (req, res) => {
@@ -876,6 +723,109 @@ export function startDashboard(): void {
     }
     console.log(`[dashboard] Watchlist trader ${address.slice(0, 10)}... copy ${copyEnabled ? 'enabled' : 'disabled'}`);
     res.json({ address: address.toLowerCase(), copyEnabled });
+  });
+
+  // Discovery candidates from latest weekly macro scan.
+  // Parses /app/logs/weekly-macro-scan-runs/*-scan90d.log (host logs/ dir is bind-mounted ro)
+  // and enriches each candidate with Sharpe from store.trackedTraders.
+  app.get('/api/discovery/candidates', (_req, res) => {
+    const RUNS_DIR = '/app/logs/weekly-macro-scan-runs';
+    const SUMMARY_LOG = '/app/logs/weekly-macro-scan.log';
+    try {
+      let scanFile: string | null = null;
+      let scanDate: string | null = null;
+      if (fs.existsSync(RUNS_DIR)) {
+        const files = fs.readdirSync(RUNS_DIR).filter(f => f.endsWith('-scan90d.log')).sort();
+        if (files.length > 0) {
+          scanFile = path.join(RUNS_DIR, files[files.length - 1]);
+          const m = files[files.length - 1].match(/^(\d{8}T\d{6}Z)/);
+          if (m) {
+            const s = m[1];
+            scanDate = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(9,11)}:${s.slice(11,13)}:${s.slice(13,15)}Z`;
+          }
+        }
+      }
+
+      if (!scanFile) {
+        res.json({ scanDate: null, scanned: 0, candidates: [], message: 'No weekly scan has run yet.' });
+        return;
+      }
+
+      const content = fs.readFileSync(scanFile, 'utf8');
+      const lines = content.split('\n');
+
+      const headMatch = content.match(/\[scan\] cached=(\d+)/);
+      const scanned = headMatch ? Number(headMatch[1]) : 0;
+
+      // Extract the top "MACRO CANDIDATES" section (before "--- subset NOT on 7d ---").
+      let inTop = false;
+      const rawRows: string[] = [];
+      for (const ln of lines) {
+        if (/^========== MACRO CANDIDATES/.test(ln)) { inTop = true; continue; }
+        if (/^--- subset NOT on 7d/.test(ln))       { inTop = false; }
+        if (inTop && /^0x[0-9a-f]{40}/i.test(ln))   { rawRows.push(ln); }
+      }
+
+      const store = readStore();
+      const sharpeByAddr = new Map<string, number>();
+      for (const t of store.trackedTraders ?? []) {
+        if (t.address && typeof (t as any).falconSharpe === 'number') {
+          sharpeByAddr.set(t.address.toLowerCase(), (t as any).falconSharpe);
+        }
+      }
+      for (const w of store.watchlistTraders ?? []) {
+        if (w.address && typeof (w as any).falconSharpe === 'number') {
+          sharpeByAddr.set(w.address.toLowerCase(), (w as any).falconSharpe);
+        }
+      }
+      const watchlistAddrs = new Set((store.watchlistTraders ?? []).map(w => w.address.toLowerCase()));
+
+      // Row format from macro_scan_90d.js:
+      //   addr on7d tr90 t/wk closed hold_d >48h >7d wr pnl
+      const candidates = rawRows.map(row => {
+        const parts = row.trim().split(/\s+/);
+        const addr   = (parts[0] || '').toLowerCase();
+        const on7d   = parts[1] || '';
+        const tr90   = Number(parts[2]) || 0;
+        const tpw    = Number(parts[3]) || 0;
+        const closed = Number(parts[4]) || 0;
+        const holdD  = Number(parts[5]) || 0;
+        const wrStr  = parts[8] || '';
+        const wr     = Number(String(wrStr).replace('%', '')) || 0;
+        const pnl    = Number(parts[9]) || 0;
+        const expPerTrade = closed > 0 ? pnl / closed : 0;
+        const sharpe = sharpeByAddr.has(addr) ? sharpeByAddr.get(addr)! : null;
+        const why    = `WR ${wr}% · hold ${holdD}d · ${tpw} trades/wk · ${closed} closed · PNL +$${pnl.toFixed(0)}`;
+        return {
+          address: addr,
+          onFalcon7d: on7d === 'Y',
+          tr90,
+          tpw,
+          closed,
+          avgHoldDays: holdD,
+          winRate: wr,
+          pnl,
+          expPerTrade,
+          sharpe,
+          alreadyWatchlisted: watchlistAddrs.has(addr),
+          why,
+        };
+      }).filter(c => c.closed >= 10);
+
+      // Pull "SENT" line from summary log to confirm last cron run.
+      let lastRunLine: string | null = null;
+      if (fs.existsSync(SUMMARY_LOG)) {
+        const sumLines = fs.readFileSync(SUMMARY_LOG, 'utf8').trim().split('\n').reverse();
+        for (const ln of sumLines) {
+          if (ln.includes('SENT') || ln.includes('SEND_FAILED')) { lastRunLine = ln; break; }
+        }
+      }
+
+      res.json({ scanDate, scanned, candidates, lastRunLine });
+    } catch (e) {
+      console.error('[dashboard] /api/discovery/candidates error:', e);
+      res.status(500).json({ error: 'failed to read scan results' });
+    }
   });
 
   app.listen(CONFIG.PORT, '0.0.0.0', () => {

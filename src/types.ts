@@ -62,6 +62,14 @@ export interface SimulatedTrade {
   entrySlippageCost?: number;
   exitSlippageCost?: number;
   costAdjustedPnl?: number;
+  // Orderbook snapshot at fill time. Populated for watchlist BUYs via CLOB
+  // /book; depthBackfilled=true if filled in after the fact from current state.
+  bestAsk?: number;
+  bestBid?: number;
+  askDepth5?: number;
+  askDepth10?: number;
+  spreadAtEntry?: number;
+  depthBackfilled?: boolean;
 }
 
 export interface TraderHistoryEntry {

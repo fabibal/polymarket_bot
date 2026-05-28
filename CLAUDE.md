@@ -13,6 +13,26 @@ DRY_RUN simulation-only copy bot. Tracks top 10 traders by weekly PNL plus a per
 - Ask before guessing — use AskUserQuestion for anything ambiguous.
 - **Watchlist traders bypass ALL filters by design.** Price floor/ceiling, spread cap, category exclusions (incl. `FORCE_EXCLUDE_CATEGORIES`), and min-sample gates do NOT apply to watchlist entries. Watchlist = explicit user trust override; only `MAX_WATCHLIST_ENTRIES_PER_MARKET` / `MAX_WATCHLIST_ENTRY_WINDOW_MS` and `MAX_TOTAL_OPEN_POSITIONS` still constrain them.
 - `store.ts` persistence: `writeStore()` is an immediate atomic flush (temp+rename) used for financial mutations (addOpenTrade, closeOpenTrade, resolveByPrice) and user-driven dashboard actions. `markDirty()` defers the write; a 60 s background flusher started by `startAutoFlush()` in `index.ts` coalesces bursts. Signal handlers force a final flush on exit.
+- **`closed_trades` retention: unlimited.** As of 2026-05-27 the 7-day archival step in `runDailyCleanup()` was removed — the table holds the full history in-DB (query perf ~12 ms at 30k rows). Existing `data/archive/*.json` files are historical artifacts; the importer ran once to merge them back. Daily backups in `data/backups/` (last 30 retained) remain the disaster-recovery path. `traderHistory` and `processedTradeIds` still prune in the same daily run.
+
+## Orderbook depth at fill time (watchlist only)
+Every watchlist BUY snapshots CLOB orderbook state via `getOrderbookDepth(slug, outcome)`
+(src/bullpen.ts) before `addOpenTrade`. Two HTTPS calls: Gamma (slug → `clobTokenIds`)
++ CLOB `/book`. Failures fall through with null — depth is never blocking.
+
+Fields persisted on `open_trades` + `closed_trades` (and shadow tables, schema-symmetric):
+- `best_ask`, `best_bid` — top of book at fill time
+- `spread_at_entry` — `best_ask - best_bid`
+- `ask_depth_5`, `ask_depth_10` — $ available within 5% / 10% of best_ask
+  (sum of `price * size` over asks at `price <= best_ask * 1.0X`)
+- `depth_backfilled` — 1 if filled in at startup from current book (stale), 0 if captured at fill time
+
+Backfill: `backfillOpenTradeDepth()` runs once at startup for open watchlist trades
+where `bestAsk` is null. Best-effort, fire-and-forget; throttled 100ms per fetch.
+Backfilled depth reflects current book, not the original fill moment — coarse proxy only.
+
+Dashboard `/api/watchlist` exposes per-trader `avgAskDepth5`, `avgSpread`, `liqSampleCount`
+across the trader's open + closed sim trades. Leaderboard copies are not instrumented.
 
 ## Bullpen API gotchas
 - `data leaderboard` and `activity` return direct JSON arrays, **not** `{items: []}`.
@@ -54,6 +74,12 @@ MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000   # 12h
 GAS_COST_PER_BUY=0                      # Polymarket charges no fees on sports markets
 SLIPPAGE_RATE=0.02                      # 2% each side (entry at ask, exit at bid)
 
+# Watchlist depth gate (added 2026-05-27) — skip BUY when CLOB ask_depth_5 < $500.
+# Protects against thin books where a $5-15 copy would itself move the market;
+# also improves statistical validity of the watchlist edge by trimming low-liquidity
+# tail trades. Non-blocking on depth-fetch failure (copy proceeds).
+DEPTH_GATE_MIN_DEPTH_5=500
+
 FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
 ```
 
@@ -88,6 +114,7 @@ Both scripts: alert at ≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=
 | `check-bullpen-expiry.sh` | `0 9 * * *` | `bullpen --output json status` → `account.session_expires` (CLI ≥0.1.98 stores creds encrypted as `credentials.json.enc`, so JWT is no longer decodable from disk; script shells out to the CLI instead) | `bullpen login` on server |
 | `check-falcon-expiry.sh` | `0 9 * * *` | `POLYMARKET_ANALYTICS_API_KEY` (= `FALCON_API_KEY`) in `~/polymarket_bot/.env`, raw JWT, no auto-refresh, ~60 day TTL | Generate new JWT at https://polymarketanalytics.com → update `.env` → `docker compose up -d --no-deps bot` |
 | `git-sync.sh` | `0 3 * * *` | Tracked changes under `src/`, `tests/`, `scripts/`, `public/`, plus `CLAUDE.md`, `Dockerfile`, `docker-compose.yml`, `package*.json`, `tsconfig.json`, `.gitignore`, `.env.example` | Auto: stages `git add -u` on those paths, commits as `chore(sync): daily auto-sync <date>`, pushes to `origin/main` via `~/.ssh/deploy-key`. Skips silently when no diff. Untracked files are NOT auto-added — add them manually if they belong in git. Log: `logs/git-sync.log` (rotated to last 100 lines) + `logs/git-sync.cron.log` |
+| `weekly-macro-scan.sh` | `0 4 * * 1` (Mon) | `docker cp` latest `macro_scan.js` + `macro_scan_90d.js` into the container, then `docker exec` Falcon enrichment (updates `tracked_traders.falcon_sharpe/roi/win_rate`) + 90d on-chain scan. Parses MACRO CANDIDATES (avg_hold≥48h, t/wk<20, WR>60%, closed≥10, pnl>0; excludes watchlist + excluded_traders), enriches with Sharpe from `tracked_traders`, sends Telegram top-5 summary or "no candidates" if empty. **Does NOT auto-add to watchlist — manual review only.** Log: `logs/weekly-macro-scan.log` (last 200 lines) + per-run raw outputs under `logs/weekly-macro-scan-runs/` (pruned after 30d) + `logs/weekly-macro-scan.cron.log` |
 
 New alerts: copy `send_telegram()` from `check-bullpen-expiry.sh` (self-contained, sources `~/.env.shared`). Use `[polymarket_bot]` prefix so messages group separately from `paper_trader`. Always log one line per run so a quiet log proves the cron ran.
 

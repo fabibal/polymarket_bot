@@ -282,6 +282,7 @@ function getDb(): Db {
   d.pragma('journal_mode = WAL');
   d.pragma('foreign_keys = ON');
   d.exec(SCHEMA);
+  migrateDepthColumns(d);
   seedIfFresh(d);
   _initInsertionCounterFromDb(d);
   db = d;
@@ -314,6 +315,27 @@ function _initInsertionCounterFromDb(d: Db): void {
 export function initInsertionCounter(): number {
   getDb();
   return insertionCounter;
+}
+
+const DEPTH_COLS: Array<[string, string]> = [
+  ['best_ask',         'REAL'],
+  ['best_bid',         'REAL'],
+  ['ask_depth_5',      'REAL'],
+  ['ask_depth_10',     'REAL'],
+  ['spread_at_entry',  'REAL'],
+  ['depth_backfilled', 'INTEGER'],
+];
+
+function migrateDepthColumns(d: Db): void {
+  const tables = ['open_trades', 'closed_trades', 'shadow_open_trades', 'shadow_closed_trades'];
+  for (const t of tables) {
+    const existing = new Set(
+      (d.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map(r => r.name)
+    );
+    for (const [col, type] of DEPTH_COLS) {
+      if (!existing.has(col)) d.exec(`ALTER TABLE ${t} ADD COLUMN ${col} ${type}`);
+    }
+  }
 }
 
 function seedIfFresh(d: Db): void {
@@ -374,6 +396,9 @@ type TradeRow = {
   exit_price?: number | null; realized_pnl?: number | null;
   closed_at?: string | null; holding_period_ms?: number | null;
   exit_slippage_cost?: number | null; cost_adjusted_pnl?: number | null;
+  best_ask?: number | null; best_bid?: number | null;
+  ask_depth_5?: number | null; ask_depth_10?: number | null;
+  spread_at_entry?: number | null; depth_backfilled?: number | null;
   insertion_order: number;
 };
 
@@ -405,8 +430,21 @@ function rowToTrade(r: TradeRow): SimulatedTrade {
   if (r.holding_period_ms      != null) t.holdingPeriodMs      = r.holding_period_ms;
   if (r.exit_slippage_cost     != null) t.exitSlippageCost     = r.exit_slippage_cost;
   if (r.cost_adjusted_pnl      != null) t.costAdjustedPnl      = r.cost_adjusted_pnl;
+  if (r.best_ask               != null) t.bestAsk              = r.best_ask;
+  if (r.best_bid               != null) t.bestBid              = r.best_bid;
+  if (r.ask_depth_5            != null) t.askDepth5            = r.ask_depth_5;
+  if (r.ask_depth_10           != null) t.askDepth10           = r.ask_depth_10;
+  if (r.spread_at_entry        != null) t.spreadAtEntry        = r.spread_at_entry;
+  if (r.depth_backfilled       != null) t.depthBackfilled      = !!r.depth_backfilled;
   return t;
 }
+
+const DEPTH_VALS = (t: SimulatedTrade) => [
+  t.bestAsk ?? null, t.bestBid ?? null,
+  t.askDepth5 ?? null, t.askDepth10 ?? null,
+  t.spreadAtEntry ?? null,
+  t.depthBackfilled == null ? null : (t.depthBackfilled ? 1 : 0),
+];
 
 function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
   return [
@@ -415,7 +453,9 @@ function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
     t.marketSlug, t.marketTitle, t.outcome, t.side,
     t.entryPrice, t.simulatedAmount, t.simulatedShares,
     t.currentPrice ?? null, t.unrealizedPnl ?? null, t.status,
-    t.entryGasCost ?? null, t.entrySlippageCost ?? null, order,
+    t.entryGasCost ?? null, t.entrySlippageCost ?? null,
+    ...DEPTH_VALS(t),
+    order,
   ];
 }
 
@@ -429,22 +469,26 @@ function closedTradeRowParams(t: SimulatedTrade, order: number): any[] {
     t.exitPrice ?? null, t.realizedPnl ?? null, t.closedAt ?? null,
     t.holdingPeriodMs ?? null,
     t.entryGasCost ?? null, t.entrySlippageCost ?? null,
-    t.exitSlippageCost ?? null, t.costAdjustedPnl ?? null, order,
+    t.exitSlippageCost ?? null, t.costAdjustedPnl ?? null,
+    ...DEPTH_VALS(t),
+    order,
   ];
 }
+
+const DEPTH_COL_NAMES = 'best_ask, best_bid, ask_depth_5, ask_depth_10, spread_at_entry, depth_backfilled';
 
 const OPEN_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
-  entry_gas_cost, entry_slippage_cost, insertion_order)`;
-const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(20).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, ${DEPTH_COL_NAMES}, insertion_order)`;
+const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(26).fill('?').join(',') + ')';
 
 const CLOSED_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
   exit_price, realized_pnl, closed_at, holding_period_ms,
-  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, insertion_order)`;
-const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(26).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, ${DEPTH_COL_NAMES}, insertion_order)`;
+const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(32).fill('?').join(',') + ')';
 
 // ── Snapshot load ───────────────────────────────────────────────────────────
 function loadSnapshot(): TradesStore {
@@ -787,6 +831,28 @@ export function closeOpenTrade(
   });
   tx();
   return true;
+}
+
+export function updateOpenTradeDepth(
+  id: string,
+  depth: { bestAsk: number; bestBid: number; askDepth5: number; askDepth10: number; spreadAtEntry: number },
+  backfilled: boolean,
+): void {
+  const store = readStore();
+  const t = store.openTrades.find(x => x.id === id);
+  if (t) {
+    t.bestAsk = depth.bestAsk;
+    t.bestBid = depth.bestBid;
+    t.askDepth5 = depth.askDepth5;
+    t.askDepth10 = depth.askDepth10;
+    t.spreadAtEntry = depth.spreadAtEntry;
+    t.depthBackfilled = backfilled;
+  }
+  getDb().prepare(
+    `UPDATE open_trades SET best_ask=?, best_bid=?, ask_depth_5=?, ask_depth_10=?,
+       spread_at_entry=?, depth_backfilled=? WHERE id=?`
+  ).run(depth.bestAsk, depth.bestBid, depth.askDepth5, depth.askDepth10,
+        depth.spreadAtEntry, backfilled ? 1 : 0, id);
 }
 
 export function updateOpenTradePrices(
@@ -1242,43 +1308,11 @@ export function runDailyCleanup(): void {
   const store = readStore();
   const now = Date.now();
   const cutoff7d  = now - 7 * 86_400_000;
-  const dataDir   = path.dirname(dbPathOverride ?? CONFIG.DB_FILE);
 
-  // 1. Archive closed trades older than 7 days (JSON files on disk, per month).
-  const recentClosed = store.closedTrades.filter(t => new Date(t.closedAt ?? t.timestamp).getTime() >= cutoff7d);
-  const oldClosed    = store.closedTrades.filter(t => new Date(t.closedAt ?? t.timestamp).getTime() <  cutoff7d);
-
-  if (oldClosed.length > 0 && (dbPathOverride ?? CONFIG.DB_FILE) !== ':memory:') {
-    const archiveDir = path.join(dataDir, 'archive');
-    if (!fs.existsSync(archiveDir)) fs.mkdirSync(archiveDir, { recursive: true });
-
-    const byMonth = new Map<string, SimulatedTrade[]>();
-    for (const trade of oldClosed) {
-      const dt = new Date(trade.closedAt ?? trade.timestamp);
-      const key = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
-      if (!byMonth.has(key)) byMonth.set(key, []);
-      byMonth.get(key)!.push(trade);
-    }
-    for (const [month, trades] of byMonth) {
-      const archivePath = path.join(archiveDir, `trades_${month}.json`);
-      let existing: SimulatedTrade[] = [];
-      if (fs.existsSync(archivePath)) {
-        try { existing = JSON.parse(fs.readFileSync(archivePath, 'utf-8')); } catch {}
-      }
-      const existingIds = new Set(existing.map(t => t.id));
-      const merged = [...existing, ...trades.filter(t => !existingIds.has(t.id))];
-      fs.writeFileSync(archivePath, JSON.stringify(merged, null, 2), 'utf-8');
-      console.log(`[cleanup] Archived ${trades.length} trades to trades_${month}.json, kept ${recentClosed.length} trades`);
-    }
-    store.closedTrades = recentClosed;
-    const d = getDb();
-    const oldIds = oldClosed.map(t => t.id);
-    const del = d.prepare('DELETE FROM closed_trades WHERE id = ?');
-    const tx = d.transaction(() => { for (const id of oldIds) del.run(id); });
-    tx();
-  } else {
-    console.log(`[cleanup] closedTrades: all ${recentClosed.length} within 7-day window — nothing to archive`);
-  }
+  // closed_trades archival/pruning was removed 2026-05-27: query perf at 30k+
+  // rows is ~12ms and disk is 1TB free, so keeping the full history in-DB is
+  // cheaper than walking JSON archives for analytics. Backups still run daily.
+  console.log(`[cleanup] closedTrades: ${store.closedTrades.length} retained in DB (no archival)`);
 
   // 2. Trim processedTradeIds: drop IDs whose underlying trade is no longer referenced.
   const refIds = new Set<string>();

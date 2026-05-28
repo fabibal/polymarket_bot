@@ -3,7 +3,7 @@
  * - BUY  → create a new simulated $5 position (subject to price/spread filters)
  * - SELL → close the oldest matching open position at sell price (realized PNL)
  */
-import { getTraderActivity, getMarketPrice, RawActivityItem, RawPriceResponse } from './bullpen';
+import { getTraderActivity, getMarketPrice, getOrderbookDepth, RawActivityItem, RawPriceResponse } from './bullpen';
 import { readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSeen, appendTraderHistory, addShadowOpenTrade, closeShadowOpenTrade, markShadowProcessed, setShadowLastSeen } from './store';
 import { LeaderboardTrader, ActivityTrade, SimulatedTrade, TraderHistoryEntry } from './types';
 import { CONFIG } from './config';
@@ -309,6 +309,22 @@ export async function pollTrader(
         }
       }
 
+      // Watchlist depth gate: fetch CLOB orderbook BEFORE creating the trade so we can
+      // skip thin books. Non-blocking — depth fetch failure falls through to copy.
+      let watchlistDepth: Awaited<ReturnType<typeof getOrderbookDepth>> = null;
+      if (isWatchlist) {
+        watchlistDepth = await getOrderbookDepth(activity.marketSlug, activity.outcome);
+        if (watchlistDepth && watchlistDepth.askDepth5 < CONFIG.DEPTH_GATE_MIN_DEPTH_5) {
+          console.log(
+            `[monitor] Skip BUY ${activity.marketSlug} — depth_gate: ` +
+            `ask_depth_5=$${watchlistDepth.askDepth5.toFixed(0)} below ` +
+            `$${CONFIG.DEPTH_GATE_MIN_DEPTH_5} threshold`
+          );
+          markProcessed(activity.id);
+          continue;
+        }
+      }
+
       const shares = tradeAmount / activity.price;
       const entryCosts = computeEntryCosts(activity.price, shares);
       const trade: SimulatedTrade = {
@@ -332,6 +348,24 @@ export async function pollTrader(
         entryGasCost:      entryCosts.gas,
         entrySlippageCost: entryCosts.slippage,
       };
+      // Watchlist BUYs: persist the depth snapshot fetched above for the gate check.
+      if (isWatchlist) {
+        if (watchlistDepth) {
+          trade.bestAsk = watchlistDepth.bestAsk;
+          trade.bestBid = watchlistDepth.bestBid;
+          trade.askDepth5 = watchlistDepth.askDepth5;
+          trade.askDepth10 = watchlistDepth.askDepth10;
+          trade.spreadAtEntry = watchlistDepth.spread;
+          trade.depthBackfilled = false;
+          console.log(
+            `[depth] ${activity.marketSlug} ${activity.outcome} ` +
+            `ask=${watchlistDepth.bestAsk.toFixed(3)} bid=${watchlistDepth.bestBid.toFixed(3)} ` +
+            `spr=${watchlistDepth.spread.toFixed(3)} d5=$${watchlistDepth.askDepth5.toFixed(0)} d10=$${watchlistDepth.askDepth10.toFixed(0)}`
+          );
+        } else {
+          console.log(`[depth] ${activity.marketSlug} ${activity.outcome} — orderbook fetch failed (gate bypassed)`);
+        }
+      }
       addOpenTrade(trade);
       newTrades++;
       const srcTag = isWatchlist ? '[WL]' : '[DRY_RUN]';

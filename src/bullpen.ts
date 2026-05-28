@@ -249,6 +249,65 @@ export interface RawGammaMarket {
   events?: Array<{ slug: string; title: string; [key: string]: unknown }>;
 }
 
+export interface OrderbookDepth {
+  bestAsk: number;
+  bestBid: number;
+  spread: number;
+  askDepth5: number;   // $ within 5% of best_ask
+  askDepth10: number;  // $ within 10% of best_ask
+}
+
+const CLOB_BASE = 'https://clob.polymarket.com';
+
+/**
+ * Fetch CLOB order book depth for one outcome of a market.
+ * Two HTTPS calls: Gamma (slug → clobTokenIds[]) + CLOB /book.
+ * Returns null on any failure or missing data — callers treat as "unknown".
+ */
+export async function getOrderbookDepth(
+  slug: string,
+  outcome: string,
+): Promise<OrderbookDepth | null> {
+  try {
+    const data = await httpsGet(`${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}`) as unknown[];
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const market = data[0] as Record<string, unknown>;
+    let outcomes: string[] = [];
+    let tokenIds: string[] = [];
+    try { outcomes = JSON.parse(market.outcomes as string ?? '[]'); } catch {}
+    try { tokenIds = JSON.parse(market.clobTokenIds as string ?? '[]'); } catch {}
+    const idx = outcomes.findIndex(o => o.toLowerCase() === outcome.toLowerCase());
+    if (idx === -1 || !tokenIds[idx]) return null;
+
+    const book = await httpsGet(`${CLOB_BASE}/book?token_id=${encodeURIComponent(tokenIds[idx])}`) as any;
+    if (!book || !Array.isArray(book.asks) || !Array.isArray(book.bids)) return null;
+
+    // Polymarket /book returns asks sorted DESC by price; bids sorted ASC by price.
+    // Best ask = lowest ask price (last entry); best bid = highest bid price (last entry).
+    const asks = book.asks.map((a: any) => ({ price: Number(a.price), size: Number(a.size) }))
+      .filter((a: any) => Number.isFinite(a.price) && Number.isFinite(a.size));
+    const bids = book.bids.map((b: any) => ({ price: Number(b.price), size: Number(b.size) }))
+      .filter((b: any) => Number.isFinite(b.price) && Number.isFinite(b.size));
+    if (asks.length === 0 || bids.length === 0) return null;
+
+    asks.sort((a: any, b: any) => a.price - b.price);
+    bids.sort((a: any, b: any) => b.price - a.price);
+    const bestAsk = asks[0].price;
+    const bestBid = bids[0].price;
+    const ceil5  = bestAsk * 1.05;
+    const ceil10 = bestAsk * 1.10;
+    let askDepth5 = 0, askDepth10 = 0;
+    for (const a of asks) {
+      if (a.price <= ceil5)  askDepth5  += a.price * a.size;
+      if (a.price <= ceil10) askDepth10 += a.price * a.size;
+      else break;
+    }
+    return { bestAsk, bestBid, spread: bestAsk - bestBid, askDepth5, askDepth10 };
+  } catch {
+    return null;
+  }
+}
+
 export async function getGammaTrendingMarkets(): Promise<RawGammaMarket[]> {
   const url = `${GAMMA_BASE}/markets?active=true&closed=false&order=volume&ascending=false&limit=10`;
   const data = await httpsGet(url) as unknown[];

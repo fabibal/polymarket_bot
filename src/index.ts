@@ -2,8 +2,37 @@ import { refreshLeaderboard } from './leaderboard';
 import { pollTrader } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
-import { readStore, runDailyCleanup, startAutoFlush, stopAutoFlush, flushIfDirty, initInsertionCounter } from './store';
+import { readStore, runDailyCleanup, startAutoFlush, stopAutoFlush, flushIfDirty, initInsertionCounter, updateOpenTradeDepth } from './store';
+import { getOrderbookDepth } from './bullpen';
 import { CONFIG } from './config';
+
+/**
+ * One-shot startup task: for every open watchlist trade missing orderbook depth,
+ * fetch the current CLOB book and write it back with depth_backfilled=1.
+ * Best-effort — failures are silent and the trade stays unannotated.
+ */
+async function backfillOpenTradeDepth(): Promise<void> {
+  const store = readStore();
+  const targets = store.openTrades.filter(
+    t => t.copiedTraderSource === 'watchlist' && t.bestAsk == null
+  );
+  if (targets.length === 0) return;
+  console.log(`[backfill] Filling orderbook depth for ${targets.length} open watchlist trade(s)...`);
+  let ok = 0;
+  for (const t of targets) {
+    const d = await getOrderbookDepth(t.marketSlug, t.outcome);
+    if (d) {
+      updateOpenTradeDepth(t.id, {
+        bestAsk: d.bestAsk, bestBid: d.bestBid,
+        askDepth5: d.askDepth5, askDepth10: d.askDepth10,
+        spreadAtEntry: d.spread,
+      }, true);
+      ok++;
+    }
+    await new Promise(r => setTimeout(r, 100)); // throttle CLOB calls
+  }
+  console.log(`[backfill] Done: ${ok}/${targets.length} succeeded`);
+}
 
 async function runPollingCycle(): Promise<void> {
   const store = readStore();
@@ -98,6 +127,11 @@ async function main(): Promise<void> {
 
   startDashboard();
   scheduleMidnightCleanup();
+
+  // Best-effort backfill — fire-and-forget so it never blocks startup.
+  backfillOpenTradeDepth().catch(err =>
+    console.error('[backfill] Failed:', err instanceof Error ? err.message : err)
+  );
 
   // Initial leaderboard fetch
   try {
