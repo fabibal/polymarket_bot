@@ -137,7 +137,11 @@ export async function getTraderActivity(
       });
     }
 
-    if (hitSince || data.length < ACTIVITY_PAGE_SIZE || results.length >= limit) break;
+    // NOTE: deliberately do NOT break on `results.length >= limit` here. Doing so
+    // truncated paging before reaching `hitSince`, so the caller's cursor could
+    // advance past unseen trades and drop them permanently (H1). Page until we
+    // actually reach an item older than `since` (hitSince) or exhaust the pages.
+    if (hitSince || data.length < ACTIVITY_PAGE_SIZE) break;
   }
 
   return results.slice(0, limit);

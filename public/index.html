@@ -420,7 +420,6 @@
     .cstat-fill.warn { background: var(--red); }
     .cstat-ram  { font-size: 11px; font-family: 'Consolas', monospace; color: var(--muted); }
     .cstat-meta { font-size: 11px; font-family: 'Consolas', monospace; color: var(--muted); opacity: 0.75; }
-    #containers-ts { margin-left: auto; font-size: 10px; color: var(--muted); font-family: system-ui; }
 
     /* ── Charts 2×2 grid ── */
     .charts-grid {
@@ -548,7 +547,6 @@
 
 <div id="container-strip">
   <div class="cstat-card"><span class="cstat-name">Loading…</span></div>
-  <span id="containers-ts"></span>
 </div>
 
 <main>
@@ -601,6 +599,16 @@
       <div class="label">📊 Open Positions</div>
       <div class="value" id="wl-s-open-limit">—</div>
       <div class="sub" id="wl-s-open-limit-sub">wallet cap: $800 / $5</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">🧪 Test PNL</div>
+      <div class="value" id="wl-s-test-pnl">—</div>
+      <div class="sub">cost-adjusted, since May 28</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">🧪 Test Trades</div>
+      <div class="value blue" id="wl-s-test-trades">—</div>
+      <div class="sub">watchlist closes since May 28</div>
     </div>
   </div>
 
@@ -702,10 +710,15 @@
             <th title="Falcon API ROI">ROI <span style="font-size:9px;opacity:.5">(Falcon)</span></th>
             <th title="Falcon API Sharpe ratio">Sharpe <span style="font-size:9px;opacity:.5">(Falcon)</span></th>
             <th>7d W% <span style="font-size:9px;opacity:.5">(sim)</span></th>
-            <th title="Falcon API trade count — capped at 200">30d Trades <span style="font-size:9px;opacity:.5">(≤200)</span></th>
+            <th title="All-time simulated win rate vs break-even WR (= avg entry price). Green = above break-even (profitable edge), red = below.">WR vs B/E <span style="font-size:9px;opacity:.5">(sim)</span></th>
+            <th title="Profit factor = gross cost-adjusted wins / gross cost-adjusted losses. >1.0 is profitable.">Profit Factor</th>
+            <th title="Trade count from locally-stored trader history (last 30 days), not Falcon">30d Trades <span style="font-size:9px;opacity:.5">(local)</span></th>
             <th title="Average holding period of closed simulated trades">Avg Hold</th>
+            <th title="Average CLOB ask depth within 5% of best ask at fill time ($)">Avg Depth</th>
+            <th title="Average bid-ask spread at fill time">Avg Spread</th>
+            <th title="Number of trades with logged orderbook-depth data">Liq Samples</th>
             <th>Open Pos</th>
-            <th>Realized PNL</th>
+            <th title="Cost-adjusted realized PNL (after slippage), closed simulated trades">Realized PNL <span style="font-size:9px;opacity:.5">(adj)</span></th>
             <th title="Daily realized PNL over the last 30 days (UTC buckets, cost-adjusted)">PNL 30d</th>
             <th title="Per-trade copy amount — click to edit">Amount</th>
             <th>Copy</th>
@@ -713,7 +726,7 @@
           </tr>
         </thead>
         <tbody id="watchlist-body">
-          <tr class="empty-row"><td colspan="13">Loading watchlist…</td></tr>
+          <tr class="empty-row"><td colspan="18">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -880,25 +893,12 @@
     return mb >= 1024 ? (mb / 1024).toFixed(1) + 'GB' : Math.round(mb) + 'MB';
   }
 
-  function fmtUptime(ms) {
-    if (ms == null || ms < 0) return null;
-    const mins = Math.floor(ms / 60000);
-    if (mins < 60)        return 'up ' + mins + 'm';
-    const hours = Math.floor(mins / 60);
-    if (hours < 24)       return 'up ' + hours + 'h';
-    const days = Math.floor(hours / 24);
-    return 'up ' + days + 'd';
-  }
-
   async function loadContainers() {
     try {
       const d = await fetch('/api/containers').then(r => r.json());
       const items = d.items || [];
-      $('containers-ts').textContent = 'Updated ' + timeAgo(d.fetchedAt);
       const strip = $('container-strip');
-      const ts = $('containers-ts');
       strip.innerHTML = '';
-      strip.appendChild(ts);
       for (const c of items) {
         const isWarn = c.ramPct != null && c.ramPct > 80;
         const cpuStr = c.cpuPct != null ? c.cpuPct.toFixed(1) + '%' : '—';
@@ -908,7 +908,8 @@
         const card = document.createElement('div');
         card.className = 'cstat-card' + (isWarn ? ' warn' : '');
         const restartStr = c.restartCount != null ? `restarts: ${c.restartCount}` : '';
-        const uptimeStr  = fmtUptime(c.uptimeMs) || '';
+        const u          = fmtUptime(c.uptimeMs);
+        const uptimeStr  = u ? 'up ' + u : '';
         const metaTitle  = c.startedAt ? ` title="started ${c.startedAt}"` : '';
         const metaParts  = [restartStr, uptimeStr].filter(Boolean).join(' · ');
         card.innerHTML =
@@ -917,11 +918,9 @@
           `<div class="cstat-bar"><div class="cstat-fill ${isWarn ? 'warn' : 'ok'}" style="width:${barPct}%"></div></div>` +
           `<span class="cstat-ram">${ramStr}</span>` +
           (metaParts ? `<span class="cstat-meta"${metaTitle}>${metaParts}</span>` : '');
-        strip.insertBefore(card, ts);
+        strip.appendChild(card);
       }
-    } catch {
-      $('containers-ts').textContent = 'Error';
-    }
+    } catch {}
   }
 
   function toggleWlDetailRow(addr) {
@@ -1271,6 +1270,29 @@
     </table>`;
   }
 
+  // ── Watchlist cell builders (shared by full-build and in-place update) ───────
+  // All-time sim WR vs break-even WR (= avg entry price). Green if WR clears B/E.
+  function wrVsBreakEvenCell(w) {
+    const wr = w.allTimeWinRate, be = w.avgEntryPrice;
+    if (wr == null || be == null) return '<span style="color:var(--muted)">—</span>';
+    const cls = wr >= be ? 'green' : 'red';
+    return `<span class="${cls}" title="actual ${(wr*100).toFixed(1)}% vs break-even ${(be*100).toFixed(1)}%">${(wr*100).toFixed(0)}%<span style="color:var(--muted);font-size:9px"> / ${(be*100).toFixed(0)}%</span></span>`;
+  }
+  function profitFactorCell(w) {
+    const pf = w.profitFactor;
+    if (pf == null) return '<span style="color:var(--muted)">—</span>';
+    return `<span class="${pf >= 1 ? 'green' : 'red'}">${Number(pf).toFixed(2)}</span>`;
+  }
+  function liqDepthCell(w) {
+    return w.avgAskDepth5 != null ? '$' + Math.round(w.avgAskDepth5).toLocaleString() : '<span style="color:var(--muted)">—</span>';
+  }
+  function liqSpreadCell(w) {
+    return w.avgSpread != null ? Number(w.avgSpread).toFixed(3) : '<span style="color:var(--muted)">—</span>';
+  }
+  function liqSamplesCell(w) {
+    return w.liqSampleCount > 0 ? String(w.liqSampleCount) : '<span style="color:var(--muted)">—</span>';
+  }
+
   function buildWatchlistRow(w, idx) {
     const addr = w.address;
     const name = w.label || w.username || shortAddr(addr);
@@ -1290,8 +1312,13 @@
     if (s && s.hasEnoughData && s.winRate7d != null) {
       wrCell = `<span class="${s.winRate7d >= 0.5 ? 'green' : 'red'}">${(s.winRate7d * 100).toFixed(0)}%</span>`;
     }
+    const beCell     = wrVsBreakEvenCell(w);
+    const pfCell     = profitFactorCell(w);
     const tradesCell = (s && s.tradeCount30d > 0) ? s.tradeCount30d : '—';
     const holdCell   = fmtHoldDuration(w.avgHoldMs);
+    const depthCell  = liqDepthCell(w);
+    const spreadCell = liqSpreadCell(w);
+    const liqCell    = liqSamplesCell(w);
     const openCell   = w.openPositions > 0 ? `<span class="blue">${w.openPositions}</span>` : '—';
     const pnlCell    = (w.realizedPnl != null && w.realizedPnl !== 0)
       ? `<span class="${w.realizedPnl >= 0 ? 'green' : 'red'}">${fmtPnl(w.realizedPnl)}</span>`
@@ -1316,7 +1343,7 @@
     return `<tr class="trader-row" data-wl-addr="${addr}" data-wl-idx="${idx}">
       <td class="trader-cell" style="cursor:pointer" onclick="toggleWlDetailRow('${addr}')">
         <div style="display:flex;align-items:center">
-          <button class="wl-chevron" id="wl-chev-${addr}" onclick="event.stopPropagation();toggleWlDetailRow('${addr}')">▼</button>
+          <button class="wl-chevron" id="wl-chev-${addr}" onclick="event.stopPropagation();toggleWlDetailRow('${addr}')">▶</button>
           <div>
             <span class="t-name">${name} <span class="badge-watchlist">WATCHLIST</span></span>
             <span class="t-addr">${shortAddr(addr)}</span>
@@ -1327,8 +1354,13 @@
       <td>${falconRoi}</td>
       <td>${falconSharpe}</td>
       <td id="wl-cell-wr-${addr}">${wrCell}</td>
+      <td id="wl-cell-be-${addr}">${beCell}</td>
+      <td id="wl-cell-pf-${addr}">${pfCell}</td>
       <td id="wl-cell-trades-${addr}">${tradesCell}</td>
       <td id="wl-cell-hold-${addr}">${holdCell}</td>
+      <td id="wl-cell-depth-${addr}">${depthCell}</td>
+      <td id="wl-cell-spread-${addr}">${spreadCell}</td>
+      <td id="wl-cell-liq-${addr}">${liqCell}</td>
       <td id="wl-cell-openpos-${addr}">${openCell}</td>
       <td id="wl-cell-pnl-${addr}">${pnlCell}</td>
       <td id="wl-cell-spark-${addr}">${sparkCell}</td>
@@ -1336,8 +1368,8 @@
       <td id="wl-cell-copy-${addr}">${copyBtn}</td>
       <td>${removeBtn}</td>
     </tr>
-    <tr id="${subRowId}" class="wl-sub-row expanded" data-address="${addr}">
-      <td colspan="13" style="padding:0">
+    <tr id="${subRowId}" class="wl-sub-row" data-address="${addr}">
+      <td colspan="18" style="padding:0">
         <div class="wl-expand-wrap">
           <div class="wl-expand-grid">
             <div class="wl-expand-side">
@@ -1419,6 +1451,12 @@
         : '<span style="color:var(--muted)">—</span>';
     }
 
+    // WR vs break-even + profit factor
+    const beEl = document.getElementById(`wl-cell-be-${addr}`);
+    if (beEl) beEl.innerHTML = wrVsBreakEvenCell(w);
+    const pfEl = document.getElementById(`wl-cell-pf-${addr}`);
+    if (pfEl) pfEl.innerHTML = profitFactorCell(w);
+
     // 30d trades
     const tradesEl = document.getElementById(`wl-cell-trades-${addr}`);
     if (tradesEl) tradesEl.textContent = (s && s.tradeCount30d > 0) ? s.tradeCount30d : '—';
@@ -1426,6 +1464,14 @@
     // Avg hold duration
     const holdEl = document.getElementById(`wl-cell-hold-${addr}`);
     if (holdEl) holdEl.innerHTML = fmtHoldDuration(w.avgHoldMs);
+
+    // Liquidity columns
+    const depthEl = document.getElementById(`wl-cell-depth-${addr}`);
+    if (depthEl) depthEl.innerHTML = liqDepthCell(w);
+    const spreadEl = document.getElementById(`wl-cell-spread-${addr}`);
+    if (spreadEl) spreadEl.innerHTML = liqSpreadCell(w);
+    const liqEl = document.getElementById(`wl-cell-liq-${addr}`);
+    if (liqEl) liqEl.innerHTML = liqSamplesCell(w);
 
     // Open sim positions
     const openEl = document.getElementById(`wl-cell-openpos-${addr}`);
@@ -1494,7 +1540,7 @@
       if (!tbody) return;
 
       if (items.length === 0) {
-        tbody.innerHTML = '<tr class="empty-row"><td colspan="13">No traders in watchlist — add one above.</td></tr>';
+        tbody.innerHTML = '<tr class="empty-row"><td colspan="18">No traders in watchlist — add one above.</td></tr>';
         return;
       }
 
@@ -1730,6 +1776,15 @@
         if (openLimSub) openLimSub.textContent = `wallet cap: $${cap.toFixed(0)} / $${tradeAmt}`;
       }
 
+      const testPnlEl = $('wl-s-test-pnl');
+      if (testPnlEl) {
+        const v = Number(s.testPnl || 0);
+        testPnlEl.textContent = fmtPnl(v);
+        testPnlEl.className = 'value ' + pnlClass(v);
+      }
+      const testTradesEl = $('wl-s-test-trades');
+      if (testTradesEl) testTradesEl.textContent = Number(s.testTrades || 0);
+
       $('last-updated').textContent = 'Updated ' + timeAgo(s.lastUpdated);
       $('status-dot').className = 'ok';
     } catch (e) {
@@ -1787,14 +1842,45 @@
   // ── Watchlist charts ───────────────────────────────────────────────────────
   let wlChartEquity = null, wlChartDrawdown = null, wlChartWinRate = null, wlChartTraders = null, wlChartOpenHistory = null, wlChartWalletHistory = null;
 
+  // Draws a dashed vertical line at the data point whose label matches `targetLabel`.
+  // Used to mark the 2026-05-28 $1k-wallet-test cutover on equity + wallet charts.
+  function verticalLinePlugin(targetLabel) {
+    return {
+      id: 'verticalLine_' + targetLabel,
+      afterDatasetsDraw(chart) {
+        const labels = chart.data.labels || [];
+        const idx = labels.indexOf(targetLabel);
+        if (idx < 0) return;
+        const x = chart.scales.x.getPixelForValue(idx);
+        const { top, bottom } = chart.chartArea;
+        const c = chart.ctx;
+        c.save();
+        c.strokeStyle = 'rgba(63,185,80,0.55)';
+        c.lineWidth = 1.2;
+        c.setLineDash([5, 4]);
+        c.beginPath(); c.moveTo(x, top); c.lineTo(x, bottom); c.stroke();
+        c.setLineDash([]);
+        c.fillStyle = 'rgba(63,185,80,0.85)';
+        c.font = '10px system-ui, sans-serif';
+        c.textAlign = 'left';
+        c.fillText('🧪 May 28', x + 4, top + 10);
+        c.restore();
+      },
+    };
+  }
+
   function initWatchlistCharts() {
     const ctx = id => document.getElementById(id).getContext('2d');
     const fmtDollar = c => (Number(c.raw) >= 0 ? '+$' : '-$') + Math.abs(Number(c.raw)).toFixed(2);
 
     wlChartEquity = new Chart(ctx('wl-chart-equity'), {
       type: 'line',
-      data: { labels: [], datasets: [{ data: [], borderColor: '#bc8cff', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 }] },
+      data: { labels: [], datasets: [
+        { label: 'cum. PNL', data: [], borderColor: '#bc8cff', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 },
+        { label: '🧪 $1k Test (from May 28)', data: [], borderColor: '#3fb950', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2, spanGaps: false },
+      ]},
       options: makeChartOpts(fmtDollar),
+      plugins: [verticalLinePlugin('2026-05-28')],
     });
     wlChartDrawdown = new Chart(ctx('wl-chart-drawdown'), {
       type: 'line',
@@ -1843,14 +1929,20 @@
       type: 'line',
       data: { labels: [], datasets: [
         { label: '$ in use', data: [], borderColor: '#bc8cff', borderWidth: 2, pointRadius: 0, fill: true, backgroundColor: 'rgba(188,140,255,0.10)', tension: 0.2 },
+        { label: '🧪 $1k Test (from May 28)', data: [], borderColor: '#3fb950', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2, spanGaps: false },
         { label: 'cap ($800 @ 80%)', data: [], borderColor: '#f85149', borderWidth: 1.5, pointRadius: 0, borderDash: [6, 4], fill: false },
       ]},
       options: (() => {
-        const opts = makeChartOpts(c => c.datasetIndex === 0 ? `$${Number(c.raw).toFixed(0)} in use` : `cap $${Number(c.raw).toFixed(0)}`);
+        const opts = makeChartOpts(c => {
+          if (c.datasetIndex === 0) return `$${Number(c.raw).toFixed(0)} in use`;
+          if (c.datasetIndex === 1) return `🧪 $${Number(c.raw).toFixed(0)} test`;
+          return `cap $${Number(c.raw).toFixed(0)}`;
+        });
         opts.scales.y.min = 0;
         opts.scales.y.suggestedMax = 1000;
         return opts;
       })(),
+      plugins: [verticalLinePlugin('2026-05-28')],
     });
   }
 
@@ -1868,6 +1960,19 @@
       for (const t of closed) { cumPnl += Number(t.realizedPnl); dayEquity.set(t.closedAt.slice(0, 10), cumPnl); }
       const eqLabels = [...dayEquity.keys()];
       const eqData   = [...dayEquity.values()];
+
+      // 🧪 $1k test green line: cumulative cost-adjusted PNL, watchlist closes ≥ 2026-05-28, begins at $0.
+      const TEST_START = '2026-05-28';
+      const dayTest = new Map();
+      let cumTest = 0;
+      for (const t of closed) {
+        const day = t.closedAt.slice(0, 10);
+        if (day < TEST_START) continue;
+        const adj = t.costAdjustedPnl != null ? Number(t.costAdjustedPnl) : Number(t.realizedPnl);
+        cumTest += adj;
+        dayTest.set(day, cumTest);
+      }
+      const eqTestData = eqLabels.map(d => d < TEST_START ? null : (dayTest.get(d) ?? cumTest));
 
       let peak = -Infinity;
       // Suppress drawdown until cumulative equity peak ≥ $50 — early data points
@@ -1893,7 +1998,10 @@
       const tData     = tEntries.map(([, v]) => v);
       const tColors   = tData.map(v => v >= 0 ? 'rgba(188,140,255,0.75)' : 'rgba(248,81,73,0.75)');
 
-      wlChartEquity.data.labels = eqLabels; wlChartEquity.data.datasets[0].data = eqData; wlChartEquity.update('none');
+      wlChartEquity.data.labels = eqLabels;
+      wlChartEquity.data.datasets[0].data = eqData;
+      wlChartEquity.data.datasets[1].data = eqTestData;
+      wlChartEquity.update('none');
       wlChartDrawdown.data.labels = eqLabels; wlChartDrawdown.data.datasets[0].data = ddData; wlChartDrawdown.update('none');
       wlChartWinRate.data.labels = eqLabels; wlChartWinRate.data.datasets[0].data = wr7Data; wlChartWinRate.data.datasets[1].data = eqLabels.map(() => 50); wlChartWinRate.update('none');
       wlChartTraders.data.labels = tLabels; wlChartTraders.data.datasets[0].data = tData; wlChartTraders.data.datasets[0].backgroundColor = tColors; wlChartTraders.update('none');
@@ -1917,7 +2025,8 @@
       const cap = Number(d.cap) || 800;
       wlChartWalletHistory.data.labels = d.days || [];
       wlChartWalletHistory.data.datasets[0].data = d.amounts || [];
-      wlChartWalletHistory.data.datasets[1].data = (d.days || []).map(() => cap);
+      wlChartWalletHistory.data.datasets[1].data = d.testAmounts || (d.days || []).map(() => null);
+      wlChartWalletHistory.data.datasets[2].data = (d.days || []).map(() => cap);
       wlChartWalletHistory.update('none');
     } catch (e) {
       console.error('[wl-wallet-history] Load failed:', e);
@@ -1955,7 +2064,7 @@
   loadWatchlistCharts();
   setInterval(loadWatchlistCharts, 30_000);
 
-  setInterval(refresh, 5_000);
+  setInterval(refresh, 30_000);
 
   checkVpn();
   setInterval(checkVpn, 30_000);

@@ -194,11 +194,24 @@ export async function pollTrader(
         };
         addShadowOpenTrade(sTrade);
         newTrades++;
-        console.log(`[shadow] EXCLUDED ${label} BUY ${activity.marketSlug} @ $${activity.price.toFixed(3)} — would have passed filters`);
+        console.log(`[shadow] PASS ${label} BUY ${activity.marketSlug} @ $${activity.price.toFixed(3)} — would have copied`);
         continue;
       }
 
       const currentStore = readStore();
+
+      // ╔══════════════════════════════════════════════════════════════════════╗
+      // ║ DORMANT CODE (L2): the entire leaderboard real-copy BUY path below     ║
+      // ║ (everything guarded by `!isWatchlist`: global/market caps, per-trader  ║
+      // ║ sample gate, category/price/spread filters) is NOT reached under the   ║
+      // ║ current wiring. Leaderboard traders are shadow-only since 2026-05-28   ║
+      // ║ — index.ts polls them with { shadowMode: true, copyEnabled: false },   ║
+      // ║ so they take the shadow branch above and never get here. Only          ║
+      // ║ watchlist traders (isWatchlist=true) reach this point, and they bypass ║
+      // ║ all `!isWatchlist` gates by design. This block is kept (not deleted)   ║
+      // ║ so leaderboard real-copy can be re-enabled later; if you do, RE-VERIFY ║
+      // ║ this path end-to-end — it is currently untested in production.         ║
+      // ╚══════════════════════════════════════════════════════════════════════╝
 
       // ── Watchlist-only: per-market entry cap within a rolling window ──
       // Watchlist bypasses MAX_POSITIONS_PER_MARKET, but rapid BUY-SELL-BUY cycles

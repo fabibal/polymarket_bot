@@ -9,6 +9,10 @@ import { CONFIG } from './config';
 import { checkVpnConnectivity, RawActivityItem } from './bullpen';
 import { detectCategory } from './categories';
 import { tradeCostAdjustedPnl, tradeTotalCosts } from './simulator';
+import { groupStats } from './stats';
+
+// $1k wallet-test cutover: leaderboard real copies frozen, watchlist-only sim begins.
+const TEST_START_MS = Date.UTC(2026, 4, 28, 0, 0, 0);
 
 // Minimal shape used by computeTraderStats (compatible with both RawActivityItem and TraderHistoryEntry)
 type ActivityLike = {
@@ -90,6 +94,53 @@ async function getContainerUptimeMs(name: string): Promise<number | null> {
   if (!startedAt) return null;
   const started = new Date(startedAt).getTime();
   return isNaN(started) ? null : Date.now() - started;
+}
+
+// Fetch container logs (multiplexed Docker stream) and count substring matches.
+// Used for "wallet cap skips" — bot logs go to docker stdout, not a host file.
+function countContainerLogMatches(name: string, sinceSec: number, needle: string): Promise<number> {
+  return new Promise(resolve => {
+    const req = http.request(
+      { socketPath: '/var/run/docker.sock', path: `/containers/${name}/logs?stdout=1&stderr=1&since=${sinceSec}`, method: 'GET' },
+      res => {
+        // Count matches incrementally on each streamed chunk so we never hold the
+        // full (potentially tens of MB over 7d) log in memory at once. Each
+        // "wallet_cap:" occurrence is on its own log line, so a raw byte search
+        // across multiplex frame headers is safe (headers are 8 bytes of binary
+        // that cannot contain the literal needle). We carry a small tail of the
+        // previous chunk (needle.length - 1 bytes) so a match split across a
+        // chunk boundary is still counted exactly once.
+        let n = 0;
+        let tail = '';
+        const overlap = Math.max(0, needle.length - 1);
+        res.on('data', (d: Buffer) => {
+          const s = tail + d.toString('utf8');
+          let idx = 0;
+          while ((idx = s.indexOf(needle, idx)) !== -1) { n++; idx += needle.length; }
+          tail = overlap > 0 ? s.slice(-overlap) : '';
+        });
+        res.on('end', () => resolve(n));
+        res.on('error', () => resolve(n));
+      }
+    );
+    req.on('error', () => resolve(0));
+    req.setTimeout(5000, () => { req.destroy(); resolve(0); });
+    req.end();
+  });
+}
+
+let walletCapSkipsCache: { count: number; ts: number } | null = null;
+const WALLET_CAP_SKIPS_TTL_MS = 60_000;
+
+async function getWalletCapSkips7d(): Promise<number> {
+  const now = Date.now();
+  if (walletCapSkipsCache && now - walletCapSkipsCache.ts < WALLET_CAP_SKIPS_TTL_MS) {
+    return walletCapSkipsCache.count;
+  }
+  const sinceSec = Math.floor((now - 7 * 86_400_000) / 1000);
+  const count = await countContainerLogMatches('polymarket_bot', sinceSec, 'wallet_cap:');
+  walletCapSkipsCache = { count, ts: now };
+  return count;
 }
 
 // ── Container stats ────────────────────────────────────────────────────────
@@ -290,13 +341,32 @@ function computeInlineStats(
   return { hasEnoughData: true as const, tradeCount30d, winRate7d, avgWin, avgLoss, topCategory, histVol30d };
 }
 
+// Cost-adjusted per-trade edge stats for a set of closed trades.
+// Used by the go-live readiness, shadow comparison, and risk endpoints.
+function edgeStats(trades: import('./types').SimulatedTrade[]) {
+  const vals = trades.map(t => tradeCostAdjustedPnl(t));
+  const gs = groupStats(vals);
+  const winners = vals.filter(v => v > 0).length;
+  const totalPnl = vals.reduce((s, v) => s + v, 0);
+  return {
+    n: gs.n,
+    winRate: gs.n > 0 ? winners / gs.n : null,
+    expPerTrade: gs.mean,
+    ciLow: gs.ciLow,
+    ciHigh: gs.ciHigh,
+    tStat: gs.tStat,
+    pValue: gs.pValue,
+    totalPnl,
+  };
+}
+
 export function startDashboard(): void {
   const app = express();
 
   app.use(express.json());
   app.use(express.static(path.join(process.cwd(), 'public')));
 
-  app.get('/api/stats', (req, res) => {
+  app.get('/api/stats', async (req, res) => {
     const store = readStore();
     const source = String(req.query.source ?? '');
 
@@ -325,6 +395,15 @@ export function startDashboard(): void {
     const avgSlippage   = closedCosts / closedCount;
     const avgNetEdge    = realizedAdj / closedCount;
 
+    // $1k wallet-test window: watchlist-only closes at or after TEST_START_MS.
+    const testCloses = store.closedTrades.filter(t =>
+      t.copiedTraderSource === 'watchlist' &&
+      t.closedAt != null &&
+      new Date(t.closedAt).getTime() >= TEST_START_MS
+    );
+    const testPnl    = testCloses.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
+    const testTrades = testCloses.length;
+
     const stats = {
       totalTrades: openTrades.length + closedTrades.length,
       openTrades: openTrades.length,
@@ -346,8 +425,62 @@ export function startDashboard(): void {
       avgRawPnlPerTrade:          avgRawPnl,
       avgSlippagePerTrade:        avgSlippage,
       avgNetEdgePerTrade:         avgNetEdge,
-    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number };
+      simulatedWalletSize:        CONFIG.SIMULATED_WALLET_SIZE,
+      walletInUse:                openTrades.reduce((s, t) => s + (t.simulatedAmount ?? CONFIG.TRADE_AMOUNT), 0),
+      walletCapUtilization:       CONFIG.WALLET_CAP_UTILIZATION,
+      walletCapSkips7d:           await getWalletCapSkips7d(),
+      tradeAmount:                CONFIG.TRADE_AMOUNT,
+      testPnl,
+      testTrades,
+      testStart:                  new Date(TEST_START_MS).toISOString(),
+    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string };
     res.json(stats);
+  });
+
+  // Per-day wallet $ in use over the last 30 days. Sum of simulatedAmount for
+  // trades active on each day (opened on/before dayEnd, not closed before dayEnd).
+  app.get('/api/wallet/history', (_req, res) => {
+    const store = readStore();
+    const all = [...store.openTrades, ...store.closedTrades];
+    const watchOnly = all.filter(t => t.copiedTraderSource === 'watchlist');
+    const DAY_MS = 86_400_000;
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    const days: string[] = [];
+    const amounts: number[] = [];
+    const testAmounts: (number | null)[] = [];
+    for (let i = 29; i >= 0; i--) {
+      const dayStart = new Date(today.getTime() - i * DAY_MS);
+      const dayEnd   = dayStart.getTime() + DAY_MS;
+      let inUse = 0;
+      for (const t of all) {
+        const opened = new Date(t.timestamp).getTime();
+        if (opened >= dayEnd) continue;
+        const amt = Number(t.simulatedAmount ?? CONFIG.TRADE_AMOUNT) || 0;
+        if (!t.closedAt) { inUse += amt; continue; }
+        const closed = new Date(t.closedAt).getTime();
+        if (closed >= dayEnd) inUse += amt;
+      }
+      days.push(dayStart.toISOString().slice(0, 10));
+      amounts.push(Math.round(inUse * 100) / 100);
+
+      if (dayEnd <= TEST_START_MS) {
+        testAmounts.push(null);
+      } else {
+        let testInUse = 0;
+        for (const t of watchOnly) {
+          const opened = new Date(t.timestamp).getTime();
+          if (opened >= dayEnd) continue;
+          const amt = Number(t.simulatedAmount ?? CONFIG.TRADE_AMOUNT) || 0;
+          if (!t.closedAt) { testInUse += amt; continue; }
+          const closed = new Date(t.closedAt).getTime();
+          if (closed >= dayEnd) testInUse += amt;
+        }
+        testAmounts.push(Math.round(testInUse * 100) / 100);
+      }
+    }
+    const cap = CONFIG.SIMULATED_WALLET_SIZE * CONFIG.WALLET_CAP_UTILIZATION;
+    res.json({ days, amounts, testAmounts, testStart: new Date(TEST_START_MS).toISOString(), walletSize: CONFIG.SIMULATED_WALLET_SIZE, cap });
   });
 
   app.get('/api/trades', (req, res) => {
@@ -373,7 +506,8 @@ export function startDashboard(): void {
       all = all.filter(t => new Date(t.timestamp).getTime() >= cutoff!);
     }
     all.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    res.json({ count: all.length, items: all });
+    const items = all.map(t => ({ ...t, costAdjustedPnl: tradeCostAdjustedPnl(t) }));
+    res.json({ count: items.length, items });
   });
 
   app.get('/api/vpn-status', async (_req, res) => {
@@ -417,7 +551,23 @@ export function startDashboard(): void {
 
       const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
       const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
-      const realizedPnl = simClosed.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
+      // Cost-adjusted realized PNL — consistent basis with the sparkline + go-live panel.
+      const realizedPnl = simClosed.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
+
+      // Break-even win rate = average entry price (implied probability paid).
+      // A favorites strategy buying at avg 0.75 must win >75% just to break even.
+      const avgEntryPrice = simClosed.length > 0
+        ? simClosed.reduce((s, t) => s + (Number(t.entryPrice) || 0), 0) / simClosed.length
+        : null;
+
+      // Profit factor = gross cost-adjusted wins / gross cost-adjusted losses.
+      let grossWin = 0, grossLoss = 0;
+      for (const t of simClosed) {
+        const v = tradeCostAdjustedPnl(t);
+        if (v > 0) grossWin += v; else grossLoss += -v;
+      }
+      const profitFactor = (simClosed.length >= 3 && grossLoss > 0) ? grossWin / grossLoss : null;
+
       const traderOpenTrades = store.openTrades.filter(t => t.copiedTrader === w.address);
       const openPositions = traderOpenTrades.length;
 
@@ -529,7 +679,7 @@ export function startDashboard(): void {
         ? liqSamples.reduce((s, t) => s + (t.spreadAtEntry ?? 0), 0) / liqSamples.length
         : null;
 
-      return { ...w, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length };
+      return { ...w, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length };
     });
 
     // Watchlist-wide PNL totals (simulated)
@@ -681,7 +831,20 @@ export function startDashboard(): void {
       }
 
       const winRate = (winCount + lossCount) >= 3 ? winCount / (winCount + lossCount) : null;
-      const data = { totalPositions, openPositions, closedPositions, totalInvested, realizedPnl, winCount, lossCount, winRate };
+
+      // Earliest trade timestamp ("active since")
+      let activeSince: string | null = null;
+      try {
+        const earliestRaw = await httpsGet(
+          `https://data-api.polymarket.com/activity?user=${addr}&limit=1&type=TRADE&sortDirection=ASC`
+        );
+        const earliest = Array.isArray(earliestRaw) ? earliestRaw as Record<string, unknown>[] : [];
+        if (earliest[0] && earliest[0].timestamp) {
+          activeSince = new Date(Number(earliest[0].timestamp) * 1000).toISOString();
+        }
+      } catch { /* non-blocking */ }
+
+      const data = { totalPositions, openPositions, closedPositions, totalInvested, realizedPnl, winCount, lossCount, winRate, activeSince };
       pstatsCache.set(addr, { data, ts: Date.now() });
       res.json(data);
     } catch (err) {
@@ -826,6 +989,152 @@ export function startDashboard(): void {
       console.error('[dashboard] /api/discovery/candidates error:', e);
       res.status(500).json({ error: 'failed to read scan results' });
     }
+  });
+
+  // ── Go-live readiness ───────────────────────────────────────────────────────
+  // Statistical gate for flipping DRY_RUN=false. Computed over watchlist closed
+  // trades in the $1k test window only (closed_at >= TEST_START_MS), cost-adjusted.
+  app.get('/api/golive/readiness', (_req, res) => {
+    const store = readStore();
+    const TARGET = 5000;
+    const P_THRESHOLD = 0.01;
+    const test = store.closedTrades.filter(t =>
+      t.copiedTraderSource === 'watchlist' &&
+      t.closedAt != null &&
+      new Date(t.closedAt).getTime() >= TEST_START_MS,
+    );
+    const e = edgeStats(test);
+    // READY requires significance AND a positive edge — a significant *negative*
+    // edge must never read as "go live" in this DRY_RUN-safety context.
+    const ready = e.n >= TARGET && e.pValue < P_THRESHOLD && e.expPerTrade > 0;
+    res.json({
+      n: e.n,
+      target: TARGET,
+      pThreshold: P_THRESHOLD,
+      netEdgePerTrade: e.expPerTrade,
+      ciLow: e.ciLow,
+      ciHigh: e.ciHigh,
+      tStat: e.tStat,
+      pValue: e.pValue,
+      totalPnl: e.totalPnl,
+      winRate: e.winRate,
+      ready,
+      testStart: new Date(TEST_START_MS).toISOString(),
+    });
+  });
+
+  // ── Shadow vs watchlist edge comparison ──────────────────────────────────────
+  // Shadow = leaderboard traders (shadow-only, not copied). Watchlist = real sim.
+  // Both over full history, cost-adjusted, so the watchlist edge can be compared
+  // against the leaderboard baseline it replaced.
+  app.get('/api/shadow/stats', (_req, res) => {
+    const store = readStore();
+    const shadow = edgeStats(store.shadowClosedTrades ?? []);
+    const watchlist = edgeStats(store.closedTrades.filter(t => t.copiedTraderSource === 'watchlist'));
+    res.json({ shadow, watchlist });
+  });
+
+  // ── Risk metrics ──────────────────────────────────────────────────────────────
+  app.get('/api/risk/metrics', (_req, res) => {
+    const store = readStore();
+    const DAY_MS = 86_400_000;
+    const closed = store.closedTrades
+      .filter(t => t.copiedTraderSource === 'watchlist' && t.closedAt != null)
+      .sort((a, b) => new Date(a.closedAt!).getTime() - new Date(b.closedAt!).getTime());
+
+    // Equity curve (cost-adjusted) → max drawdown $ and %.
+    let cum = 0, peak = 0, maxDrawdownUsd = 0, maxDrawdownPct = 0;
+    // Longest losing streak (consecutive non-positive trades).
+    let streak = 0, longestLosingStreak = 0;
+    const dailyPnl = new Map<string, number>();
+    for (const t of closed) {
+      const v = tradeCostAdjustedPnl(t);
+      cum += v;
+      if (cum > peak) peak = cum;
+      const dd = peak - cum;
+      if (dd > maxDrawdownUsd) { maxDrawdownUsd = dd; maxDrawdownPct = peak > 0 ? (dd / peak) * 100 : 0; }
+      if (v <= 0) { streak++; if (streak > longestLosingStreak) longestLosingStreak = streak; } else streak = 0;
+      const day = t.closedAt!.slice(0, 10);
+      dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + v);
+    }
+
+    // Daily-PNL Sharpe (annualized by sqrt(365)). Calendar days from first to
+    // last close are filled with 0 so idle days count as flat returns.
+    let sharpe: number | null = null;
+    if (closed.length >= 2) {
+      const first = new Date(closed[0].closedAt!.slice(0, 10)).getTime();
+      const last = new Date(closed[closed.length - 1].closedAt!.slice(0, 10)).getTime();
+      const series: number[] = [];
+      for (let d = first; d <= last; d += DAY_MS) {
+        series.push(dailyPnl.get(new Date(d).toISOString().slice(0, 10)) ?? 0);
+      }
+      if (series.length >= 2) {
+        const mean = series.reduce((a, b) => a + b, 0) / series.length;
+        const variance = series.reduce((a, b) => a + (b - mean) ** 2, 0) / (series.length - 1);
+        const sd = Math.sqrt(variance);
+        sharpe = sd > 0 ? (mean / sd) * Math.sqrt(365) : null;
+      }
+    }
+
+    // Exposure concentration over OPEN watchlist positions.
+    const open = store.openTrades.filter(t => t.copiedTraderSource === 'watchlist');
+    const totalOpen = open.reduce((s, t) => s + (Number(t.simulatedAmount) || 0), 0);
+    const labelByAddr = new Map<string, string>();
+    for (const w of store.watchlistTraders ?? []) if (w.label) labelByAddr.set(w.address, w.label);
+    const byTraderMap = new Map<string, number>();
+    const byCatMap = new Map<string, number>();
+    for (const t of open) {
+      const amt = Number(t.simulatedAmount) || 0;
+      byTraderMap.set(t.copiedTrader, (byTraderMap.get(t.copiedTrader) ?? 0) + amt);
+      const cat = detectCategory(t.marketSlug || '');
+      byCatMap.set(cat, (byCatMap.get(cat) ?? 0) + amt);
+    }
+    const byTrader = [...byTraderMap.entries()]
+      .map(([address, amount]) => ({
+        address,
+        label: labelByAddr.get(address) ?? null,
+        amount,
+        pct: totalOpen > 0 ? (amount / totalOpen) * 100 : 0,
+      }))
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 8);
+    const byCategory = [...byCatMap.entries()]
+      .map(([category, amount]) => ({ category, amount, pct: totalOpen > 0 ? (amount / totalOpen) * 100 : 0 }))
+      .sort((a, b) => b.amount - a.amount);
+
+    res.json({
+      closedCount: closed.length,
+      maxDrawdownUsd,
+      maxDrawdownPct,
+      longestLosingStreak,
+      sharpe,
+      totalOpen,
+      byTrader,
+      byCategory,
+    });
+  });
+
+  // ── Auto-excluded traders ─────────────────────────────────────────────────────
+  app.get('/api/excluded', (_req, res) => {
+    const store = readStore();
+    const threshold = CONFIG.AUTO_EXCLUDE_WIN_RATE_THRESHOLD;
+    const usernameByAddr = new Map<string, string>();
+    for (const t of store.trackedTraders ?? []) if (t.username) usernameByAddr.set(t.address, t.username);
+    const items = (store.autoExcludedTraders ?? []).map(address => {
+      // Cost-adjusted WR from this trader's shadow + real closed trades.
+      const tr = [
+        ...(store.shadowClosedTrades ?? []).filter(t => t.copiedTrader === address),
+        ...store.closedTrades.filter(t => t.copiedTrader === address),
+      ];
+      const winners = tr.filter(t => tradeCostAdjustedPnl(t) > 0).length;
+      return {
+        address,
+        username: usernameByAddr.get(address) ?? null,
+        winRate: tr.length > 0 ? winners / tr.length : null,
+        sampleSize: tr.length,
+      };
+    });
+    res.json({ threshold, count: items.length, items });
   });
 
   app.listen(CONFIG.PORT, '0.0.0.0', () => {

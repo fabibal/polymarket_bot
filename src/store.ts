@@ -767,11 +767,17 @@ export function updateTrackedTraders(traders: LeaderboardTrader[]): void {
 export function addOpenTrade(trade: SimulatedTrade): void {
   const store = readStore();
   store.openTrades.push(trade);
-  store.processedTradeIds.push(trade.sourceTradeId);
-  if (store.processedTradeIds.length > PROCESSED_IDS_CAP) {
-    store.processedTradeIds = store.processedTradeIds.slice(-PROCESSED_IDS_CAP);
-  } else if (store.processedTradeIds.length >= PROCESSED_IDS_WARN) {
-    console.warn(`[store] processedTradeIds at ${store.processedTradeIds.length} — approaching ${PROCESSED_IDS_CAP} cap`);
+  // Guard against duplicate IDs in the in-memory array (L3) — matches markProcessed.
+  // The DB side already uses INSERT OR IGNORE; without this check the in-memory
+  // array could accumulate duplicates (inflating the cap-trim slice) until the
+  // next full persistSnapshot dedupes them.
+  if (!store.processedTradeIds.includes(trade.sourceTradeId)) {
+    store.processedTradeIds.push(trade.sourceTradeId);
+    if (store.processedTradeIds.length > PROCESSED_IDS_CAP) {
+      store.processedTradeIds = store.processedTradeIds.slice(-PROCESSED_IDS_CAP);
+    } else if (store.processedTradeIds.length >= PROCESSED_IDS_WARN) {
+      console.warn(`[store] processedTradeIds at ${store.processedTradeIds.length} — approaching ${PROCESSED_IDS_CAP} cap`);
+    }
   }
 
   const d = getDb();
@@ -1287,18 +1293,21 @@ function maybeWriteDailySnapshot(): void {
   const today = new Date().toISOString().slice(0, 10);
   const dest = path.join(backupDir, `store-${today}.db`);
   // Use SQLite backup API for a consistent copy while WAL is active.
+  // Prune AFTER the backup completes (L5): the backup is async, so running the
+  // prune synchronously here races the write — the new file may not exist yet
+  // when we re-scan the directory.
   getDb().backup(dest).then(() => {
     const kb = (fs.statSync(dest).size / 1024).toFixed(1);
     console.log(`[cleanup] Wrote daily snapshot → backups/store-${today}.db (${kb} KB)`);
-  }).catch(err => console.error('[cleanup] Snapshot backup failed:', err));
 
-  const after = fs.readdirSync(backupDir)
-    .filter(f => f.startsWith('store-') && f.endsWith('.db'))
-    .map(f => ({ name: f, mtime: fs.statSync(path.join(backupDir, f)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-  for (const f of after.slice(30)) {
-    try { fs.unlinkSync(path.join(backupDir, f.name)); } catch {}
-  }
+    const after = fs.readdirSync(backupDir)
+      .filter(f => f.startsWith('store-') && f.endsWith('.db'))
+      .map(f => ({ name: f, mtime: fs.statSync(path.join(backupDir, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const f of after.slice(30)) {
+      try { fs.unlinkSync(path.join(backupDir, f.name)); } catch {}
+    }
+  }).catch(err => console.error('[cleanup] Snapshot backup failed:', err));
 }
 
 export function runDailyCleanup(): void {
@@ -1317,6 +1326,21 @@ export function runDailyCleanup(): void {
   console.log(`[cleanup] closedTrades: ${store.closedTrades.length} retained in DB (no archival)`);
 
   // 2. Trim processedTradeIds: drop IDs whose underlying trade is no longer referenced.
+  //
+  // CURSOR DEPENDENCY (L1) — this trim is only safe because of the per-trader
+  // `since` cursor (trader_last_seen / shadow_last_seen). A processed-ID for a
+  // trade that was fetched-but-skipped (depth gate, wallet cap, entry cap, price
+  // filter) survives here only via traderHistory, which is itself capped at
+  // SIDE_CAP per side. Once a skipped trade's hash ages out of that cap, this
+  // step drops it from the dedup set. That is acceptable ONLY because the cursor
+  // prevents the API from ever returning that trade again.
+  //
+  // WARNING: if the cursor is ever lost or reset (e.g. restoring an older DB
+  // backup whose trader_last_seen predates current trades), getTraderActivity
+  // can re-return those trades and they will be re-processed/re-simulated, since
+  // their dedup IDs were pruned here. The 7-day staleness filter in monitor.ts
+  // bounds the blast radius to the last 7 days. If you restore a backup, expect
+  // some duplicate reprocessing within that window.
   const refIds = new Set<string>();
   for (const t of store.openTrades)   refIds.add(t.sourceTradeId);
   for (const t of store.closedTrades) refIds.add(t.sourceTradeId);

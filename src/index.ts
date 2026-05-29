@@ -58,7 +58,8 @@ async function runPollingCycle(): Promise<void> {
 
   for (const trader of traders) {
     polledAddresses.add(trader.address.toLowerCase());
-    const n = await pollTrader(trader);
+    // Leaderboard traders are shadow-only as of 2026-05-28 — no real copies.
+    const n = await pollTrader(trader, { shadowMode: true, copyEnabled: false });
     totalNew += n;
     // Brief pause between traders to avoid rate-limiting
     await new Promise(r => setTimeout(r, 1_000));

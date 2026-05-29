@@ -2,6 +2,8 @@
 
 DRY_RUN simulation-only copy bot. Tracks top 10 traders by weekly PNL plus a persistent watchlist; simulates each BUY as a $5 position (watchlist entries can override via `copyAmount`) and closes FIFO on matching SELL.
 
+**Leaderboard = shadow-only (as of 2026-05-28).** Top-10 leaderboard traders are still tracked, polled, and recorded into `shadow_open_trades` / `shadow_closed_trades` for edge measurement, but they generate **zero** real sim copies. Enforced in `src/index.ts` by passing `{ shadowMode: true, copyEnabled: false }` to `pollTrader` for every leaderboard trader. Lifetime leaderboard real-copy PNL through 2026-05-28 was -$2,451 over 9,258 closed trades — no demonstrable edge, removed. Only `watchlist_traders` entries can produce real sim positions. On the policy flip, the 99 then-open leaderboard positions ($495) were deleted from `open_trades`, dropping wallet_in_use from $750 to $285.
+
 ## Stack
 - Node.js / TypeScript, vitest tests under `tests/`
 - Bullpen CLI (`@bullpenfi/cli`) — docs https://cli.bullpen.fi/ — requires `bullpen login` on host; config at `~/.bullpen/`
@@ -80,6 +82,15 @@ SLIPPAGE_RATE=0.02                      # 2% each side (entry at ask, exit at bi
 # tail trades. Non-blocking on depth-fetch failure (copy proceeds).
 DEPTH_GATE_MIN_DEPTH_5=500
 
+# Simulated wallet cap (added 2026-05-28) — models a fixed-size real wallet.
+# When SIMULATED_WALLET_SIZE>0, sum(simulatedAmount) over open trades is compared
+# against SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION before each BUY; over-cap
+# BUYs are skipped (applies to BOTH watchlist and leaderboard — wallet is a hard
+# real-money constraint regardless of trust override). Logs `wallet_cap: $X/$1000 in use`.
+# Dashboard /api/stats returns simulatedWalletSize, walletInUse, walletCapUtilization.
+SIMULATED_WALLET_SIZE=1000
+WALLET_CAP_UTILIZATION=0.80
+
 FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
 ```
 
@@ -114,7 +125,8 @@ Both scripts: alert at ≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=
 | `check-bullpen-expiry.sh` | `0 9 * * *` | `bullpen --output json status` → `account.session_expires` (CLI ≥0.1.98 stores creds encrypted as `credentials.json.enc`, so JWT is no longer decodable from disk; script shells out to the CLI instead) | `bullpen login` on server |
 | `check-falcon-expiry.sh` | `0 9 * * *` | `POLYMARKET_ANALYTICS_API_KEY` (= `FALCON_API_KEY`) in `~/polymarket_bot/.env`, raw JWT, no auto-refresh, ~60 day TTL | Generate new JWT at https://polymarketanalytics.com → update `.env` → `docker compose up -d --no-deps bot` |
 | `git-sync.sh` | `0 3 * * *` | Tracked changes under `src/`, `tests/`, `scripts/`, `public/`, plus `CLAUDE.md`, `Dockerfile`, `docker-compose.yml`, `package*.json`, `tsconfig.json`, `.gitignore`, `.env.example` | Auto: stages `git add -u` on those paths, commits as `chore(sync): daily auto-sync <date>`, pushes to `origin/main` via `~/.ssh/deploy-key`. Skips silently when no diff. Untracked files are NOT auto-added — add them manually if they belong in git. Log: `logs/git-sync.log` (rotated to last 100 lines) + `logs/git-sync.cron.log` |
-| `weekly-macro-scan.sh` | `0 4 * * 1` (Mon) | `docker cp` latest `macro_scan.js` + `macro_scan_90d.js` into the container, then `docker exec` Falcon enrichment (updates `tracked_traders.falcon_sharpe/roi/win_rate`) + 90d on-chain scan. Parses MACRO CANDIDATES (avg_hold≥48h, t/wk<20, WR>60%, closed≥10, pnl>0; excludes watchlist + excluded_traders), enriches with Sharpe from `tracked_traders`, sends Telegram top-5 summary or "no candidates" if empty. **Does NOT auto-add to watchlist — manual review only.** Log: `logs/weekly-macro-scan.log` (last 200 lines) + per-run raw outputs under `logs/weekly-macro-scan-runs/` (pruned after 30d) + `logs/weekly-macro-scan.cron.log` |
+| `watchdog.sh` | `*/5 * * * *` | Probes `http://localhost:8082/`. State file `logs/watchdog.state` tracks consecutive failures; ≥2 consecutive non-200 results (~10 min unreachable) triggers `docker compose restart bot` + Telegram alert. Recovers from the gluetun-restart orphan-namespace failure: bot uses `network_mode: container:gluetun`, so a gluetun restart detaches the bot's netns and Express becomes unreachable from outside even though the process is healthy. `FORCE_RESTART=1` simulates a failure for testing. Log: `logs/watchdog.log` (rotated to last 100 lines) + `logs/watchdog.cron.log`. |
+| `weekly-macro-scan.sh` | `0 4 * * 1` (Mon) | `docker cp` latest `macro_scan.js` + `macro_scan_90d.js` into the container, then `docker exec` Falcon enrichment (updates `tracked_traders.falcon_sharpe/roi/win_rate`) + 90d on-chain scan. Parses MACRO CANDIDATES (avg_hold≥48h, t/wk<20, WR>60%, closed≥10, pnl>0; excludes watchlist + excluded_traders), enriches with Sharpe from `tracked_traders`, sends Telegram top-5 summary only when candidates>0 (zero-candidate runs log `SILENT` to the app log and send no message). **Does NOT auto-add to watchlist — manual review only.** Log: `logs/weekly-macro-scan.log` (last 200 lines) + per-run raw outputs under `logs/weekly-macro-scan-runs/` (pruned after 30d) + `logs/weekly-macro-scan.cron.log` |
 
 New alerts: copy `send_telegram()` from `check-bullpen-expiry.sh` (self-contained, sources `~/.env.shared`). Use `[polymarket_bot]` prefix so messages group separately from `paper_trader`. Always log one line per run so a quiet log proves the cron ran.
 

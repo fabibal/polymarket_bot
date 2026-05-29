@@ -68,6 +68,8 @@ services:
       - MAX_POSITIONS_PER_MARKET=2   # max open positions per market slug (lowered from 5 — prevents stacking same game)
       - MAX_POSITIONS_PER_MARKET_SPORTS=1  # sports/esports cap — prevents single-trader domination (swisstony had 95 open)
       - MAX_TOTAL_OPEN_POSITIONS=300  # global cap: skip all new BUYs when reached (lowered from 750)
+      - SIMULATED_WALLET_SIZE=1000   # $ wallet simulation; 0 disables. Caps BOTH watchlist+leaderboard BUYs.
+      - WALLET_CAP_UTILIZATION=0.80  # stop opening new BUYs at 80% utilization ($800 of $1000)
       - MIN_TRADER_SAMPLE=5  # don't copy a leaderboard trader until we have ≥5 closed trades from them locally
       - GAS_COST_PER_BUY=0  # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
       - SLIPPAGE_RATE=0.02   # 2% slippage each side (entry at ask, exit at bid)
