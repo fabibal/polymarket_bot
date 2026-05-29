@@ -56,21 +56,14 @@ services:
       - DRY_RUN=true
       - PORT=8080
       - DB_FILE=/app/data/store.db
-      - LEADERBOARD_REFRESH_MS=300000   # 5 minutes
       - POLL_INTERVAL_MS=30000          # 30 seconds
       - PRICE_UPDATE_INTERVAL_MS=300000 # 5 minutes
-      - AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42  # auto-exclude traders below 42% 7d win rate (RN1 has 44.9% WR but is profitable due to high W/L ratio)
-      - MIN_PRICE=0.65       # skip BUYs below this entry price (raised from 0.40 — 0.65-0.80 is the sweet spot for PNL/trade)
-      - MIN_PRICE_SPORTS=0.60  # sports-specific floor — sports <0.60 had 43% WR historically; only copy favorites
-      - MAX_PRICE=0.88       # skip BUYs above this entry price (lowered from 0.95 — 0.90-0.95 bucket has 96% WR but only 4.85% ROI, tail risk not worth it)
-      - MAX_SPREAD=0.05      # tightened from 0.15 — 15% spread was eating ~$0.75/round-trip
-      - FORCE_EXCLUDE_CATEGORIES=esports  # excluded at startup: -$0.43/trade cost-adj historically
-      - MAX_POSITIONS_PER_MARKET=2   # max open positions per market slug (lowered from 5 — prevents stacking same game)
-      - MAX_POSITIONS_PER_MARKET_SPORTS=1  # sports/esports cap — prevents single-trader domination (swisstony had 95 open)
-      - MAX_TOTAL_OPEN_POSITIONS=300  # global cap: skip all new BUYs when reached (lowered from 750)
-      - SIMULATED_WALLET_SIZE=1000   # $ wallet simulation; 0 disables. Caps BOTH watchlist+leaderboard BUYs.
+      # Entry-filter + leaderboard env vars removed 2026-05-29 (watchlist-only — they were
+      # inert no-ops): LEADERBOARD_REFRESH_MS, AUTO_EXCLUDE_WIN_RATE_THRESHOLD, MIN_PRICE,
+      # MIN_PRICE_SPORTS, MAX_PRICE, MAX_SPREAD, FORCE_EXCLUDE_CATEGORIES,
+      # MAX_POSITIONS_PER_MARKET(_SPORTS), MAX_TOTAL_OPEN_POSITIONS, MIN_TRADER_SAMPLE.
+      - SIMULATED_WALLET_SIZE=1000   # $ wallet simulation; 0 disables. Active size cap on watchlist BUYs.
       - WALLET_CAP_UTILIZATION=0.80  # stop opening new BUYs at 80% utilization ($800 of $1000)
-      - MIN_TRADER_SAMPLE=5  # don't copy a leaderboard trader until we have ≥5 closed trades from them locally
       - GAS_COST_PER_BUY=0  # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
       - SLIPPAGE_RATE=0.02   # 2% slippage each side (entry at ask, exit at bid)
       - FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}

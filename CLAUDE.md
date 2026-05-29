@@ -1,8 +1,12 @@
 # Polymarket Copy Trading Bot
 
-DRY_RUN simulation-only copy bot. Tracks top 10 traders by weekly PNL plus a persistent watchlist; simulates each BUY as a $5 position (watchlist entries can override via `copyAmount`) and closes FIFO on matching SELL.
+DRY_RUN simulation-only copy bot. Tracks a persistent watchlist of traders; simulates each BUY as a $5 position (watchlist entries can override via `copyAmount`) and closes FIFO on matching SELL.
 
-**Leaderboard = shadow-only (as of 2026-05-28).** Top-10 leaderboard traders are still tracked, polled, and recorded into `shadow_open_trades` / `shadow_closed_trades` for edge measurement, but they generate **zero** real sim copies. Enforced in `src/index.ts` by passing `{ shadowMode: true, copyEnabled: false }` to `pollTrader` for every leaderboard trader. Lifetime leaderboard real-copy PNL through 2026-05-28 was -$2,451 over 9,258 closed trades — no demonstrable edge, removed. Only `watchlist_traders` entries can produce real sim positions. On the policy flip, the 99 then-open leaderboard positions ($495) were deleted from `open_trades`, dropping wallet_in_use from $750 to $285.
+**Watchlist-only architecture (as of 2026-05-29).** Leaderboard tracking was removed completely. The bot polls **only** `watchlist_traders`; there is no leaderboard fetch, no Falcon leaderboard refresh, and no shadow polling. `runPollingCycle()` in `src/index.ts` iterates the watchlist and calls `pollTrader(trader, { source: 'watchlist', copyEnabled, tradeAmount })` — nothing else.
+
+History: leaderboard was first demoted to shadow-only on 2026-05-28 (lifetime leaderboard real-copy PNL was -$2,451 over 9,258 closed trades — no demonstrable edge), then removed entirely on 2026-05-29. On removal: `src/leaderboard.ts` was deleted; `refreshLeaderboard` and the periodic refresh were removed from `index.ts`; auto-exclusion logic and its config (`AUTO_EXCLUDE_WIN_RATE_THRESHOLD`, `AUTO_EXCLUDE_MIN_TRADES`) plus `LEADERBOARD_LIMIT` / `LEADERBOARD_REFRESH_MS` were dropped from `config.ts`; `tests/auto_exclusion.test.ts` was deleted. DB: `tracked_traders` and `shadow_open_trades` were purged; `shadow_closed_trades` and `excluded_traders` are kept as a **historical record** (`shadow_closed_trades` still surfaced read-only via `/api/shadow/stats`; `excluded_traders` is no longer read by any endpoint — frozen table only).
+
+A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `!isWatchlist` real-copy branches and `hasSufficientSample` in `src/monitor.ts`; orphaned `store.ts` exports (`updateTrackedTraders`, `updateTraderLastOnLeaderboard`, `setAutoExclusion`, `setLeaderboardStats`, `updateWatchlistFalconData`, `updateTraderFalconCache`, `setTraderExclusion`, `isShadowProcessed`, `addShadowOpenTrade`, `closeShadowOpenTrade`, `markShadowProcessed`, `setShadowLastSeen`) plus the in-memory `excludedTraders`/`autoExcludedTraders` store fields; `bullpen.ts` leaderboard/Falcon fetchers (`getLeaderboard`, `getFalconLeaderboard`, `RawFalconTrader`, `RawLeaderboardItem`, `RawLeaderboardResponse`); `simulator.ts` shadow-resolution logic; and the now-inert filter config keys. `persistSnapshot` no longer rewrites `shadow_closed_trades` (read-only/frozen). Dashboard `/api/watchlist` no longer returns Falcon fields and `/api/stats` no longer returns `trackedTraders`/`lastLeaderboardUpdate`.
 
 ## Stack
 - Node.js / TypeScript, vitest tests under `tests/`
@@ -13,7 +17,30 @@ DRY_RUN simulation-only copy bot. Tracks top 10 traders by weekly PNL plus a per
 ## Key rules
 - **Never flip `DRY_RUN=false`** without an explicit instruction in the current conversation.
 - Ask before guessing — use AskUserQuestion for anything ambiguous.
-- **Watchlist traders bypass ALL filters by design.** Price floor/ceiling, spread cap, category exclusions (incl. `FORCE_EXCLUDE_CATEGORIES`), and min-sample gates do NOT apply to watchlist entries. Watchlist = explicit user trust override; only `MAX_WATCHLIST_ENTRIES_PER_MARKET` / `MAX_WATCHLIST_ENTRY_WINDOW_MS` and `MAX_TOTAL_OPEN_POSITIONS` still constrain them.
+- **🚨 WATCHLIST TRADERS BYPASS ALL ENTRY FILTERS — BY DESIGN, INTENTIONAL. 🚨**
+  Since the bot is **watchlist-only** (leaderboard removed 2026-05-29), **every** trade is a
+  watchlist trade, so these filters apply to **nothing** and are inert no-ops:
+  - price floor/ceiling (`MIN_PRICE`, `MIN_PRICE_SPORTS`, `MAX_PRICE`)
+  - spread cap (`MAX_SPREAD`)
+  - category exclusions (`FORCE_EXCLUDE_CATEGORIES`, dashboard exclusions)
+  - per-market caps (`MAX_POSITIONS_PER_MARKET`, `MAX_POSITIONS_PER_MARKET_SPORTS`)
+  - global open-position cap (`MAX_TOTAL_OPEN_POSITIONS`) — **NOT enforced for watchlist**
+  - per-trader sample gates (`MIN_TRADER_SAMPLE`, `MIN_TRADER_SHADOW_SAMPLE`)
+
+  **Rationale:** a watchlist entry is an explicit, manual trust decision by the operator.
+  The operator vouches for the trader, so the bot copies them unconditionally — no
+  algorithmic second-guessing on price, liquidity category, or sample size.
+
+  **The ONLY active constraints on a watchlist BUY are:**
+  1. **Wallet cap** — `SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION` (e.g. $1000 × 0.80 = $800);
+     new BUYs are skipped once open `simulatedAmount` would exceed it.
+  2. **Per-market watchlist entry cap** — `MAX_WATCHLIST_ENTRIES_PER_MARKET` within
+     `MAX_WATCHLIST_ENTRY_WINDOW_MS` (closes the BUY-SELL-BUY loophole).
+  3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5` (thin-book guard).
+
+  As of 2026-05-29 the now-inert filter config keys above were removed from `config.ts` and
+  `docker-compose.yml`; the dead `!isWatchlist` / shadow branches in `monitor.ts` that read
+  them were deleted.
 - `store.ts` persistence: `writeStore()` is an immediate atomic flush (temp+rename) used for financial mutations (addOpenTrade, closeOpenTrade, resolveByPrice) and user-driven dashboard actions. `markDirty()` defers the write; a 60 s background flusher started by `startAutoFlush()` in `index.ts` coalesces bursts. Signal handlers force a final flush on exit.
 - **`closed_trades` retention: unlimited.** As of 2026-05-27 the 7-day archival step in `runDailyCleanup()` was removed — the table holds the full history in-DB (query perf ~12 ms at 30k rows). Existing `data/archive/*.json` files are historical artifacts; the importer ran once to merge them back. Daily backups in `data/backups/` (last 30 retained) remain the disaster-recovery path. `traderHistory` and `processedTradeIds` still prune in the same daily run.
 
@@ -50,26 +77,18 @@ NODE_OPTIONS=--max-old-space-size=450   # Node heap cap; container limit 512MB
 DRY_RUN=true
 PORT=8080
 
-LEADERBOARD_REFRESH_MS=300000           # 5 min
 POLL_INTERVAL_MS=30000                  # 30 s per cycle
 PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
-AUTO_EXCLUDE_WIN_RATE_THRESHOLD=0.42    # auto-exclude when 7d WR < threshold
-MIN_TRADER_SAMPLE=5                     # min locally-closed trades before copying (real)
-MIN_TRADER_SHADOW_SAMPLE=20             # shadow-closed alt unlock; breaks chicken-and-egg
-
-MIN_PRICE=0.65
-MIN_PRICE_SPORTS=0.60                   # sports floor (favorites only)
-MAX_PRICE=0.88
-MAX_SPREAD=0.05
-
-FORCE_EXCLUDE_CATEGORIES=esports        # merged with dashboard-driven exclusions
-MAX_POSITIONS_PER_MARKET=2
-MAX_POSITIONS_PER_MARKET_SPORTS=1
-MAX_TOTAL_OPEN_POSITIONS=300
+# REMOVED 2026-05-29 (watchlist-only; these were inert no-ops — see "Key rules").
+# Deleted from config.ts AND docker-compose.yml:
+#   LEADERBOARD_REFRESH_MS, AUTO_EXCLUDE_WIN_RATE_THRESHOLD,
+#   MIN_PRICE, MIN_PRICE_SPORTS, MAX_PRICE, MAX_SPREAD, FORCE_EXCLUDE_CATEGORIES,
+#   MAX_POSITIONS_PER_MARKET, MAX_POSITIONS_PER_MARKET_SPORTS, MAX_TOTAL_OPEN_POSITIONS,
+#   MIN_TRADER_SAMPLE, MIN_TRADER_SHADOW_SAMPLE
 
 # Watchlist-only entry cap (open+closed within window) — closes the BUY-SELL-BUY
-# loophole that MAX_POSITIONS_PER_MARKET (open-only) lets through.
+# loophole. One of the THREE active constraints (see "Key rules").
 MAX_WATCHLIST_ENTRIES_PER_MARKET=2
 MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000   # 12h
 

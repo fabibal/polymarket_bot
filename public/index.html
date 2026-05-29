@@ -552,13 +552,13 @@
 <main>
   <!-- Watchlist stat cards -->
   <h2 style="margin:0 0 10px 0; font-size:15px; color:var(--muted); font-weight:600; letter-spacing:.04em; text-transform:uppercase;">
-    Watchlist Performance <span style="color:var(--text); text-transform:none; letter-spacing:0; font-weight:400; font-size:12px;">— excludes leaderboard &amp; legacy trades</span>
+    Watchlist Performance <span style="color:var(--text); text-transform:none; letter-spacing:0; font-weight:400; font-size:12px;">— watchlist sim trades only</span>
   </h2>
   <div class="stats-grid">
     <div class="stat-card">
-      <div class="label">Total PNL <span style="color:var(--muted); font-weight:400;">· watchlist only</span></div>
+      <div class="label">Total PNL <span style="color:var(--muted); font-weight:400;">· raw · watchlist only</span></div>
       <div class="value" id="wl-s-total-pnl">—</div>
-      <div class="sub">realized + unrealized</div>
+      <div class="sub">raw realized + unrealized (pre-slippage)</div>
     </div>
     <div class="stat-card">
       <div class="label">Slippage-Adjusted PNL</div>
@@ -598,7 +598,7 @@
     <div class="stat-card">
       <div class="label">📊 Open Positions</div>
       <div class="value" id="wl-s-open-limit">—</div>
-      <div class="sub" id="wl-s-open-limit-sub">wallet cap: $800 / $5</div>
+      <div class="sub" id="wl-s-open-limit-sub">wallet cap: —</div>
     </div>
     <div class="stat-card">
       <div class="label">🧪 Test PNL</div>
@@ -615,7 +615,7 @@
   <!-- Watchlist charts 2×2 -->
   <div class="charts-grid" id="wl-charts-grid">
     <div class="chart-card">
-      <div class="chart-card-title">Portfolio Equity Curve</div>
+      <div class="chart-card-title">Portfolio Equity Curve <span style="text-transform:none;letter-spacing:0;opacity:.6">(cost-adjusted)</span></div>
       <div class="chart-wrap"><canvas id="wl-chart-equity"></canvas></div>
     </div>
     <div class="chart-card">
@@ -627,7 +627,7 @@
       <div class="chart-wrap"><canvas id="wl-chart-winrate"></canvas></div>
     </div>
     <div class="chart-card">
-      <div class="chart-card-title">Realized PNL by Trader</div>
+      <div class="chart-card-title">Realized PNL by Trader <span style="text-transform:none;letter-spacing:0;opacity:.6">(cost-adjusted)</span></div>
       <div class="chart-wrap"><canvas id="wl-chart-traders"></canvas></div>
     </div>
   </div>
@@ -649,6 +649,103 @@
         <span style="font-size:10px;color:var(--muted);font-family:system-ui;font-weight:400;margin-left:8px">all watchlist closed trades · slug-derived</span>
       </div>
       <div id="wl-cat-bars"></div>
+    </div>
+  </div>
+
+  <!-- Go-Live Readiness -->
+  <div class="section">
+    <div class="section-header">
+      <div class="section-header-left">
+        <span class="section-title">🚦 Go-Live Readiness</span>
+        <span id="golive-badge" class="badge badge-dry">—</span>
+        <span style="font-size:11px;color:var(--muted)">gate: n≥5000 AND p&lt;0.01 AND positive edge · cost-adjusted · test window since May 28</span>
+      </div>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="label">Net Edge / Trade</div>
+        <div class="value" id="gl-edge">—</div>
+        <div class="sub" id="gl-edge-ci">95% CI —</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">t-statistic</div>
+        <div class="value" id="gl-t">—</div>
+        <div class="sub">vs 0 (one-sample)</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">p-value</div>
+        <div class="value" id="gl-p">—</div>
+        <div class="sub" id="gl-p-sub">two-tailed · need &lt;0.01</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Sample Size</div>
+        <div class="value" id="gl-n">—</div>
+        <div class="sub" id="gl-n-sub">/ 5000</div>
+        <div style="margin-top:8px;height:6px;background:var(--surface3);border-radius:3px;overflow:hidden">
+          <div id="gl-bar" style="height:100%;width:0%;background:var(--blue);transition:width .4s"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Watchlist edge vs historical shadow baseline -->
+  <div class="section">
+    <div class="section-header">
+      <div class="section-header-left">
+        <span class="section-title">👥 Watchlist Edge vs Shadow Baseline <span style="text-transform:none;letter-spacing:0;color:var(--yellow)">(historical)</span></span>
+        <span style="font-size:11px;color:var(--muted)">cost-adjusted · shadow = former leaderboard traders · no new shadow data since 2026-05-29</span>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Group</th><th>n</th><th>Win Rate</th><th>Exp/Trade</th>
+          <th title="One-sample t vs 0">t-stat</th><th title="Two-tailed p-value">p-value</th><th>Total PNL</th>
+        </tr></thead>
+        <tbody id="shadow-body"><tr class="empty-row"><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Risk metrics -->
+  <div class="section">
+    <div class="section-header">
+      <div class="section-header-left">
+        <span class="section-title">⚠️ Risk Metrics</span>
+        <span style="font-size:11px;color:var(--muted)">watchlist · cost-adjusted</span>
+      </div>
+    </div>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="label">Max Drawdown</div>
+        <div class="value red" id="risk-dd">—</div>
+        <div class="sub" id="risk-dd-pct">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Longest Losing Streak</div>
+        <div class="value" id="risk-streak">—</div>
+        <div class="sub">consecutive losing closes</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Portfolio Sharpe</div>
+        <div class="value" id="risk-sharpe">—</div>
+        <div class="sub">daily PNL, annualized</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Open Exposure</div>
+        <div class="value blue" id="risk-exposure">—</div>
+        <div class="sub" id="risk-exposure-sub">across open positions</div>
+      </div>
+    </div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-card-title">Concentration by Trader <span style="text-transform:none;letter-spacing:0;opacity:.6">(% of open $)</span></div>
+        <div id="risk-bytrader" style="padding-top:6px"></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-title">Concentration by Category <span style="text-transform:none;letter-spacing:0;opacity:.6">(% of open $)</span></div>
+        <div id="risk-bycat" style="padding-top:6px"></div>
+      </div>
     </div>
   </div>
 
@@ -706,9 +803,6 @@
         <thead>
           <tr>
             <th>Trader</th>
-            <th title="Falcon API win rate">W% <span style="font-size:9px;opacity:.5">(Falcon)</span></th>
-            <th title="Falcon API ROI">ROI <span style="font-size:9px;opacity:.5">(Falcon)</span></th>
-            <th title="Falcon API Sharpe ratio">Sharpe <span style="font-size:9px;opacity:.5">(Falcon)</span></th>
             <th>7d W% <span style="font-size:9px;opacity:.5">(sim)</span></th>
             <th title="All-time simulated win rate vs break-even WR (= avg entry price). Green = above break-even (profitable edge), red = below.">WR vs B/E <span style="font-size:9px;opacity:.5">(sim)</span></th>
             <th title="Profit factor = gross cost-adjusted wins / gross cost-adjusted losses. >1.0 is profitable.">Profit Factor</th>
@@ -726,7 +820,7 @@
           </tr>
         </thead>
         <tbody id="watchlist-body">
-          <tr class="empty-row"><td colspan="18">Loading watchlist…</td></tr>
+          <tr class="empty-row"><td colspan="15">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -808,26 +902,9 @@
     return Math.floor(diff / 86_400_000) + 'd ago';
   }
 
-  function trackedDuration(ts) {
-    if (!ts) return null;
-    const ms = Date.now() - new Date(ts).getTime();
-    if (ms < 3_600_000)  return Math.floor(ms / 60_000) + 'm';
-    if (ms < 86_400_000) return Math.floor(ms / 3_600_000) + 'h';
-    return Math.floor(ms / 86_400_000) + 'd';
-  }
-
   function truncate(s, n) {
     if (!s) return '—';
     return s.length > n ? s.slice(0, n) + '…' : s;
-  }
-
-  function fmtCompact(n) {
-    if (n == null) return '—';
-    const abs = Math.abs(n);
-    const sign = n >= 0 ? '+' : '';
-    if (abs >= 1_000_000) return sign + '$' + (abs / 1_000_000).toFixed(1) + 'M';
-    if (abs >= 1_000)     return sign + '$' + (abs / 1_000).toFixed(1) + 'K';
-    return sign + '$' + abs.toFixed(0);
   }
 
   const CAT_LABELS = {
@@ -838,7 +915,7 @@
 
   async function refresh() {
     try {
-      await Promise.all([loadWatchlistStats(), loadWatchlist(), loadWatchlistTrades(), loadDiscoveryCandidates()]);
+      await Promise.all([loadWatchlistStats(), loadWatchlist(), loadWatchlistTrades(), loadDiscoveryCandidates(), loadGoLive(), loadShadowStats(), loadRiskMetrics()]);
     } catch (e) {
       const dot = $('status-dot'); if (dot) dot.className = 'err';
       const lu  = $('last-updated'); if (lu) lu.textContent = 'Error';
@@ -1298,16 +1375,6 @@
     const name = w.label || w.username || shortAddr(addr);
     const s = w.inlineStats;
 
-    const falconWr = w.falconWinRate != null
-      ? `<span class="${w.falconWinRate >= 0.5 ? 'green' : 'red'}">${(w.falconWinRate * 100).toFixed(1)}%</span>`
-      : '<span style="color:var(--muted)">—</span>';
-    const falconRoi = w.falconRoi != null
-      ? `<span class="${w.falconRoi >= 0 ? 'green' : 'red'}">${w.falconRoi >= 0 ? '+' : ''}${w.falconRoi.toFixed(1)}%</span>`
-      : '<span style="color:var(--muted)">—</span>';
-    const falconSharpe = w.falconSharpe != null
-      ? `<span class="${w.falconSharpe >= 1 ? 'green' : w.falconSharpe >= 0 ? 'yellow' : 'red'}">${w.falconSharpe.toFixed(2)}</span>`
-      : '<span style="color:var(--muted)">—</span>';
-
     let wrCell = '<span style="color:var(--muted)">—</span>';
     if (s && s.hasEnoughData && s.winRate7d != null) {
       wrCell = `<span class="${s.winRate7d >= 0.5 ? 'green' : 'red'}">${(s.winRate7d * 100).toFixed(0)}%</span>`;
@@ -1350,9 +1417,6 @@
           </div>
         </div>
       </td>
-      <td>${falconWr}</td>
-      <td>${falconRoi}</td>
-      <td>${falconSharpe}</td>
       <td id="wl-cell-wr-${addr}">${wrCell}</td>
       <td id="wl-cell-be-${addr}">${beCell}</td>
       <td id="wl-cell-pf-${addr}">${pfCell}</td>
@@ -1369,7 +1433,7 @@
       <td>${removeBtn}</td>
     </tr>
     <tr id="${subRowId}" class="wl-sub-row" data-address="${addr}">
-      <td colspan="18" style="padding:0">
+      <td colspan="15" style="padding:0">
         <div class="wl-expand-wrap">
           <div class="wl-expand-grid">
             <div class="wl-expand-side">
@@ -1540,7 +1604,7 @@
       if (!tbody) return;
 
       if (items.length === 0) {
-        tbody.innerHTML = '<tr class="empty-row"><td colspan="18">No traders in watchlist — add one above.</td></tr>';
+        tbody.innerHTML = '<tr class="empty-row"><td colspan="15">No traders in watchlist — add one above.</td></tr>';
         return;
       }
 
@@ -1552,23 +1616,23 @@
         domAddrs.some((a, i) => a !== newAddrs[i]);
 
       if (needsRebuild) {
-        // Snapshot which traders were collapsed before destroying DOM
-        const collapsedSet = new Set(
-          Array.from(tbody.querySelectorAll('.wl-sub-row:not(.expanded)'))
+        // Rows are collapsed by default. Snapshot which were expanded (user opened)
+        // so the expanded state survives a rebuild; only those re-fetch detail data.
+        const expandedSet = new Set(
+          Array.from(tbody.querySelectorAll('.wl-sub-row.expanded'))
             .map(r => r.dataset.address).filter(Boolean)
         );
 
         // Full rebuild
         tbody.innerHTML = items.map((w, i) => buildWatchlistRow(w, i)).join('');
 
-        // Restore collapsed state; load data only for expanded rows
+        // Restore expanded state; load detail data only for expanded rows
         items.forEach((w, i) => {
-          if (collapsedSet.has(w.address)) {
+          if (expandedSet.has(w.address)) {
             const subRow = document.getElementById(`wl-sub-${i}`);
             const chev   = document.getElementById(`wl-chev-${w.address}`);
-            if (subRow) subRow.classList.remove('expanded');
-            if (chev)   chev.textContent = '▶';
-          } else {
+            if (subRow) subRow.classList.add('expanded');
+            if (chev)   chev.textContent = '▼';
             loadWatchlistPositions(w.address, i);
             loadWatchlistPStats(w.address);
             renderWlPnlChart(i);
@@ -1608,6 +1672,97 @@
     } catch (e) {
       msgEl.textContent = 'Network error'; msgEl.style.color = 'var(--red)';
     }
+  }
+
+  // ── Go-live readiness ────────────────────────────────────────────────────
+  function fmtP(p) {
+    if (p == null) return '—';
+    if (p < 0.001) return '<0.001';
+    return Number(p).toFixed(4);
+  }
+
+  async function loadGoLive() {
+    try {
+      const d = await fetch('/api/golive/readiness').then(r => r.json());
+      const edgeEl = $('gl-edge');
+      if (edgeEl) { edgeEl.textContent = fmtPnl(d.netEdgePerTrade); edgeEl.className = 'value ' + pnlClass(d.netEdgePerTrade); }
+      const ciEl = $('gl-edge-ci');
+      if (ciEl) ciEl.textContent = `95% CI ${fmtPnl(d.ciLow)} … ${fmtPnl(d.ciHigh)}`;
+      const tEl = $('gl-t'); if (tEl) tEl.textContent = (d.tStat != null ? Number(d.tStat).toFixed(2) : '—');
+      const pEl = $('gl-p');
+      if (pEl) { pEl.textContent = fmtP(d.pValue); pEl.className = 'value ' + (d.pValue != null && d.pValue < 0.01 ? 'green' : 'yellow'); }
+      const nEl = $('gl-n'); if (nEl) nEl.textContent = (d.n ?? 0).toLocaleString();
+      const nSub = $('gl-n-sub'); if (nSub) nSub.textContent = `/ ${(d.target ?? 5000).toLocaleString()} (${d.target ? Math.min(100, Math.round((d.n / d.target) * 100)) : 0}%)`;
+      const bar = $('gl-bar'); if (bar) bar.style.width = Math.min(100, ((d.n || 0) / (d.target || 5000)) * 100) + '%';
+      const badge = $('golive-badge');
+      if (badge) {
+        if (d.ready) { badge.textContent = 'READY'; badge.className = 'badge badge-live'; }
+        else { badge.textContent = 'NOT YET'; badge.className = 'badge badge-dry'; }
+      }
+    } catch (e) { console.error('[golive] load failed:', e); }
+  }
+
+  // ── Watchlist vs shadow edge ──────────────────────────────────────────────
+  function shadowRow(label, g) {
+    const wr = g.winRate != null ? (g.winRate * 100).toFixed(1) + '%' : '—';
+    const wrCls = g.winRate != null ? (g.winRate >= 0.5 ? 'green' : 'red') : '';
+    return `<tr>
+      <td>${label}</td>
+      <td>${(g.n ?? 0).toLocaleString()}</td>
+      <td class="${wrCls}">${wr}</td>
+      <td class="${pnlClass(g.expPerTrade)}">${fmtPnl(g.expPerTrade)}</td>
+      <td>${g.tStat != null ? Number(g.tStat).toFixed(2) : '—'}</td>
+      <td>${fmtP(g.pValue)}</td>
+      <td class="${pnlClass(g.totalPnl)}">${fmtPnl(g.totalPnl)}</td>
+    </tr>`;
+  }
+  async function loadShadowStats() {
+    try {
+      const d = await fetch('/api/shadow/stats').then(r => r.json());
+      const tb = $('shadow-body');
+      if (!tb) return;
+      tb.innerHTML = shadowRow('Watchlist (real sim)', d.watchlist || {}) + shadowRow('Shadow (ex-leaderboard, frozen)', d.shadow || {});
+    } catch (e) { console.error('[shadow] load failed:', e); }
+  }
+
+  // ── Risk metrics ──────────────────────────────────────────────────────────
+  function concentrationBars(items, nameKey) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return '<div style="color:var(--muted);font-size:11px;font-style:italic">No open positions</div>';
+    }
+    return items.map(it => {
+      const name = it[nameKey] || shortAddr(it.address);
+      const pct = Number(it.pct) || 0;
+      const color = pct > 50 ? 'var(--red)' : pct > 30 ? 'var(--yellow)' : 'var(--blue)';
+      return `<div style="display:flex;align-items:center;gap:6px;margin:2px 0;font-size:11px">
+        <span style="display:inline-block;width:120px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${name}">${truncate(name, 18)}</span>
+        <span style="flex:1;background:rgba(255,255,255,0.05);border-radius:2px;height:10px;position:relative;overflow:hidden">
+          <span style="position:absolute;left:0;top:0;bottom:0;background:${color};width:${pct.toFixed(1)}%"></span>
+        </span>
+        <span style="min-width:90px;text-align:right;color:var(--muted)">$${Number(it.amount).toFixed(0)} (${pct.toFixed(0)}%)</span>
+      </div>`;
+    }).join('');
+  }
+  async function loadRiskMetrics() {
+    try {
+      const d = await fetch('/api/risk/metrics').then(r => r.json());
+      const ddEl = $('risk-dd'); if (ddEl) ddEl.textContent = '-$' + Number(d.maxDrawdownUsd || 0).toFixed(2);
+      const ddPct = $('risk-dd-pct'); if (ddPct) ddPct.textContent = (d.maxDrawdownPct != null ? '-' + Number(d.maxDrawdownPct).toFixed(1) + '% from peak' : '—');
+      const stEl = $('risk-streak'); if (stEl) { stEl.textContent = d.longestLosingStreak ?? 0; stEl.className = 'value ' + ((d.longestLosingStreak || 0) >= 5 ? 'red' : 'yellow'); }
+      const shEl = $('risk-sharpe');
+      if (shEl) {
+        shEl.textContent = d.sharpe != null ? Number(d.sharpe).toFixed(2) : '—';
+        shEl.className = 'value ' + (d.sharpe == null ? '' : d.sharpe >= 1 ? 'green' : d.sharpe >= 0 ? 'yellow' : 'red');
+      }
+      const exEl = $('risk-exposure'); if (exEl) exEl.textContent = '$' + Number(d.totalOpen || 0).toFixed(0);
+      const exSub = $('risk-exposure-sub');
+      if (exSub) {
+        const top = (d.byTrader || [])[0];
+        exSub.textContent = top ? `top trader ${Number(top.pct).toFixed(0)}% of open $` : 'across open positions';
+      }
+      const bt = $('risk-bytrader'); if (bt) bt.innerHTML = concentrationBars(d.byTrader || [], 'label');
+      const bc = $('risk-bycat'); if (bc) bc.innerHTML = concentrationBars((d.byCategory || []).map(c => ({ ...c, label: CAT_LABELS[c.category] || c.category })), 'label');
+    } catch (e) { console.error('[risk] load failed:', e); }
   }
 
   function toggleDiscovery() {
@@ -1723,7 +1878,7 @@
       const wlAdjPnl = (s.totalRealizedPnlAdjusted || 0) + (s.totalUnrealizedPnlAdjusted || 0);
       setVal('wl-s-adj-pnl', fmtPnl(wlAdjPnl), pnlClass(wlAdjPnl));
       const wlAdjSub = $('wl-s-adj-pnl-sub');
-      if (wlAdjSub) wlAdjSub.textContent = `avg/trade net: ${fmtPnl(s.avgNetEdgePerTrade ?? 0)}`;
+      if (wlAdjSub) wlAdjSub.textContent = `avg/trade net: ${fmtPnl(s.avgNetEdgePerTrade ?? 0)} · slippage $${Number(s.totalTradingCosts ?? 0).toFixed(0)} total`;
       setVal('wl-s-realized-pnl',  fmtPnl(s.totalRealizedPnl), pnlClass(s.totalRealizedPnl));
       setVal('wl-s-unrealized-pnl',fmtPnl(s.totalUnrealizedPnl), pnlClass(s.totalUnrealizedPnl));
 
@@ -1764,7 +1919,7 @@
       const openLimEl = $('wl-s-open-limit');
       const openLimSub = $('wl-s-open-limit-sub');
       if (openLimEl) {
-        const tradeAmt = 5;
+        const tradeAmt = Number(s.tradeAmount) || 5;
         const size = Number(s.simulatedWalletSize || 0);
         const util = Number(s.walletCapUtilization || 0);
         const cap = size * util;
@@ -1921,7 +2076,7 @@
       type: 'line',
       data: { labels: [], datasets: [
         { label: 'open positions', data: [], borderColor: '#bc8cff', borderWidth: 2, pointRadius: 0, fill: false, tension: 0.2 },
-        { label: 'MAX_TOTAL_OPEN_POSITIONS', data: [], borderColor: '#f85149', borderWidth: 1.5, pointRadius: 0, borderDash: [6, 4], fill: false },
+        { label: 'wallet cap (positions)', data: [], borderColor: '#f85149', borderWidth: 1.5, pointRadius: 0, borderDash: [6, 4], fill: false },
       ]},
       options: makeChartOpts(c => c.datasetIndex === 0 ? `${c.raw} open` : `limit ${c.raw}`),
     });
@@ -1955,11 +2110,27 @@
       if (closed.length === 0) return;
       closed.sort((a, b) => new Date(a.closedAt) - new Date(b.closedAt));
 
+      // Cost-adjusted PNL is the canonical basis everywhere (matches the go-live
+      // panel + per-trader columns). Fall back to raw only if adjusted is absent.
+      const pnlOf = t => t.costAdjustedPnl != null ? Number(t.costAdjustedPnl) : Number(t.realizedPnl);
+
+      // Build a CALENDAR-indexed day axis (every day from first to last close),
+      // not just days that had closes — so idle gaps don't compress the slope.
+      const DAY_MS = 86_400_000;
+      const firstDay = closed[0].closedAt.slice(0, 10);
+      const lastDay  = closed[closed.length - 1].closedAt.slice(0, 10);
+      const eqLabels = [];
+      for (let d = new Date(firstDay + 'T00:00:00Z').getTime(),
+               end = new Date(lastDay + 'T00:00:00Z').getTime(); d <= end; d += DAY_MS) {
+        eqLabels.push(new Date(d).toISOString().slice(0, 10));
+      }
+
+      // Cumulative cost-adjusted equity per close-day, then forward-fill the calendar.
       const dayEquity = new Map();
       let cumPnl = 0;
-      for (const t of closed) { cumPnl += Number(t.realizedPnl); dayEquity.set(t.closedAt.slice(0, 10), cumPnl); }
-      const eqLabels = [...dayEquity.keys()];
-      const eqData   = [...dayEquity.values()];
+      for (const t of closed) { cumPnl += pnlOf(t); dayEquity.set(t.closedAt.slice(0, 10), cumPnl); }
+      let lastEq = 0;
+      const eqData = eqLabels.map(d => { if (dayEquity.has(d)) lastEq = dayEquity.get(d); return lastEq; });
 
       // 🧪 $1k test green line: cumulative cost-adjusted PNL, watchlist closes ≥ 2026-05-28, begins at $0.
       const TEST_START = '2026-05-28';
@@ -1968,11 +2139,15 @@
       for (const t of closed) {
         const day = t.closedAt.slice(0, 10);
         if (day < TEST_START) continue;
-        const adj = t.costAdjustedPnl != null ? Number(t.costAdjustedPnl) : Number(t.realizedPnl);
-        cumTest += adj;
+        cumTest += pnlOf(t);
         dayTest.set(day, cumTest);
       }
-      const eqTestData = eqLabels.map(d => d < TEST_START ? null : (dayTest.get(d) ?? cumTest));
+      let lastTest = null;
+      const eqTestData = eqLabels.map(d => {
+        if (d < TEST_START) return null;
+        if (dayTest.has(d)) lastTest = dayTest.get(d);
+        return lastTest ?? 0;
+      });
 
       let peak = -Infinity;
       // Suppress drawdown until cumulative equity peak ≥ $50 — early data points
@@ -1984,12 +2159,12 @@
         const dayMs = new Date(day).getTime();
         const w = closed.filter(t => { const ms = new Date(t.closedAt.slice(0, 10)).getTime(); return ms <= dayMs && ms >= dayMs - 6 * 86_400_000; });
         if (w.length === 0) return null;
-        return (w.filter(t => Number(t.realizedPnl) > 0).length / w.length) * 100;
+        return (w.filter(t => pnlOf(t) > 0).length / w.length) * 100;
       });
 
       const tPnl = {}, tName = {};
       for (const t of closed) {
-        tPnl[t.copiedTrader] = (tPnl[t.copiedTrader] || 0) + Number(t.realizedPnl);
+        tPnl[t.copiedTrader] = (tPnl[t.copiedTrader] || 0) + pnlOf(t);
         if (t.copiedTraderUsername) tName[t.copiedTrader] = t.copiedTraderUsername;
       }
       const allSorted = Object.entries(tPnl).sort((a, b) => b[1] - a[1]);
@@ -2011,10 +2186,11 @@
     try {
       const r = await fetch('/api/watchlist/open-history');
       const d = await r.json();
-      const limit = Number(d.maxTotalOpenPositions) || 300;
+      const limit = Number(d.walletPositionLimit) || 0;
       wlChartOpenHistory.data.labels = d.days || [];
       wlChartOpenHistory.data.datasets[0].data = d.counts || [];
       wlChartOpenHistory.data.datasets[1].data = (d.days || []).map(() => limit);
+      wlChartOpenHistory.data.datasets[1].label = `wallet cap (~${limit} pos @ $${d.walletCap ? (d.walletCap / (limit || 1)).toFixed(0) : '5'})`;
       wlChartOpenHistory.update('none');
     } catch (e) {
       console.error('[wl-open-history] Load failed:', e);
@@ -2022,11 +2198,15 @@
     try {
       const r = await fetch('/api/wallet/history');
       const d = await r.json();
-      const cap = Number(d.cap) || 800;
+      const cap = Number(d.cap) || 0;
+      const walletSize = Number(d.walletSize) || 0;
+      const capPct = walletSize > 0 ? Math.round((cap / walletSize) * 100) : 0;
       wlChartWalletHistory.data.labels = d.days || [];
       wlChartWalletHistory.data.datasets[0].data = d.amounts || [];
       wlChartWalletHistory.data.datasets[1].data = d.testAmounts || (d.days || []).map(() => null);
       wlChartWalletHistory.data.datasets[2].data = (d.days || []).map(() => cap);
+      wlChartWalletHistory.data.datasets[2].label = `cap ($${cap.toFixed(0)} @ ${capPct}%)`;
+      if (wlChartWalletHistory.options.scales.y) wlChartWalletHistory.options.scales.y.suggestedMax = walletSize || undefined;
       wlChartWalletHistory.update('none');
     } catch (e) {
       console.error('[wl-wallet-history] Load failed:', e);
@@ -2064,6 +2244,7 @@
   loadWatchlistCharts();
   setInterval(loadWatchlistCharts, 30_000);
 
+  refresh();
   setInterval(refresh, 30_000);
 
   checkVpn();

@@ -5,7 +5,7 @@
  *   2. Max hold age: older than MAX_HOLD_DAYS → closed at current price, status 'expired'
  */
 import { getMarketPrice } from './bullpen';
-import { readStore, updateOpenTradePrices, resolveByPrice, updateShadowPrices, resolveShadowByPrice } from './store';
+import { readStore, updateOpenTradePrices, resolveByPrice } from './store';
 import { CONFIG } from './config';
 import { SimulatedTrade } from './types';
 
@@ -83,17 +83,14 @@ export async function updatePrices(): Promise<void> {
 
   try {
     const store = readStore();
-    const shadowOpen = store.shadowOpenTrades ?? [];
-    if (store.openTrades.length === 0 && shadowOpen.length === 0) return;
+    if (store.openTrades.length === 0) return;
 
     const startMs = Date.now();
-    console.log(`[simulator] Refreshing prices for ${store.openTrades.length} open + ${shadowOpen.length} shadow position(s)...`);
-
-    const shadowIds = new Set(shadowOpen.map(t => t.id));
+    console.log(`[simulator] Refreshing prices for ${store.openTrades.length} open position(s)...`);
 
     // Build slug → outcomes map (fetch each slug once, distribute to all its outcome positions)
     const slugOutcomes = new Map<string, Set<string>>();
-    for (const t of [...store.openTrades, ...shadowOpen]) {
+    for (const t of store.openTrades) {
       if (!slugOutcomes.has(t.marketSlug)) slugOutcomes.set(t.marketSlug, new Set());
       slugOutcomes.get(t.marketSlug)!.add(t.outcome);
     }
@@ -102,9 +99,6 @@ export async function updatePrices(): Promise<void> {
     const priceUpdates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }> = [];
     const resolutions: Array<{ id: string; exitPrice: number }> = [];
     const staleResolutions: Array<{ id: string; exitPrice: number }> = [];
-    const shadowPriceUpdates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }> = [];
-    const shadowResolutions: Array<{ id: string; exitPrice: number }> = [];
-    const shadowStaleResolutions: Array<{ id: string; exitPrice: number }> = [];
     const maxAgeMs = CONFIG.MAX_HOLD_DAYS * 86_400_000;
     const nowMs = Date.now();
 
@@ -129,15 +123,11 @@ export async function updatePrices(): Promise<void> {
             // Markets that return 404 from the Gamma API have almost certainly resolved
             // and been removed — we can't know the final price, so we exit at last price.
             const deadPositions = store.openTrades.filter(t => t.marketSlug === slug);
-            const deadShadow    = shadowOpen.filter(t => t.marketSlug === slug);
-            if (deadPositions.length > 0 || deadShadow.length > 0) {
+            if (deadPositions.length > 0) {
               staleResolutions.push(
                 ...deadPositions.map(t => ({ id: t.id, exitPrice: t.currentPrice ?? t.entryPrice }))
               );
-              shadowStaleResolutions.push(
-                ...deadShadow.map(t => ({ id: t.id, exitPrice: t.currentPrice ?? t.entryPrice }))
-              );
-              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead, expiring ${deadPositions.length}+${deadShadow.length} position(s) at last price`);
+              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead, expiring ${deadPositions.length} position(s) at last price`);
             } else {
               console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead (no open positions)`);
             }
@@ -151,22 +141,18 @@ export async function updatePrices(): Promise<void> {
           const currentPrice = extractOutcomePrice(data, outcome);
           if (currentPrice === null) continue;
 
-          const related = [...store.openTrades, ...shadowOpen].filter(t => t.marketSlug === slug && t.outcome === outcome);
+          const related = store.openTrades.filter(t => t.marketSlug === slug && t.outcome === outcome);
           for (const trade of related) {
-            const isShadow = shadowIds.has(trade.id);
             const unrealizedPnl = (currentPrice - trade.entryPrice) * trade.simulatedShares;
             const ageMs = nowMs - new Date(trade.timestamp).getTime();
-            const resArr  = isShadow ? shadowResolutions      : resolutions;
-            const stalArr = isShadow ? shadowStaleResolutions : staleResolutions;
-            const updArr  = isShadow ? shadowPriceUpdates     : priceUpdates;
             if (currentPrice >= CONFIG.RESOLVED_THRESHOLD) {
-              resArr.push({ id: trade.id, exitPrice: 1 });
+              resolutions.push({ id: trade.id, exitPrice: 1 });
             } else if (currentPrice <= 1 - CONFIG.RESOLVED_THRESHOLD) {
-              resArr.push({ id: trade.id, exitPrice: 0 });
+              resolutions.push({ id: trade.id, exitPrice: 0 });
             } else if (ageMs > maxAgeMs) {
-              stalArr.push({ id: trade.id, exitPrice: currentPrice });
+              staleResolutions.push({ id: trade.id, exitPrice: currentPrice });
             } else {
-              updArr.push({ id: trade.id, currentPrice, unrealizedPnl });
+              priceUpdates.push({ id: trade.id, currentPrice, unrealizedPnl });
             }
           }
         }
@@ -182,16 +168,6 @@ export async function updatePrices(): Promise<void> {
       resolveByPrice(staleResolutions, 'expired');
       console.log(`[simulator] Expired ${staleResolutions.length} position(s) (age>${CONFIG.MAX_HOLD_DAYS}d or dead market)`);
     }
-    if (shadowPriceUpdates.length) updateShadowPrices(shadowPriceUpdates);
-    if (shadowResolutions.length) {
-      resolveShadowByPrice(shadowResolutions);
-      console.log(`[simulator] Shadow-resolved ${shadowResolutions.length} trade(s) by price threshold`);
-    }
-    if (shadowStaleResolutions.length) {
-      resolveShadowByPrice(shadowStaleResolutions, 'expired');
-      console.log(`[simulator] Shadow-expired ${shadowStaleResolutions.length} position(s)`);
-    }
-
     const elapsedS = ((Date.now() - startMs) / 1000).toFixed(1);
     console.log(`[simulator] Price update complete — ${uniqueSlugs.length} slugs checked in ${elapsedS}s, ${resolutions.length} resolved, ${staleResolutions.length} expired`);
   } finally {

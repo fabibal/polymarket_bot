@@ -44,11 +44,6 @@ describe('store: fresh DB bootstrap', () => {
     expect(s.watchlistTraders.find(w => w.label === 'DrPufferfish')?.copyEnabled).toBe(false);
   });
 
-  it('merges FORCE_EXCLUDE_CATEGORIES into excludedCategories on load', () => {
-    const s = store.readStore();
-    expect(s.excludedCategories).toContain('esports');
-  });
-
   it('seeds default leaderboardFilters', () => {
     const s = store.readStore();
     expect(s.leaderboardFilters.categories).toEqual([]);
@@ -102,28 +97,6 @@ describe('store: processed-id dedup and cap', () => {
   });
 });
 
-describe('store: shadow mirror isolation', () => {
-  it('shadow ops do not touch real trades and vice versa', () => {
-    store.addOpenTrade(makeTrade({ id: 'r1', sourceTradeId: 'r1src' }));
-    store.addShadowOpenTrade(makeTrade({ id: 's1', sourceTradeId: 's1src', copiedTrader: '0xexc' }));
-    const s = store.readStore();
-    expect(s.openTrades.length).toBe(1);
-    expect(s.shadowOpenTrades?.length).toBe(1);
-    expect(s.processedTradeIds).toContain('r1src');
-    expect(s.processedShadowIds).toContain('s1src');
-    expect(s.processedTradeIds).not.toContain('s1src');
-    expect(s.processedShadowIds).not.toContain('r1src');
-
-    // Closing a shadow doesn't affect real state.
-    const closed = store.closeShadowOpenTrade('0xexc', 'foo-market', 'Yes', 0.85);
-    expect(closed).toBe(true);
-    const s2 = store.readStore();
-    expect(s2.openTrades.length).toBe(1);
-    expect(s2.shadowOpenTrades?.length).toBe(0);
-    expect(s2.shadowClosedTrades?.length).toBe(1);
-  });
-});
-
 describe('store: watchlist CRUD persists through reload', () => {
   it('add/update/remove survive cache drop', () => {
     store.addWatchlistTrader('0xDEADBEEF000000000000000000000000000DEAD1', 'TestGuy');
@@ -147,28 +120,15 @@ describe('store: writeStore full-snapshot round-trip', () => {
   it('in-memory mutations via snapshot are persisted by writeStore', () => {
     const s = store.readStore();
     s.openTrades.push(makeTrade({ id: 'ws1', sourceTradeId: 'ws1src' }));
-    s.excludedTraders.push('0xbaduser');
+    s.excludedCategories.push('testcat');
     s.traderFalconCache['0xfoo'] = { winRate: 0.66, updatedAt: '2026-04-22T12:00:00.000Z' };
     store.writeStore(s);
 
     store._resetStoreCache();
     const reloaded = store.readStore();
     expect(reloaded.openTrades.find(t => t.id === 'ws1')).toBeDefined();
-    expect(reloaded.excludedTraders).toContain('0xbaduser');
+    expect(reloaded.excludedCategories).toContain('testcat');
     expect(reloaded.traderFalconCache['0xfoo']?.winRate).toBe(0.66);
-  });
-});
-
-describe('store: exclusion flags', () => {
-  it('setAutoExclusion marks auto=1, manual setTraderExclusion marks auto=0', () => {
-    store.setAutoExclusion('0xauto', true);
-    store.setTraderExclusion('0xmanual', true);
-    store._resetStoreCache();
-    const s = store.readStore();
-    expect(s.excludedTraders).toContain('0xauto');
-    expect(s.excludedTraders).toContain('0xmanual');
-    expect(s.autoExcludedTraders).toContain('0xauto');
-    expect(s.autoExcludedTraders).not.toContain('0xmanual');
   });
 });
 

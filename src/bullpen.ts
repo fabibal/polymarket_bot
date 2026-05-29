@@ -28,21 +28,6 @@ async function run(args: string[]): Promise<unknown> {
 // Response shapes (loosely typed — real CLI output may vary)
 // ---------------------------------------------------------------------------
 
-export interface RawLeaderboardItem {
-  rank?: number;
-  address: string;
-  username?: string;
-  pnl?: string | number;      // comes back as string e.g. "22053933.75"
-  volume?: string | number;   // comes back as string e.g. "43013258.51"
-  win_rate?: number | null;
-  trades_count?: number | null;
-  [key: string]: unknown;
-}
-
-export type RawLeaderboardResponse =
-  | RawLeaderboardItem[]
-  | { count?: number; items?: RawLeaderboardItem[]; data?: RawLeaderboardItem[]; [key: string]: unknown };
-
 export interface RawActivityItem {
   transaction_hash?: string;
   timestamp?: string;
@@ -79,15 +64,6 @@ export interface RawPriceResponse {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-
-export async function getLeaderboard(limit = 10): Promise<RawLeaderboardResponse> {
-  return run([
-    'polymarket', 'data', 'leaderboard',
-    '--period', 'week',
-    '--limit', String(limit),
-    '--output', 'json',
-  ]) as Promise<RawLeaderboardResponse>;
-}
 
 const DATA_API_BASE = 'https://data-api.polymarket.com';
 const ACTIVITY_PAGE_SIZE = 500; // API max per request
@@ -151,42 +127,6 @@ export async function getTraderActivity(
 // Direct Gamma REST API — no bullpen subprocess, no auth required
 // ---------------------------------------------------------------------------
 
-function httpsPost(url: string, body: unknown, headers: Record<string, string>, timeoutMs = 10_000): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const bodyStr = JSON.stringify(body);
-    const u = new URL(url);
-    const req = https.request(
-      {
-        hostname: u.hostname,
-        port: u.port || 443,
-        path: u.pathname + u.search,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(bodyStr),
-          ...headers,
-        },
-        timeout: timeoutMs,
-      },
-      res => {
-        let buf = '';
-        res.on('data', (chunk: Buffer) => { buf += chunk; });
-        res.on('end', () => {
-          if (res.statusCode && res.statusCode >= 400) {
-            reject(new Error(`HTTP ${res.statusCode} from ${url}: ${buf.slice(0, 200)}`));
-            return;
-          }
-          try { resolve(JSON.parse(buf)); }
-          catch { reject(new Error(`Invalid JSON from ${url}`)); }
-        });
-      }
-    );
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout (${timeoutMs}ms) posting to ${url}`)); });
-    req.write(bodyStr);
-    req.end();
-  });
-}
 
 function httpsGet(url: string, timeoutMs = 10_000): Promise<unknown> {
   return new Promise((resolve, reject) => {
@@ -340,82 +280,6 @@ export async function getTraderProfile(address: string): Promise<RawProfileRespo
     address,           // positional arg — NOT --trades <ADDRESS>
     '--output', 'json',
   ]) as Promise<RawProfileResponse>;
-}
-
-// ---------------------------------------------------------------------------
-// Falcon (Polymarket Analytics) Leaderboard — agent 579
-// ---------------------------------------------------------------------------
-
-export interface RawFalconTrader {
-  address: string;
-  rank?: number;
-  total_pnl?: number;
-  roi?: number;           // fraction, e.g. 1.505 means 150.5% (multiply by 100 for display)
-  win_rate?: number;      // 0–1 fraction
-  sharpe_ratio?: number;
-  total_trades?: number;
-  markets_traded?: number;
-  avg_trade_size?: number;
-  total_invested?: number;
-  [key: string]: unknown;
-}
-
-const FALCON_API_URL = 'https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized';
-
-function parseFalconField(v: unknown): number | undefined {
-  if (v == null) return undefined;
-  const n = Number(v);
-  return isNaN(n) ? undefined : n;
-}
-
-export async function getFalconLeaderboard(): Promise<RawFalconTrader[]> {
-  const apiKey = process.env.FALCON_API_KEY ?? '';
-  if (!apiKey) return [];
-
-  const body = {
-    agent_id: 579,
-    params: { wallet_address: 'ALL', leaderboard_period: '30d' },
-    pagination: { limit: 100, offset: 0 },
-    formatter_config: { format_type: 'raw' },
-  };
-
-  const data = await httpsPost(FALCON_API_URL, body, { Authorization: `Bearer ${apiKey}` });
-
-  // Find the array of trader records in the (possibly nested) response
-  let raw: unknown[] | null = null;
-  if (Array.isArray(data)) {
-    raw = data;
-  } else if (data && typeof data === 'object') {
-    const obj = data as Record<string, unknown>;
-    if (Array.isArray(obj.data)) {
-      raw = obj.data;
-    } else if (obj.data && typeof obj.data === 'object') {
-      // Shape: { data: { results: [...] } }
-      const inner = obj.data as Record<string, unknown>;
-      if (Array.isArray(inner.results)) raw = inner.results;
-      else if (Array.isArray(inner.items)) raw = inner.items;
-    }
-    if (!raw) {
-      if (Array.isArray(obj.results)) raw = obj.results;
-      else if (Array.isArray(obj.items)) raw = obj.items;
-    }
-  }
-
-  if (!raw) return [];
-
-  // Normalize: API returns numbers as strings — convert to number
-  return (raw as Record<string, unknown>[]).map(item => ({
-    address:        String(item.address ?? ''),
-    rank:           parseFalconField(item.rank),
-    total_pnl:      parseFalconField(item.total_pnl),
-    roi:            parseFalconField(item.roi),           // fraction (0.18 = 18%)
-    win_rate:       parseFalconField(item.win_rate),      // fraction (0-1)
-    sharpe_ratio:   parseFalconField(item.sharpe_ratio),
-    total_trades:   parseFalconField(item.total_trades),
-    markets_traded: parseFalconField(item.markets_traded),
-    avg_trade_size: parseFalconField(item.avg_trade_size),
-    total_invested: parseFalconField(item.total_invested),
-  })).filter(t => t.address.length > 0);
 }
 
 /** Check VPN connectivity by attempting a leaderboard call with a 5-second timeout. */

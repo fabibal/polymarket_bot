@@ -102,14 +102,25 @@ describe('initInsertionCounter', () => {
     store.initInsertionCounter();
     store.addOpenTrade(makeTrade({ id: 'r1', sourceTradeId: 'r1', copiedTrader: '0xa' }));
     store.addOpenTrade(makeTrade({ id: 'r2', sourceTradeId: 'r2', copiedTrader: '0xb' }));
-    store.addShadowOpenTrade(makeTrade({ id: 'sh1', sourceTradeId: 'sh1', copiedTrader: '0xc' }));
-    store.addShadowOpenTrade(makeTrade({ id: 'sh2', sourceTradeId: 'sh2', copiedTrader: '0xd' }));
-    store.addShadowOpenTrade(makeTrade({ id: 'sh3', sourceTradeId: 'sh3', copiedTrader: '0xe' }));
-    expect(store._getInsertionCounter()).toBe(6);
-
+    expect(store._getInsertionCounter()).toBe(3); // real rows took insertion_order 1,2
     store._closeDb();
+
+    // Shadow tables are no longer written by the app (shadow polling removed
+    // 2026-05-29), but initInsertionCounter must still scan them. Seed a shadow
+    // row with a higher insertion_order directly to verify the MAX spans them.
+    const raw = new Database(tmpFile);
+    raw.prepare(
+      `INSERT INTO shadow_open_trades
+        (id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
+         market_slug, market_title, outcome, side, entry_price, simulated_amount,
+         simulated_shares, status, insertion_order)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run('sh1', 'sh1', '2026-04-22T10:00:00.000Z', '0xc', 0,
+          'foo-market', 'Foo?', 'Yes', 'buy', 0.7, 5, 7.14, 'open', 5);
+    raw.close();
+
     store._setDbPathForTests(tmpFile);
     const next = store.initInsertionCounter();
-    expect(next).toBe(6);
+    expect(next).toBe(6); // MAX(real=2, shadow=5) + 1
   });
 });

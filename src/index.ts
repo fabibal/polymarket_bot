@@ -1,4 +1,3 @@
-import { refreshLeaderboard } from './leaderboard';
 import { pollTrader, resetSkipDedup } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
@@ -34,60 +33,29 @@ async function backfillOpenTradeDepth(): Promise<void> {
   console.log(`[backfill] Done: ${ok}/${targets.length} succeeded`);
 }
 
+// Watchlist-only polling (leaderboard tracking removed 2026-05-29). Each watchlist
+// trader's recent activity is polled and copied per its copyEnabled / copyAmount.
 async function runPollingCycle(): Promise<void> {
   resetSkipDedup();
   const store = readStore();
-  const excluded = new Set(store.excludedTraders ?? []);
-  const traders = store.trackedTraders.filter(t => !excluded.has(t.address));
+  const watchlistTraders = store.watchlistTraders ?? [];
 
-  // Shadow targets: all excluded addresses (manual + auto). They're not in trackedTraders anymore.
-  // Synthesize minimal trader objects so pollTrader can use them.
-  const shadowTargets = [...excluded].map(addr => {
-    const pastTrade = store.closedTrades.find(t => t.copiedTrader === addr && t.copiedTraderUsername);
-    return { rank: 0, address: addr, username: pastTrade?.copiedTraderUsername, weeklyPnl: 0 };
-  });
-
-  if (store.trackedTraders.length === 0) {
-    console.log('[bot] No leaderboard traders yet — waiting for leaderboard refresh...');
-  } else if (excluded.size > 0) {
-    console.log(`[bot] Polling ${traders.length} active + ${shadowTargets.length} in shadow mode`);
+  if (watchlistTraders.length === 0) {
+    console.log('[bot] No watchlist traders configured — add one via the dashboard.');
+    return;
   }
 
-  const polledAddresses = new Set<string>();
-  let totalNew = 0;
+  const disabledCount = watchlistTraders.filter(w => !w.copyEnabled).length;
+  const note = disabledCount > 0 ? ` (${disabledCount} copy-disabled — enable via dashboard)` : '';
+  console.log(`[bot] Polling ${watchlistTraders.length} watchlist trader(s)${note}`);
 
-  for (const trader of traders) {
-    polledAddresses.add(trader.address.toLowerCase());
-    // Leaderboard traders are shadow-only as of 2026-05-28 — no real copies.
-    const n = await pollTrader(trader, { shadowMode: true, copyEnabled: false });
+  let totalNew = 0;
+  for (const w of watchlistTraders) {
+    const trader = { rank: 0, address: w.address, weeklyPnl: 0 };
+    const n = await pollTrader(trader, { copyEnabled: w.copyEnabled, source: 'watchlist', tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT });
     totalNew += n;
     // Brief pause between traders to avoid rate-limiting
     await new Promise(r => setTimeout(r, 1_000));
-  }
-
-  // Shadow-poll excluded leaderboard traders (observe, don't copy)
-  for (const trader of shadowTargets) {
-    try {
-      await pollTrader(trader, { shadowMode: true, copyEnabled: false });
-    } catch (err) {
-      console.error(`[shadow] poll failed for ${trader.address.slice(0,10)}:`, err instanceof Error ? err.message : err);
-    }
-    await new Promise(r => setTimeout(r, 1_000));
-  }
-
-  // Poll watchlist-only traders not already covered by the leaderboard
-  const watchlistTraders = store.watchlistTraders ?? [];
-  const watchlistOnly = watchlistTraders.filter(w => !polledAddresses.has(w.address.toLowerCase()));
-  if (watchlistOnly.length > 0) {
-    const disabledCount = watchlistOnly.filter(w => !w.copyEnabled).length;
-    const note = disabledCount > 0 ? ` (${disabledCount} copy-disabled — enable via dashboard)` : '';
-    console.log(`[bot] Polling ${watchlistOnly.length} watchlist-only trader(s)${note}`);
-    for (const w of watchlistOnly) {
-      const trader = { rank: 0, address: w.address, weeklyPnl: 0 };
-      const n = await pollTrader(trader, { copyEnabled: w.copyEnabled, source: 'watchlist', tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT });
-      totalNew += n;
-      await new Promise(r => setTimeout(r, 1_000));
-    }
   }
 
   if (totalNew > 0) {
@@ -112,8 +80,7 @@ async function main(): Promise<void> {
   console.log('║  Polymarket Copy Trading Bot  [DRY RUN]    ║');
   console.log('╚════════════════════════════════════════════╝');
   console.log(`  Trade amount : $${CONFIG.TRADE_AMOUNT} per trade (simulated)`);
-  console.log(`  Tracking     : Top ${CONFIG.LEADERBOARD_LIMIT} traders by weekly PNL`);
-  console.log(`  Leaderboard  : refresh every ${CONFIG.LEADERBOARD_REFRESH_MS / 60_000} min`);
+  console.log(`  Tracking     : Watchlist traders only (leaderboard removed)`);
   console.log(`  Poll interval: every ${CONFIG.POLL_INTERVAL_MS / 1_000}s per trader`);
   console.log(`  Price update : every ${CONFIG.PRICE_UPDATE_INTERVAL_MS / 60_000} min`);
   console.log('');
@@ -135,20 +102,6 @@ async function main(): Promise<void> {
     console.error('[backfill] Failed:', err instanceof Error ? err.message : err)
   );
 
-  // Initial leaderboard fetch
-  try {
-    await refreshLeaderboard();
-  } catch (err) {
-    console.error('[bot] Initial leaderboard fetch failed:', err instanceof Error ? err.message : err);
-    console.error('[bot] Make sure `bullpen login` has been run and the config is mounted.');
-  }
-
-  // Periodic leaderboard refresh
-  setInterval(async () => {
-    try { await refreshLeaderboard(); }
-    catch (err) { console.error('[leaderboard] Refresh failed:', err instanceof Error ? err.message : err); }
-  }, CONFIG.LEADERBOARD_REFRESH_MS);
-
   // Periodic price updates for open positions
   setInterval(async () => {
     try { await updatePrices(); }
@@ -162,7 +115,7 @@ async function main(): Promise<void> {
     setTimeout(poll, CONFIG.POLL_INTERVAL_MS);
   };
 
-  // Give leaderboard a moment to load before first poll
+  // Start polling shortly after startup (dashboard/backfill get a head start).
   setTimeout(poll, 5_000);
 }
 

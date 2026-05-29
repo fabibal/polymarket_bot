@@ -415,8 +415,6 @@ export function startDashboard(): void {
       totalUnrealizedPnl: unrealizedPnl,
       totalPnl: realizedPnl + unrealizedPnl,
       totalSimulatedAmount: [...openTrades, ...closedTrades].reduce((s, t) => s + (t.simulatedAmount ?? CONFIG.TRADE_AMOUNT), 0),
-      trackedTraders: store.trackedTraders.length,
-      lastLeaderboardUpdate: store.lastLeaderboardUpdate,
       lastUpdated: new Date().toISOString(),
       totalRealizedPnlAdjusted:   realizedAdj,
       totalUnrealizedPnlAdjusted: unrealizedAdj,
@@ -679,7 +677,9 @@ export function startDashboard(): void {
         ? liqSamples.reduce((s, t) => s + (t.spreadAtEntry ?? 0), 0) / liqSamples.length
         : null;
 
-      return { ...w, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length };
+      // Drop stale Falcon fields (leaderboard removed 2026-05-29 — no refresh path; no UI consumer).
+      const { falconWinRate: _fwr, falconRoi: _fr, falconSharpe: _fs, ...wRest } = w;
+      return { ...wRest, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length };
     });
 
     // Watchlist-wide PNL totals (simulated)
@@ -725,7 +725,11 @@ export function startDashboard(): void {
       days.push(label);
       counts.push(open);
     }
-    res.json({ days, counts, maxTotalOpenPositions: CONFIG.MAX_TOTAL_OPEN_POSITIONS });
+    // Position-count ceiling implied by the wallet cap (the only active size limit
+    // now that MAX_TOTAL_OPEN_POSITIONS is gone): cap $ / per-trade $.
+    const walletCap = CONFIG.SIMULATED_WALLET_SIZE * CONFIG.WALLET_CAP_UTILIZATION;
+    const walletPositionLimit = CONFIG.TRADE_AMOUNT > 0 ? Math.floor(walletCap / CONFIG.TRADE_AMOUNT) : 0;
+    res.json({ days, counts, walletCap, walletPositionLimit });
   });
 
   app.post('/api/watchlist', (req, res) => {
@@ -1023,10 +1027,11 @@ export function startDashboard(): void {
     });
   });
 
-  // ── Shadow vs watchlist edge comparison ──────────────────────────────────────
-  // Shadow = leaderboard traders (shadow-only, not copied). Watchlist = real sim.
-  // Both over full history, cost-adjusted, so the watchlist edge can be compared
-  // against the leaderboard baseline it replaced.
+  // ── Shadow vs watchlist edge comparison (HISTORICAL) ─────────────────────────
+  // Shadow = former leaderboard traders. Leaderboard tracking was removed 2026-05-29,
+  // so shadow_closed_trades is frozen — no new shadow data accrues. Kept read-only so
+  // the watchlist edge can still be compared against the leaderboard baseline it
+  // replaced. Watchlist = real sim. Both cost-adjusted over full history.
   app.get('/api/shadow/stats', (_req, res) => {
     const store = readStore();
     const shadow = edgeStats(store.shadowClosedTrades ?? []);
@@ -1112,29 +1117,6 @@ export function startDashboard(): void {
       byTrader,
       byCategory,
     });
-  });
-
-  // ── Auto-excluded traders ─────────────────────────────────────────────────────
-  app.get('/api/excluded', (_req, res) => {
-    const store = readStore();
-    const threshold = CONFIG.AUTO_EXCLUDE_WIN_RATE_THRESHOLD;
-    const usernameByAddr = new Map<string, string>();
-    for (const t of store.trackedTraders ?? []) if (t.username) usernameByAddr.set(t.address, t.username);
-    const items = (store.autoExcludedTraders ?? []).map(address => {
-      // Cost-adjusted WR from this trader's shadow + real closed trades.
-      const tr = [
-        ...(store.shadowClosedTrades ?? []).filter(t => t.copiedTrader === address),
-        ...store.closedTrades.filter(t => t.copiedTrader === address),
-      ];
-      const winners = tr.filter(t => tradeCostAdjustedPnl(t) > 0).length;
-      return {
-        address,
-        username: usernameByAddr.get(address) ?? null,
-        winRate: tr.length > 0 ? winners / tr.length : null,
-        sampleSize: tr.length,
-      };
-    });
-    res.json({ threshold, count: items.length, items });
   });
 
   app.listen(CONFIG.PORT, '0.0.0.0', () => {

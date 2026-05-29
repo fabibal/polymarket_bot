@@ -109,8 +109,6 @@ export interface LeaderboardStats {
 
 export interface TradesStore {
   trackedTraders: LeaderboardTrader[];
-  excludedTraders: string[];           // wallet addresses excluded from polling
-  autoExcludedTraders: string[];       // subset of excludedTraders added by auto-exclusion logic
   excludedCategories: string[];        // market categories excluded from BUY simulation
   leaderboardFilters: LeaderboardFilters;
   lastLeaderboardStats?: LeaderboardStats;
@@ -151,8 +149,6 @@ export interface DashboardStats {
   totalUnrealizedPnl: number;
   totalPnl: number;
   totalSimulatedAmount: number;
-  trackedTraders: number;
-  lastLeaderboardUpdate: string;
   lastUpdated: string;
   // Cost-adjusted figures (gas + entry/exit slippage subtracted) — projected
   // net PNL if the same signals were traded live.

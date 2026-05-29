@@ -35,8 +35,6 @@ const WATCHLIST_DEFAULTS: WatchlistTrader[] = [
 
 const EMPTY_STORE = (): TradesStore => ({
   trackedTraders: [],
-  excludedTraders: [],
-  autoExcludedTraders: [],
   excludedCategories: [],
   leaderboardFilters: { ...DEFAULT_FILTERS },
   openTrades: [],
@@ -512,12 +510,7 @@ function loadSnapshot(): TradesStore {
     return t;
   });
 
-  const exc = d.prepare('SELECT address, auto FROM excluded_traders').all() as Array<{ address: string; auto: number }>;
-  s.excludedTraders     = exc.map(r => r.address);
-  s.autoExcludedTraders = exc.filter(r => r.auto === 1).map(r => r.address);
-
   s.excludedCategories = (d.prepare('SELECT category FROM excluded_categories').all() as Array<{ category: string }>).map(r => r.category);
-  for (const c of CONFIG.FORCE_EXCLUDE_CATEGORIES) if (!s.excludedCategories.includes(c)) s.excludedCategories.push(c);
 
   s.watchlistTraders = (d.prepare('SELECT * FROM watchlist_traders ORDER BY added_at ASC').all() as any[]).map(r => {
     const w: WatchlistTrader = {
@@ -603,10 +596,8 @@ function persistSnapshot(store: TradesStore): void {
       );
     }
 
-    d.prepare('DELETE FROM excluded_traders').run();
-    const ex = d.prepare('INSERT INTO excluded_traders (address, auto) VALUES (?,?)');
-    const autoSet = new Set(store.autoExcludedTraders ?? []);
-    for (const a of store.excludedTraders) ex.run(a, autoSet.has(a) ? 1 : 0);
+    // excluded_traders is no longer maintained at runtime (leaderboard removed
+    // 2026-05-29) — left frozen as a historical record, never rewritten here.
 
     d.prepare('DELETE FROM excluded_categories').run();
     const ec = d.prepare('INSERT INTO excluded_categories (category) VALUES (?)');
@@ -638,10 +629,8 @@ function persistSnapshot(store: TradesStore): void {
     order = 1;
     for (const t of (store.shadowOpenTrades ?? [])) soi.run(...openTradeRowParams(t, order++));
 
-    d.prepare('DELETE FROM shadow_closed_trades').run();
-    const sci = d.prepare(`INSERT INTO shadow_closed_trades ${CLOSED_INSERT_COLS} VALUES ${CLOSED_INSERT_PLACEHOLDERS}`);
-    order = 1;
-    for (const t of (store.shadowClosedTrades ?? [])) sci.run(...closedTradeRowParams(t, order++));
+    // shadow_closed_trades is frozen historical (leaderboard removed 2026-05-29):
+    // loaded read-only at startup for /api/shadow/stats, never rewritten here.
 
     d.prepare('DELETE FROM processed_trade_ids').run();
     const pi = d.prepare('INSERT INTO processed_trade_ids (id, added_order) VALUES (?,?)');
@@ -736,33 +725,6 @@ export function stopAutoFlush(): void {
 }
 
 // ── Targeted mutations (direct SQL + cache mirror) ─────────────────────────
-
-export function updateTrackedTraders(traders: LeaderboardTrader[]): void {
-  const store = readStore();
-  const now = new Date().toISOString();
-  const prevMap = new Map(store.trackedTraders.map(t => [t.address, t.trackedSince]));
-  for (const t of traders) t.trackedSince = prevMap.get(t.address) ?? now;
-  store.trackedTraders = traders;
-  store.lastLeaderboardUpdate = now;
-
-  const d = getDb();
-  const tx = d.transaction(() => {
-    d.prepare('DELETE FROM tracked_traders').run();
-    const ins = d.prepare(
-      `INSERT INTO tracked_traders (address, rank, username, weekly_pnl, total_volume, inactive,
-         falcon_win_rate, falcon_roi, falcon_sharpe, tracked_since) VALUES (?,?,?,?,?,?,?,?,?,?)`);
-    for (const t of traders) {
-      ins.run(
-        t.address, t.rank, t.username ?? null, t.weeklyPnl,
-        t.totalVolume ?? null, t.inactive == null ? null : (t.inactive ? 1 : 0),
-        t.falconWinRate ?? null, t.falconRoi ?? null, t.falconSharpe ?? null,
-        t.trackedSince ?? null,
-      );
-    }
-    d.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)').run('lastLeaderboardUpdate', now);
-  });
-  tx();
-}
 
 export function addOpenTrade(trade: SimulatedTrade): void {
   const store = readStore();
@@ -913,93 +875,6 @@ export function resolveByPrice(
 
 // Shadow variants ---------------------------------------------------------
 
-export function isShadowProcessed(id: string): boolean {
-  const store = readStore();
-  return (store.processedShadowIds ?? []).includes(id);
-}
-
-export function markShadowProcessed(id: string): void {
-  const store = readStore();
-  if (!store.processedShadowIds) store.processedShadowIds = [];
-  if (store.processedShadowIds.includes(id)) return;
-  store.processedShadowIds.push(id);
-  if (store.processedShadowIds.length > SHADOW_IDS_CAP) {
-    store.processedShadowIds = store.processedShadowIds.slice(-SHADOW_IDS_CAP);
-  }
-  const d = getDb();
-  const order = insertionCounter++;
-  const tx = d.transaction(() => {
-    d.prepare('INSERT OR IGNORE INTO processed_shadow_ids (id, added_order) VALUES (?,?)').run(id, order);
-    const over = d.prepare('SELECT COUNT(*) AS c FROM processed_shadow_ids').get() as { c: number };
-    if (over.c > SHADOW_IDS_CAP) {
-      const excess = over.c - SHADOW_IDS_CAP;
-      d.prepare('DELETE FROM processed_shadow_ids WHERE id IN (SELECT id FROM processed_shadow_ids ORDER BY added_order ASC LIMIT ?)').run(excess);
-    }
-  });
-  tx();
-}
-
-export function addShadowOpenTrade(trade: SimulatedTrade): void {
-  const store = readStore();
-  if (!store.shadowOpenTrades) store.shadowOpenTrades = [];
-  if (!store.processedShadowIds) store.processedShadowIds = [];
-  store.shadowOpenTrades.push(trade);
-  if (!store.processedShadowIds.includes(trade.sourceTradeId)) {
-    store.processedShadowIds.push(trade.sourceTradeId);
-    if (store.processedShadowIds.length > SHADOW_IDS_CAP) {
-      store.processedShadowIds = store.processedShadowIds.slice(-SHADOW_IDS_CAP);
-    }
-  }
-
-  const d = getDb();
-  const order = insertionCounter++;
-  const tx = d.transaction(() => {
-    d.prepare(`INSERT INTO shadow_open_trades ${OPEN_INSERT_COLS} VALUES ${OPEN_INSERT_PLACEHOLDERS}`)
-      .run(...openTradeRowParams(trade, order));
-    d.prepare('INSERT OR IGNORE INTO processed_shadow_ids (id, added_order) VALUES (?,?)').run(trade.sourceTradeId, order);
-    const over = d.prepare('SELECT COUNT(*) AS c FROM processed_shadow_ids').get() as { c: number };
-    if (over.c > SHADOW_IDS_CAP) {
-      const excess = over.c - SHADOW_IDS_CAP;
-      d.prepare('DELETE FROM processed_shadow_ids WHERE id IN (SELECT id FROM processed_shadow_ids ORDER BY added_order ASC LIMIT ?)').run(excess);
-    }
-  });
-  tx();
-}
-
-export function closeShadowOpenTrade(
-  copiedTrader: string, marketSlug: string, outcome: string, sellPrice: number,
-): boolean {
-  const store = readStore();
-  if (!store.shadowOpenTrades) return false;
-  const idx = store.shadowOpenTrades.findIndex(
-    t => t.copiedTrader === copiedTrader && t.marketSlug === marketSlug && t.outcome === outcome,
-  );
-  if (idx === -1) return false;
-  const trade = store.shadowOpenTrades[idx];
-  const closedAt = new Date().toISOString();
-  trade.status = 'resolved';
-  trade.exitPrice = sellPrice;
-  trade.realizedPnl = (sellPrice - trade.entryPrice) * trade.simulatedShares;
-  trade.closedAt = closedAt;
-  trade.holdingPeriodMs = new Date(closedAt).getTime() - new Date(trade.timestamp).getTime();
-  trade.currentPrice = sellPrice;
-  trade.unrealizedPnl = 0;
-  applyExitCosts(trade, sellPrice);
-  store.shadowOpenTrades.splice(idx, 1);
-  if (!store.shadowClosedTrades) store.shadowClosedTrades = [];
-  store.shadowClosedTrades.push(trade);
-
-  const d = getDb();
-  const order = insertionCounter++;
-  const tx = d.transaction(() => {
-    d.prepare('DELETE FROM shadow_open_trades WHERE id = ?').run(trade.id);
-    d.prepare(`INSERT INTO shadow_closed_trades ${CLOSED_INSERT_COLS} VALUES ${CLOSED_INSERT_PLACEHOLDERS}`)
-      .run(...closedTradeRowParams(trade, order));
-  });
-  tx();
-  return true;
-}
-
 export function updateShadowPrices(
   updates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }>,
 ): void {
@@ -1051,13 +926,6 @@ export function resolveShadowByPrice(
   tx();
 }
 
-export function setShadowLastSeen(address: string, timestamp: string): void {
-  const store = readStore();
-  if (!store.shadowLastSeen) store.shadowLastSeen = {};
-  store.shadowLastSeen[address] = timestamp;
-  getDb().prepare('INSERT OR REPLACE INTO shadow_last_seen (address, timestamp) VALUES (?,?)').run(address, timestamp);
-}
-
 export function markProcessed(id: string): void {
   const store = readStore();
   if (store.processedTradeIds.includes(id)) return;
@@ -1076,19 +944,6 @@ export function markProcessed(id: string): void {
     }
   });
   tx();
-}
-
-export function setTraderExclusion(address: string, excluded: boolean): void {
-  const store = readStore();
-  if (excluded) {
-    if (!store.excludedTraders.includes(address)) store.excludedTraders.push(address);
-  } else {
-    store.excludedTraders = store.excludedTraders.filter(a => a !== address);
-    store.autoExcludedTraders = (store.autoExcludedTraders ?? []).filter(a => a !== address);
-  }
-  const d = getDb();
-  if (excluded) d.prepare('INSERT OR IGNORE INTO excluded_traders (address, auto) VALUES (?, 0)').run(address);
-  else          d.prepare('DELETE FROM excluded_traders WHERE address = ?').run(address);
 }
 
 export function setCategoryExclusion(category: string, excluded: boolean): void {
@@ -1158,40 +1013,6 @@ export function setLeaderboardFilters(filters: LeaderboardFilters): void {
   getDb().prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)').run('leaderboardFilters', JSON.stringify(filters));
 }
 
-export function setLeaderboardStats(stats: LeaderboardStats): void {
-  const store = readStore();
-  store.lastLeaderboardStats = stats;
-  getDb().prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)').run('lastLeaderboardStats', JSON.stringify(stats));
-}
-
-export function updateTraderLastOnLeaderboard(addresses: string[]): void {
-  if (addresses.length === 0) return;
-  const store = readStore();
-  if (!store.traderLastOnLeaderboard) store.traderLastOnLeaderboard = {};
-  const now = new Date().toISOString();
-  for (const addr of addresses) store.traderLastOnLeaderboard[addr] = now;
-
-  const d = getDb();
-  const stmt = d.prepare('INSERT OR REPLACE INTO trader_last_on_leaderboard (address, timestamp) VALUES (?,?)');
-  const tx = d.transaction(() => { for (const a of addresses) stmt.run(a, now); });
-  tx();
-}
-
-export function setAutoExclusion(address: string, excluded: boolean): void {
-  const store = readStore();
-  if (!store.autoExcludedTraders) store.autoExcludedTraders = [];
-  if (excluded) {
-    if (!store.excludedTraders.includes(address))      store.excludedTraders.push(address);
-    if (!store.autoExcludedTraders.includes(address))  store.autoExcludedTraders.push(address);
-  } else {
-    store.excludedTraders     = store.excludedTraders.filter(a => a !== address);
-    store.autoExcludedTraders = store.autoExcludedTraders.filter(a => a !== address);
-  }
-  const d = getDb();
-  if (excluded) d.prepare('INSERT OR REPLACE INTO excluded_traders (address, auto) VALUES (?, 1)').run(address);
-  else          d.prepare('DELETE FROM excluded_traders WHERE address = ?').run(address);
-}
-
 // Watchlist ---------------------------------------------------------------
 
 export function addWatchlistTrader(address: string, label?: string): boolean {
@@ -1234,42 +1055,6 @@ export function setWatchlistCopyAmount(address: string, amount: number): boolean
   w.copyAmount = Math.max(0.01, Math.round(amount * 100) / 100);
   getDb().prepare('UPDATE watchlist_traders SET copy_amount = ? WHERE address = ?').run(w.copyAmount, addr);
   return true;
-}
-
-export function updateWatchlistFalconData(
-  address: string,
-  data: { falconWinRate?: number; falconRoi?: number; falconSharpe?: number },
-): void {
-  const store = readStore();
-  const addr = address.toLowerCase();
-  const w = store.watchlistTraders.find(w => w.address === addr);
-  if (!w) return;
-  if (data.falconWinRate !== undefined) w.falconWinRate = data.falconWinRate;
-  if (data.falconRoi     !== undefined) w.falconRoi     = data.falconRoi;
-  if (data.falconSharpe  !== undefined) w.falconSharpe  = data.falconSharpe;
-
-  const d = getDb();
-  const sets: string[] = [];
-  const vals: any[] = [];
-  if (data.falconWinRate !== undefined) { sets.push('falcon_win_rate = ?'); vals.push(data.falconWinRate); }
-  if (data.falconRoi     !== undefined) { sets.push('falcon_roi = ?');      vals.push(data.falconRoi); }
-  if (data.falconSharpe  !== undefined) { sets.push('falcon_sharpe = ?');   vals.push(data.falconSharpe); }
-  if (sets.length) { vals.push(addr); d.prepare(`UPDATE watchlist_traders SET ${sets.join(', ')} WHERE address = ?`).run(...vals); }
-}
-
-export function updateTraderFalconCache(data: Record<string, { winRate?: number }>): void {
-  const store = readStore();
-  if (!store.traderFalconCache) store.traderFalconCache = {};
-  const updatedAt = new Date().toISOString();
-  for (const [addr, d] of Object.entries(data)) {
-    store.traderFalconCache[addr.toLowerCase()] = { winRate: d.winRate, updatedAt };
-  }
-  const db2 = getDb();
-  const stmt = db2.prepare('INSERT OR REPLACE INTO trader_falcon_cache (address, win_rate, updated_at) VALUES (?,?,?)');
-  const tx = db2.transaction(() => {
-    for (const [addr, v] of Object.entries(data)) stmt.run(addr.toLowerCase(), v.winRate ?? null, updatedAt);
-  });
-  tx();
 }
 
 // ── Daily cleanup ───────────────────────────────────────────────────────────

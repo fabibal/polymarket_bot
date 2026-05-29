@@ -42,7 +42,7 @@ export function isCategoryExcluded(category: string, excludedCategories: readonl
 
 /**
  * Combined price/category check. Returns the specific failure reason or 'ok'.
- * Mirrors the BUY gate in monitor.ts (both real and shadow modes).
+ * Historical BUY-gate logic, kept as a side-effect-free test scaffold.
  */
 export function checkBuyFilters(
   price: number,
@@ -82,7 +82,7 @@ export function getOutcomeSpread(data: RawPriceResponse, outcome: string): numbe
 
 export interface WatchlistEntry {
   marketSlug: string;
-  copiedTraderSource?: 'leaderboard' | 'watchlist';
+  copiedTraderSource?: string; // only 'watchlist' is counted; widened so SimulatedTrade is assignable
   timestamp: string; // ISO
 }
 
