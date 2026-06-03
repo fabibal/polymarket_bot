@@ -37,6 +37,10 @@ services:
   bot:
     build: .
     container_name: polymarket_bot
+    # Run as the node base-image user (uid/gid 1000) so it matches the owner of the
+    # host-mounted bullpen creds. Running as root tripped the CLI's BULLPEN_HOME
+    # ownership check ("owned by uid 1000, not current uid 0") after a CLI bump.
+    user: "1000:1000"
     # Route ALL traffic through the gluetun VPN container
     network_mode: "service:gluetun"
     depends_on:
@@ -45,8 +49,10 @@ services:
     volumes:
       # Persisted trade log
       - ./data:/app/data
-      # Mount bullpen auth config from host (run `bullpen login` on host first)
-      - ${BULLPEN_CONFIG_PATH:-~/.bullpen}:/root/.bullpen:ro
+      # Mount bullpen auth config from host (run `bullpen login` on host first).
+      # Mounted under the node user's HOME (uid 1000) — /root is mode 700 and not
+      # traversable by a non-root process.
+      - ${BULLPEN_CONFIG_PATH:-~/.bullpen}:/home/node/.bullpen:ro
       # Docker socket (read-only) — used by dashboard to query container CPU/RAM stats
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Host logs dir (read-only) — dashboard reads weekly-macro-scan output
@@ -56,6 +62,8 @@ services:
       - DRY_RUN=true
       - PORT=8080
       - DB_FILE=/app/data/store.db
+      - HOME=/home/node                     # bullpen CLI reads creds from $HOME/.bullpen
+      - BULLPEN_HOME=/home/node/.bullpen     # explicit; matches the mount above
       - POLL_INTERVAL_MS=30000          # 30 seconds
       - PRICE_UPDATE_INTERVAL_MS=300000 # 5 minutes
       # Entry-filter + leaderboard env vars removed 2026-05-29 (watchlist-only — they were

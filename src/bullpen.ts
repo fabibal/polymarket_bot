@@ -282,15 +282,31 @@ export async function getTraderProfile(address: string): Promise<RawProfileRespo
   ]) as Promise<RawProfileResponse>;
 }
 
-/** Check VPN connectivity by attempting a leaderboard call with a 5-second timeout. */
+/**
+ * Check VPN connectivity via a direct HTTPS egress lookup (ipinfo.io) with a
+ * 5-second timeout. Returns true when the request succeeds and the egress
+ * country is not Hungary (the geo-blocked origin the VPN exists to mask).
+ *
+ * Note: this deliberately does NOT shell out to the bullpen CLI. The CLI's
+ * authed path reads BULLPEN_HOME and refuses when the creds dir uid differs
+ * from the process uid (root-vs-1000 under the bind-mount), which is unrelated
+ * to actual tunnel health. A direct egress probe measures the tunnel itself.
+ */
 export async function checkVpnConnectivity(): Promise<boolean> {
-  try {
-    await execFileAsync(BULLPEN_CMD, ['polymarket', 'data', 'leaderboard', '--output', 'json'], {
-      timeout: 5_000,
-      maxBuffer: 512 * 1024,
+  return new Promise(resolve => {
+    const req = https.get('https://ipinfo.io/json', { timeout: 5_000 }, res => {
+      let body = '';
+      res.on('data', d => body += d);
+      res.on('end', () => {
+        try {
+          const d = JSON.parse(body);
+          resolve(!!d.ip && d.country !== 'HU');
+        } catch {
+          resolve(false);
+        }
+      });
     });
-    return true;
-  } catch {
-    return false;
-  }
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+  });
 }
