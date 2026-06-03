@@ -368,11 +368,15 @@ export function startDashboard(): void {
 
   app.get('/api/stats', async (req, res) => {
     const store = readStore();
-    const source = String(req.query.source ?? '');
+    // Watchlist is the primary view: headline PnL, slippage and net-edge must
+    // reflect current watchlist-only performance, not the dead leaderboard era
+    // (lifetime leaderboard copy PnL was -$2,451 and would dominate the totals).
+    // Pass ?source=all to opt into the unfiltered all-source view.
+    const source = String(req.query.source ?? 'watchlist');
 
     let openTrades  = store.openTrades;
     let closedTrades = store.closedTrades;
-    if (source === 'watchlist') {
+    if (source !== 'all') {
       openTrades   = openTrades.filter(t => t.copiedTraderSource === 'watchlist');
       closedTrades = closedTrades.filter(t => t.copiedTraderSource === 'watchlist');
     }

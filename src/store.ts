@@ -213,23 +213,7 @@ CREATE TABLE IF NOT EXISTS shadow_closed_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_closed_at ON shadow_closed_trades (closed_at);
 
-CREATE TABLE IF NOT EXISTS processed_shadow_ids (
-  id           TEXT PRIMARY KEY,
-  added_order  INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_processed_shadow_order ON processed_shadow_ids (added_order);
-
 CREATE TABLE IF NOT EXISTS trader_last_seen (
-  address   TEXT PRIMARY KEY,
-  timestamp TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS trader_last_on_leaderboard (
-  address   TEXT PRIMARY KEY,
-  timestamp TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS shadow_last_seen (
   address   TEXT PRIMARY KEY,
   timestamp TEXT NOT NULL
 );
@@ -252,12 +236,6 @@ CREATE INDEX IF NOT EXISTS idx_history_ts ON trader_history (address, side, time
 CREATE TABLE IF NOT EXISTS trader_history_meta (
   address      TEXT PRIMARY KEY,
   last_fetched TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS trader_falcon_cache (
-  address    TEXT PRIMARY KEY,
-  win_rate   REAL,
-  updated_at TEXT NOT NULL
 );
 `;
 
@@ -531,11 +509,8 @@ function loadSnapshot(): TradesStore {
   s.shadowClosedTrades = (d.prepare('SELECT * FROM shadow_closed_trades ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
 
   s.processedTradeIds  = (d.prepare('SELECT id FROM processed_trade_ids  ORDER BY added_order ASC').all() as Array<{ id: string }>).map(r => r.id);
-  s.processedShadowIds = (d.prepare('SELECT id FROM processed_shadow_ids ORDER BY added_order ASC').all() as Array<{ id: string }>).map(r => r.id);
 
   s.traderLastSeen          = Object.fromEntries((d.prepare('SELECT address, timestamp FROM trader_last_seen').all() as Array<{ address: string; timestamp: string }>).map(r => [r.address, r.timestamp]));
-  s.traderLastOnLeaderboard = Object.fromEntries((d.prepare('SELECT address, timestamp FROM trader_last_on_leaderboard').all() as Array<{ address: string; timestamp: string }>).map(r => [r.address, r.timestamp]));
-  s.shadowLastSeen          = Object.fromEntries((d.prepare('SELECT address, timestamp FROM shadow_last_seen').all() as Array<{ address: string; timestamp: string }>).map(r => [r.address, r.timestamp]));
 
   // trader_history: group by address + side
   const histRows = d.prepare('SELECT address, side, transaction_hash, timestamp, slug, title, outcome, type, price, size FROM trader_history ORDER BY timestamp DESC').all() as Array<{
@@ -561,11 +536,6 @@ function loadSnapshot(): TradesStore {
   for (const r of metaRows) {
     if (!s.traderHistory[r.address]) s.traderHistory[r.address] = { buys: [], sells: [], lastFetched: r.last_fetched };
   }
-
-  s.traderFalconCache = Object.fromEntries(
-    (d.prepare('SELECT address, win_rate, updated_at FROM trader_falcon_cache').all() as Array<{ address: string; win_rate: number | null; updated_at: string }>)
-      .map(r => [r.address, { winRate: r.win_rate ?? undefined, updatedAt: r.updated_at }])
-  );
 
   const fr = d.prepare(`SELECT value FROM meta WHERE key = 'leaderboardFilters'`).get() as { value: string } | undefined;
   if (fr) try { s.leaderboardFilters = { ...DEFAULT_FILTERS, ...JSON.parse(fr.value) }; } catch {}
@@ -640,25 +610,9 @@ function persistSnapshot(store: TradesStore): void {
       for (const id of store.processedTradeIds) if (!seen.has(id)) { pi.run(id, i++); seen.add(id); }
     }
 
-    d.prepare('DELETE FROM processed_shadow_ids').run();
-    const psi = d.prepare('INSERT INTO processed_shadow_ids (id, added_order) VALUES (?,?)');
-    {
-      let i = 1;
-      const seen = new Set<string>();
-      for (const id of (store.processedShadowIds ?? [])) if (!seen.has(id)) { psi.run(id, i++); seen.add(id); }
-    }
-
     d.prepare('DELETE FROM trader_last_seen').run();
     const tls = d.prepare('INSERT INTO trader_last_seen (address, timestamp) VALUES (?,?)');
     for (const [a, ts] of Object.entries(store.traderLastSeen ?? {})) tls.run(a, ts);
-
-    d.prepare('DELETE FROM trader_last_on_leaderboard').run();
-    const tllb = d.prepare('INSERT INTO trader_last_on_leaderboard (address, timestamp) VALUES (?,?)');
-    for (const [a, ts] of Object.entries(store.traderLastOnLeaderboard ?? {})) tllb.run(a, ts);
-
-    d.prepare('DELETE FROM shadow_last_seen').run();
-    const sls = d.prepare('INSERT INTO shadow_last_seen (address, timestamp) VALUES (?,?)');
-    for (const [a, ts] of Object.entries(store.shadowLastSeen ?? {})) sls.run(a, ts);
 
     d.prepare('DELETE FROM trader_history').run();
     d.prepare('DELETE FROM trader_history_meta').run();
@@ -674,10 +628,6 @@ function persistSnapshot(store: TradesStore): void {
       for (const s of h.sells ?? []) { if (!s.transaction_hash || seenS.has(s.transaction_hash)) continue; seenS.add(s.transaction_hash);
         thi.run(addr, 'SELL', s.transaction_hash, s.timestamp, s.slug, s.title ?? null, s.outcome ?? null, s.type, s.price ?? null, s.size ?? null); }
     }
-
-    d.prepare('DELETE FROM trader_falcon_cache').run();
-    const fc = d.prepare('INSERT INTO trader_falcon_cache (address, win_rate, updated_at) VALUES (?,?,?)');
-    for (const [a, v] of Object.entries(store.traderFalconCache ?? {})) fc.run(a, v.winRate ?? null, v.updatedAt);
 
     const setMeta = d.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)');
     setMeta.run('leaderboardFilters', JSON.stringify(store.leaderboardFilters));
@@ -715,7 +665,14 @@ export function flushIfDirty(): void {
 
 export function startAutoFlush(intervalMs: number = 60_000): void {
   if (flushTimer) return;
-  flushTimer = setInterval(flushIfDirty, intervalMs);
+  flushTimer = setInterval(() => {
+    flushIfDirty();
+    // Periodic PASSIVE checkpoint keeps the WAL from growing unbounded across
+    // multi-day uptime — the startup TRUNCATE alone let it reach ~38MB by
+    // 2026-06-03. PASSIVE never blocks on readers and is a no-op if it can't
+    // reclaim, so it is safe to run every cycle.
+    try { getDb().pragma('wal_checkpoint(PASSIVE)'); } catch { /* non-fatal */ }
+  }, intervalMs);
   if (typeof flushTimer.unref === 'function') flushTimer.unref();
 }
 
