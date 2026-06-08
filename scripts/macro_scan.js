@@ -110,6 +110,22 @@ async function fetchActivity(address, maxTrades=1500) {
   return out;
 }
 
+async function isMarketMaker(address) {
+  // Liquidity-provider / market-maker detection: a MAKER_REBATE activity event means the
+  // wallet earns maker rebates -> two-sided quoting, NOT a copyable directional trader.
+  // Sample 500 (one page max): MAKER_REBATE events are sparse (~3/500 for 0xef27) so a 50-row
+  // window misses them and lets the MM through. Non-blocking on fetch error.
+  try {
+    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=500&offset=0`;
+    const data = await get(url);
+    if (!Array.isArray(data)) return false;
+    return data.some(it => String(it.type || '').toUpperCase() === 'MAKER_REBATE');
+  } catch (e) {
+    console.error(`[mm-check ${address.slice(0,10)}] ${e.message}`);
+    return false;
+  }
+}
+
 function analyzeHistory(trades) {
   // FIFO match BUY-SELL by (slug,outcome). Compute hold-weighted metrics.
   trades.sort((a,b)=>a.ts-b.ts);
@@ -199,6 +215,13 @@ function analyzeHistory(trades) {
     console.log(`raw TRADE rows: ${hist.length}`);
     const m = analyzeHistory(hist);
     for (const [k,v] of Object.entries(m)) console.log(`  ${k.padEnd(22)} ${v}`);
+    // Secondary MM heuristic (annotate only, no reject): an abnormally high FIFO win rate on
+    // a large closed sample is the signature of MM spread-capture / held-to-resolution losers
+    // hidden from FIFO. Flag for manual review.
+    const wrPct = parseFloat(m.win_rate);
+    if (m.closed > 50 && wrPct > 92) {
+      console.log(`  WARN ${tgt.addr} — suspected MM: FIFO win rate ${m.win_rate} > 92% on ${m.closed} closed trades`);
+    }
   }
 
   // ============ C) Falcon enrichment + filter ============
@@ -226,13 +249,25 @@ function analyzeHistory(trades) {
   const excluded    = new Set(db.prepare('SELECT lower(address) AS a FROM excluded_traders').all().map(r=>r.a));
 
   // Filter ALL falcon traders (not just cached) by criteria, exclude watchlist + excluded.
-  const shortlist = [...falconAll.values()].filter(t =>
+  const prelim = [...falconAll.values()].filter(t =>
     !watchlisted.has(t.address) && !excluded.has(t.address) &&
     (t.sharpe_ratio||0) > 0.5 &&
     (t.roi||0) > 0.15 &&
     (t.win_rate||0) > 0.55 &&
     (t.total_trades||0) >= 10
-  ).sort((a,b)=>(b.sharpe_ratio||0)-(a.sharpe_ratio||0)).slice(0,10);
+  ).sort((a,b)=>(b.sharpe_ratio||0)-(a.sharpe_ratio||0));
+
+  // Market-maker auto-reject: drop any candidate emitting a MAKER_REBATE event (uncopyable
+  // liquidity provider). Walk in sharpe-rank order until 10 survivors are collected.
+  const shortlist = [];
+  for (const t of prelim) {
+    if (shortlist.length >= 10) break;
+    if (await isMarketMaker(t.address)) {
+      console.log(`  skip ${t.address} — market maker (MAKER_REBATE detected)`);
+      continue;
+    }
+    shortlist.push(t);
+  }
 
   console.log(`\nTOP 10 not on watchlist (sharpe>0.5, roi>15%, wr>55%, trades>=10):`);
   console.log('addr                                       sharpe   roi    wr    trades  invested  pnl');
