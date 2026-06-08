@@ -1,4 +1,4 @@
-// One-off macro/long-term trader scan. Runs INSIDE bot container (needs VPN + FALCON_API_KEY).
+// One-off macro/long-term trader scan. Runs INSIDE bot container (needs VPN + POLYMARKET_ANALYTICS_API_KEY).
 // A) Falcon 7d/30d/90d diff
 // B) Polymarket data-api history backfill for candidates
 // C) Falcon enrichment for cached traders
@@ -7,8 +7,8 @@ const Database = require('better-sqlite3');
 
 const FALCON_URL = 'https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized';
 const DATA_API   = 'https://data-api.polymarket.com';
-const KEY = process.env.FALCON_API_KEY || '';
-if (!KEY) { console.error('FALCON_API_KEY missing'); process.exit(1); }
+const KEY = process.env.POLYMARKET_ANALYTICS_API_KEY || '';
+if (!KEY) { console.error('POLYMARKET_ANALYTICS_API_KEY missing'); process.exit(1); }
 
 function post(url, body, headers={}, timeoutMs=15000) {
   return new Promise((resolve, reject) => {
@@ -208,21 +208,18 @@ function analyzeHistory(trades) {
   for (const list of [d90, d30, d7]) for (const t of list) if (!falconAll.has(t.address)) falconAll.set(t.address, t);
   console.log(`falcon coverage (union of 7/30/90): ${falconAll.size} addrs`);
 
-  const cached = db.prepare('SELECT address FROM trader_falcon_cache').all().map(r=>r.address.toLowerCase());
-  const hits = cached.filter(a => falconAll.has(a));
-  console.log(`cached traders matched in falcon: ${hits.length}/${cached.length}`);
-
-  // Update DB: add sharpe/roi to tracked_traders + watchlist_traders for matched.
-  const updTracked = db.prepare('UPDATE tracked_traders SET falcon_sharpe=?, falcon_roi=?, falcon_win_rate=? WHERE lower(address)=?');
-  const updWatch   = db.prepare('UPDATE watchlist_traders SET falcon_sharpe=?, falcon_roi=?, falcon_win_rate=? WHERE lower(address)=?');
-  let updT=0, updW=0;
-  for (const a of hits) {
-    const t = falconAll.get(a);
-    const r1 = updTracked.run(t.sharpe_ratio??null, t.roi??null, t.win_rate??null, a);
-    const r2 = updWatch.run(t.sharpe_ratio??null, t.roi??null, t.win_rate??null, a);
-    updT += r1.changes; updW += r2.changes;
+  // Enrich the live watchlist with Falcon metrics from the in-memory fetch above.
+  // (trader_falcon_cache was dropped in the 2026-05-29 watchlist-only cleanup.)
+  const watchRows = db.prepare('SELECT address FROM watchlist_traders').all().map(r => r.address);
+  const updWatch  = db.prepare('UPDATE watchlist_traders SET falcon_sharpe=?, falcon_roi=?, falcon_win_rate=? WHERE address=?');
+  let updW = 0;
+  for (const addr of watchRows) {
+    const t = falconAll.get(addr.toLowerCase());
+    if (!t) { console.log(`  skip ${addr} — not in Falcon top ${falconAll.size}`); continue; }
+    const r = updWatch.run(t.sharpe_ratio??null, t.roi??null, t.win_rate??null, addr);
+    updW += r.changes;
   }
-  console.log(`updated rows: tracked_traders=${updT}, watchlist_traders=${updW}`);
+  console.log(`watchlist enriched from falcon: ${updW}/${watchRows.length} rows updated`);
 
   // Build excluded/watchlist sets for shortlist.
   const watchlisted = new Set(db.prepare('SELECT lower(address) AS a FROM watchlist_traders').all().map(r=>r.a));
