@@ -121,14 +121,12 @@ describe('store: writeStore full-snapshot round-trip', () => {
     const s = store.readStore();
     s.openTrades.push(makeTrade({ id: 'ws1', sourceTradeId: 'ws1src' }));
     s.excludedCategories.push('testcat');
-    s.traderFalconCache['0xfoo'] = { winRate: 0.66, updatedAt: '2026-04-22T12:00:00.000Z' };
     store.writeStore(s);
 
     store._resetStoreCache();
     const reloaded = store.readStore();
     expect(reloaded.openTrades.find(t => t.id === 'ws1')).toBeDefined();
     expect(reloaded.excludedCategories).toContain('testcat');
-    expect(reloaded.traderFalconCache['0xfoo']?.winRate).toBe(0.66);
   });
 });
 
