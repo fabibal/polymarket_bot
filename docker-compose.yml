@@ -74,7 +74,7 @@ services:
       - WALLET_CAP_UTILIZATION=0.80  # stop opening new BUYs at 80% utilization ($800 of $1000)
       - GAS_COST_PER_BUY=0  # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
       - SLIPPAGE_RATE=0.02   # 2% slippage each side (entry at ask, exit at bid)
-      - FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
+      - POLYMARKET_ANALYTICS_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
     deploy:
       resources:
         limits:

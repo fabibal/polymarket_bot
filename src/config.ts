@@ -37,5 +37,5 @@ export const CONFIG = {
   // on depth-fetch failure (copy proceeds when orderbook unavailable).
   DEPTH_GATE_MIN_DEPTH_5: parseFloat(process.env.DEPTH_GATE_MIN_DEPTH_5 ?? '500'),
   // Falcon (Polymarket Analytics) API key — optional, enables Falcon leaderboard enrichment
-  FALCON_API_KEY: process.env.FALCON_API_KEY ?? '',
+  POLYMARKET_ANALYTICS_API_KEY: process.env.POLYMARKET_ANALYTICS_API_KEY ?? '',
 };

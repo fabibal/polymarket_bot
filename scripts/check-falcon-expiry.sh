@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Falcon (Polymarket Analytics) JWT expiry check for polymarket_bot.
 #
-# Decodes the JWT in POLYMARKET_ANALYTICS_API_KEY (= FALCON_API_KEY) from
+# Decodes the JWT in POLYMARKET_ANALYTICS_API_KEY from
 # ~/polymarket_bot/.env and emits a Telegram alert when the token is close
 # to (or past) expiry. Without a valid token, Falcon leaderboard enrichment
 # silently degrades to Bullpen-only — bot keeps running but discovery quality
@@ -113,11 +113,8 @@ if [ ! -r "${BOT_ENV}" ]; then
     fail_infra "bot env file not readable at ${BOT_ENV}"
 fi
 
-# Prefer POLYMARKET_ANALYTICS_API_KEY (canonical); fall back to FALCON_API_KEY.
+# Canonical key: POLYMARKET_ANALYTICS_API_KEY.
 TOKEN="$(grep -oE '^POLYMARKET_ANALYTICS_API_KEY=.*' "${BOT_ENV}" | head -n1 | cut -d= -f2-)"
-if [ -z "${TOKEN}" ]; then
-    TOKEN="$(grep -oE '^FALCON_API_KEY=.*' "${BOT_ENV}" | head -n1 | cut -d= -f2-)"
-fi
 # Strip surrounding quotes if any
 TOKEN="${TOKEN%\"}"; TOKEN="${TOKEN#\"}"
 TOKEN="${TOKEN%\'}"; TOKEN="${TOKEN#\'}"

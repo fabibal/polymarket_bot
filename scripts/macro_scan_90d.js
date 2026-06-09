@@ -5,7 +5,7 @@ const Database = require('better-sqlite3');
 
 const DATA_API = 'https://data-api.polymarket.com';
 const FALCON_URL = 'https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized';
-const KEY = process.env.FALCON_API_KEY || '';
+const KEY = process.env.POLYMARKET_ANALYTICS_API_KEY || '';
 const CONCURRENCY = 8;
 const PAGE = 500;
 const MAX_PAGES = 5; // safety cap = 2500 trades
