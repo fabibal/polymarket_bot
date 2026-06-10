@@ -41,6 +41,12 @@ function httpsGet(url: string, timeoutMs = 10_000): Promise<unknown> {
       let body = '';
       res.on('data', (d: Buffer) => body += d);
       res.on('end', () => {
+        // A 429/500 error body is often valid JSON — without this check it
+        // parsed cleanly and got cached as if it were real data.
+        if (res.statusCode && res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode} from ${url}`));
+          return;
+        }
         try { resolve(JSON.parse(body)); }
         catch { reject(new Error(`JSON parse failed for ${url}`)); }
       });
@@ -328,8 +334,8 @@ function computeInlineStats(
   // Win rate & avg W/L from our simulated closed trades (traders rarely SELL on Polymarket —
   // they hold to resolution, so BUY/SELL pairs in raw history are almost always zero)
   const sim7d     = simClosed.filter(t => new Date(t.closedAt ?? t.timestamp).getTime() >= cut7d);
-  // WR uses costAdjustedPnl so it's consistent with the auto-exclusion gate
-  // (leaderboard.ts winRateSince) and the recovery check at line ~506.
+  // WR uses costAdjustedPnl so it's consistent with the other win-rate
+  // calculations on the dashboard (/api/stats, /api/watchlist allTimeWinRate).
   const winners7d = sim7d.filter(t => (t.costAdjustedPnl ?? t.realizedPnl ?? 0) > 0);
   const winRate7d = sim7d.length >= 2 ? winners7d.length / sim7d.length : null;
 
@@ -933,13 +939,59 @@ export function startDashboard(): void {
       const headMatch = content.match(/\[scan\] cached=(\d+)/);
       const scanned = headMatch ? Number(headMatch[1]) : 0;
 
-      // Extract the top "MACRO CANDIDATES" section (before "--- subset NOT on 7d ---").
-      let inTop = false;
-      const rawRows: string[] = [];
-      for (const ln of lines) {
-        if (/^========== MACRO CANDIDATES/.test(ln)) { inTop = true; continue; }
-        if (/^--- subset NOT on 7d/.test(ln))       { inTop = false; }
-        if (inTop && /^0x[0-9a-f]{40}/i.test(ln))   { rawRows.push(ln); }
+      // Candidate rows: prefer the machine-readable CANDIDATES_JSON line
+      // (emitted by macro_scan_90d.js since 2026-06-10). Position-parsing the
+      // human table is only a fallback for logs from older scans — a column
+      // change there would silently shift fields into the wrong numbers.
+      type RawCandidate = {
+        address: string; onFalcon7d: boolean; tr90: number; tpw: number;
+        closed: number; avgHoldDays: number; winRate: number; pnl: number;
+      };
+      let rawCandidates: RawCandidate[] | null = null;
+      const jsonLine = lines.find(l => l.startsWith('CANDIDATES_JSON '));
+      if (jsonLine) {
+        try {
+          const arr = JSON.parse(jsonLine.slice('CANDIDATES_JSON '.length));
+          if (Array.isArray(arr)) {
+            rawCandidates = arr.map((c: Record<string, unknown>) => ({
+              address:     String(c.address ?? '').toLowerCase(),
+              onFalcon7d:  Boolean(c.onFalcon7d),
+              tr90:        Number(c.tr90) || 0,
+              tpw:         Number(c.tpw) || 0,
+              closed:      Number(c.closed) || 0,
+              avgHoldDays: Number(c.avgHoldDays) || 0,
+              winRate:     Number(c.winRate) || 0,
+              pnl:         Number(c.pnl) || 0,
+            })).filter(c => /^0x[0-9a-f]{40}$/.test(c.address));
+          }
+        } catch (e) {
+          console.error('[dashboard] CANDIDATES_JSON parse failed, falling back to table parse:', e);
+        }
+      }
+      if (!rawCandidates) {
+        // Legacy fallback: extract the top "MACRO CANDIDATES" section (before
+        // "--- subset NOT on 7d ---") and split rows on whitespace.
+        // Row format: addr on7d tr90 t/wk closed hold_d >48h >7d wr pnl
+        let inTop = false;
+        const rawRows: string[] = [];
+        for (const ln of lines) {
+          if (/^========== MACRO CANDIDATES/.test(ln)) { inTop = true; continue; }
+          if (/^--- subset NOT on 7d/.test(ln))       { inTop = false; }
+          if (inTop && /^0x[0-9a-f]{40}/i.test(ln))   { rawRows.push(ln); }
+        }
+        rawCandidates = rawRows.map(row => {
+          const parts = row.trim().split(/\s+/);
+          return {
+            address:     (parts[0] || '').toLowerCase(),
+            onFalcon7d:  (parts[1] || '') === 'Y',
+            tr90:        Number(parts[2]) || 0,
+            tpw:         Number(parts[3]) || 0,
+            closed:      Number(parts[4]) || 0,
+            avgHoldDays: Number(parts[5]) || 0,
+            winRate:     Number(String(parts[8] ?? '').replace('%', '')) || 0,
+            pnl:         Number(parts[9]) || 0,
+          };
+        });
       }
 
       const store = readStore();
@@ -956,34 +1008,15 @@ export function startDashboard(): void {
       }
       const watchlistAddrs = new Set((store.watchlistTraders ?? []).map(w => w.address.toLowerCase()));
 
-      // Row format from macro_scan_90d.js:
-      //   addr on7d tr90 t/wk closed hold_d >48h >7d wr pnl
-      const candidates = rawRows.map(row => {
-        const parts = row.trim().split(/\s+/);
-        const addr   = (parts[0] || '').toLowerCase();
-        const on7d   = parts[1] || '';
-        const tr90   = Number(parts[2]) || 0;
-        const tpw    = Number(parts[3]) || 0;
-        const closed = Number(parts[4]) || 0;
-        const holdD  = Number(parts[5]) || 0;
-        const wrStr  = parts[8] || '';
-        const wr     = Number(String(wrStr).replace('%', '')) || 0;
-        const pnl    = Number(parts[9]) || 0;
-        const expPerTrade = closed > 0 ? pnl / closed : 0;
-        const sharpe = sharpeByAddr.has(addr) ? sharpeByAddr.get(addr)! : null;
-        const why    = `WR ${wr}% · hold ${holdD}d · ${tpw} trades/wk · ${closed} closed · PNL +$${pnl.toFixed(0)}`;
+      const candidates = rawCandidates.map(c => {
+        const expPerTrade = c.closed > 0 ? c.pnl / c.closed : 0;
+        const sharpe = sharpeByAddr.has(c.address) ? sharpeByAddr.get(c.address)! : null;
+        const why    = `WR ${c.winRate}% · hold ${c.avgHoldDays}d · ${c.tpw} trades/wk · ${c.closed} closed · PNL +$${c.pnl.toFixed(0)}`;
         return {
-          address: addr,
-          onFalcon7d: on7d === 'Y',
-          tr90,
-          tpw,
-          closed,
-          avgHoldDays: holdD,
-          winRate: wr,
-          pnl,
+          ...c,
           expPerTrade,
           sharpe,
-          alreadyWatchlisted: watchlistAddrs.has(addr),
+          alreadyWatchlisted: watchlistAddrs.has(c.address),
           why,
         };
       }).filter(c => c.closed >= 10);

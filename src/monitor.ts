@@ -38,7 +38,13 @@ function parseActivity(raw: RawActivityItem): ActivityTrade | null {
   const marketSlug = String(raw.slug ?? '');
   if (!marketSlug) return null;
 
-  const outcome = String(raw.outcome ?? 'Yes');
+  // No outcome → skip. Defaulting to 'Yes' (the old behavior) could open a
+  // position on the wrong side or close the wrong side's position on SELL.
+  const outcome = raw.outcome != null ? String(raw.outcome).trim() : '';
+  if (!outcome) {
+    console.warn(`[monitor] Skipping trade ${id} on ${marketSlug} — missing outcome field`);
+    return null;
+  }
   const size = Number(raw.size ?? 0);
 
   const marketTitle = String(raw.title ?? marketSlug);
@@ -86,7 +92,11 @@ export async function pollTrader(
   let newTrades = 0;
   let latestTimestamp = since;
 
-  for (const raw of items) {
+  // Process oldest-first. The API returns newest-first, which ran a SELL before
+  // its BUY when both landed in the same poll window — the close found no open
+  // position, the SELL was marked processed and lost, and the position lingered
+  // until threshold resolution or expiry.
+  for (const raw of [...items].reverse()) {
     // Advance the cursor from every item (TRADE, REDEEM, MERGE, etc.)
     const rawTs = String(raw.timestamp ?? '');
     if (rawTs && (!latestTimestamp || rawTs > latestTimestamp)) {

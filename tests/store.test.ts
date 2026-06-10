@@ -2,9 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 vi.mock('../src/config', () => ({
   CONFIG: {
-    DATA_FILE: ':memory:',
     DB_FILE: ':memory:',
-    FORCE_EXCLUDE_CATEGORIES: ['esports'],
     GAS_COST_PER_BUY: 0,
     SLIPPAGE_RATE: 0.02,
   },
@@ -42,12 +40,6 @@ describe('store: fresh DB bootstrap', () => {
     expect(s.watchlistTraders.length).toBe(5);
     expect(s.watchlistTraders.map(w => w.address)).toContain('0x8a6c6811e8937f9e8afc1b9249fa540262c30b3f');
     expect(s.watchlistTraders.find(w => w.label === 'DrPufferfish')?.copyEnabled).toBe(false);
-  });
-
-  it('seeds default leaderboardFilters', () => {
-    const s = store.readStore();
-    expect(s.leaderboardFilters.categories).toEqual([]);
-    expect(s.leaderboardFilters.minWinRate).toBe(0);
   });
 
   it('does not re-seed watchlist after it has rows', () => {
@@ -116,17 +108,48 @@ describe('store: watchlist CRUD persists through reload', () => {
   });
 });
 
-describe('store: writeStore full-snapshot round-trip', () => {
-  it('in-memory mutations via snapshot are persisted by writeStore', () => {
+describe('store: writeStore persists cleanup-state prunes', () => {
+  it('persists a processedTradeIds prune; trade tables come from targeted writes', () => {
+    store.markProcessed('p1');
+    store.markProcessed('p2');
+    store.addOpenTrade(makeTrade({ id: 'ws1', sourceTradeId: 'ws1src' }));
+
     const s = store.readStore();
-    s.openTrades.push(makeTrade({ id: 'ws1', sourceTradeId: 'ws1src' }));
-    s.excludedCategories.push('testcat');
+    s.processedTradeIds = s.processedTradeIds.filter(id => id !== 'p1');
     store.writeStore(s);
 
     store._resetStoreCache();
     const reloaded = store.readStore();
+    expect(reloaded.processedTradeIds).not.toContain('p1');
+    expect(reloaded.processedTradeIds).toContain('p2');
+    // The open trade was persisted by addOpenTrade's targeted write —
+    // writeStore no longer touches the trade tables.
     expect(reloaded.openTrades.find(t => t.id === 'ws1')).toBeDefined();
-    expect(reloaded.excludedCategories).toContain('testcat');
+  });
+});
+
+describe('store: runDailyCleanup traderHistory 90d prune', () => {
+  it('drops entries older than 90 days, keeps fresh ones', () => {
+    const oldTs   = new Date(Date.now() - 91 * 86_400_000).toISOString();
+    const freshTs = new Date(Date.now() -  1 * 86_400_000).toISOString();
+    store.appendTraderHistory('0xhist90', [
+      { transaction_hash: 'old1', timestamp: oldTs,   slug: 'm', side: 'BUY', type: 'TRADE' },
+      { transaction_hash: 'new1', timestamp: freshTs, slug: 'm', side: 'BUY', type: 'TRADE' },
+    ]);
+    store.runDailyCleanup();
+    store._resetStoreCache();
+    const h = store.readStore().traderHistory['0xhist90'];
+    expect(h.buys.map(b => b.transaction_hash)).toEqual(['new1']);
+  });
+
+  it('removes a trader whose history is entirely older than 90 days', () => {
+    const oldTs = new Date(Date.now() - 120 * 86_400_000).toISOString();
+    store.appendTraderHistory('0xgone', [
+      { transaction_hash: 'o1', timestamp: oldTs, slug: 'm', side: 'SELL', type: 'TRADE' },
+    ]);
+    store.runDailyCleanup();
+    store._resetStoreCache();
+    expect(store.readStore().traderHistory['0xgone']).toBeUndefined();
   });
 });
 

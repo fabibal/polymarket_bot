@@ -10,7 +10,6 @@ const { LONGSHOT_TRADER, OTHER_TRADER, activityFeed } = vi.hoisted(() => ({
 
 vi.mock('../src/config', () => ({
   CONFIG: {
-    DATA_FILE: ':memory:',
     DB_FILE: ':memory:',
     TRADE_AMOUNT: 5,
     ACTIVITY_LIMIT: 100,

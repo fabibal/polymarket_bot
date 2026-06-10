@@ -1,31 +1,12 @@
 /**
- * Thin wrapper around the Bullpen CLI.
- * Every public function spawns `bullpen <args> --output json` and parses stdout.
- *
- * Exception: getMarketPrice uses the Polymarket Gamma REST API directly
- * (faster, more reliable, no subprocess overhead).
+ * Polymarket HTTP API client (data-api, Gamma, CLOB) plus the VPN egress probe.
+ * Historically wrapped the Bullpen CLI; all CLI subprocess calls were removed —
+ * everything here is direct HTTPS.
  */
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import https from 'https';
 
-const execFileAsync = promisify(execFile);
-const BULLPEN_CMD = process.env.BULLPEN_CMD ?? 'bullpen';
-const TIMEOUT_MS = 30_000;
-const MAX_BUFFER = 10 * 1024 * 1024; // 10 MB — discover output can be ~1 MB
-
-async function run(args: string[]): Promise<unknown> {
-  try {
-    const { stdout } = await execFileAsync(BULLPEN_CMD, args, { timeout: TIMEOUT_MS, maxBuffer: MAX_BUFFER });
-    return JSON.parse(stdout.trim());
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`bullpen ${args.join(' ')} failed: ${message}`);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Response shapes (loosely typed — real CLI output may vary)
+// Response shapes (loosely typed — real API output may vary)
 // ---------------------------------------------------------------------------
 
 export interface RawActivityItem {
@@ -73,29 +54,36 @@ export async function getTraderActivity(
   address: string,
   limit: number,
   since?: string,
-  side?: 'buy' | 'sell'
 ): Promise<RawActivityItem[]> {
   const sinceMs = since ? new Date(since).getTime() : 0;
   const results: RawActivityItem[] = [];
+  let reachedSince = false;
+  let exhaustedPageCap = false;
 
   for (let page = 0; page < ACTIVITY_MAX_PAGES; page++) {
     const offset = page * ACTIVITY_PAGE_SIZE;
-    let url = `${DATA_API_BASE}/activity?user=${encodeURIComponent(address)}&limit=${ACTIVITY_PAGE_SIZE}&offset=${offset}`;
-    if (side) url += `&side=${side.toUpperCase()}`;
+    const url = `${DATA_API_BASE}/activity?user=${encodeURIComponent(address)}&limit=${ACTIVITY_PAGE_SIZE}&offset=${offset}`;
 
     let data: Array<Record<string, unknown>>;
     try {
       data = await httpsGet(url) as Array<Record<string, unknown>>;
-    } catch {
-      break;
+    } catch (err) {
+      // Mid-pagination failure while a cursor is active: returning partial
+      // results would let the caller advance the cursor to the newest fetched
+      // item, permanently dropping the unfetched older ones. Fail the whole
+      // poll instead — the caller retries next cycle with the cursor unmoved.
+      if (sinceMs > 0) throw err;
+      break; // no cursor (first poll): a partial backfill is acceptable
     }
     if (!Array.isArray(data) || data.length === 0) break;
 
-    let hitSince = false;
     for (const item of data) {
-      // API returns newest-first; stop once we reach items older than `since`
+      // API returns newest-first; stop once we reach items strictly older than
+      // `since`. Strict < (not <=): the API has 1-second timestamp resolution,
+      // so an item sharing the cursor's exact second may be one we haven't seen
+      // — include it and let processedTradeIds dedup the already-seen ones.
       const tsMs = typeof item.timestamp === 'number' ? item.timestamp * 1000 : 0;
-      if (sinceMs > 0 && tsMs <= sinceMs) { hitSince = true; break; }
+      if (sinceMs > 0 && tsMs < sinceMs) { reachedSince = true; break; }
 
       results.push({
         transaction_hash: item.transactionHash != null ? String(item.transactionHash) : undefined,
@@ -114,13 +102,27 @@ export async function getTraderActivity(
     }
 
     // NOTE: deliberately do NOT break on `results.length >= limit` here. Doing so
-    // truncated paging before reaching `hitSince`, so the caller's cursor could
+    // truncated paging before reaching `since`, so the caller's cursor could
     // advance past unseen trades and drop them permanently (H1). Page until we
-    // actually reach an item older than `since` (hitSince) or exhaust the pages.
-    if (hitSince || data.length < ACTIVITY_PAGE_SIZE) break;
+    // actually reach an item older than `since` or exhaust the pages.
+    if (reachedSince || data.length < ACTIVITY_PAGE_SIZE) break;
+    if (page === ACTIVITY_MAX_PAGES - 1) exhaustedPageCap = true;
   }
 
-  return results.slice(0, limit);
+  if (exhaustedPageCap && !reachedSince && sinceMs > 0) {
+    console.warn(
+      `[bullpen] activity page cap (${ACTIVITY_MAX_PAGES * ACTIVITY_PAGE_SIZE}) hit before reaching ` +
+      `cursor for ${address.slice(0, 10)}... — items older than the cap will be dropped`
+    );
+  }
+
+  // With an active cursor, return EVERYTHING newer than it. Slicing to `limit`
+  // here kept only the newest items while the caller still advanced the cursor
+  // past the dropped older ones — silently undoing the H1 fix above whenever
+  // >limit items accrued between polls (e.g. resume after downtime). The page
+  // cap bounds the batch at 1500. Without a cursor (first poll for a trader),
+  // keep the newest `limit` items as the initial-backfill bound, as before.
+  return sinceMs > 0 ? results : results.slice(0, limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,19 +182,6 @@ export async function getMarketPrice(slug: string): Promise<RawPriceResponse> {
   };
 }
 
-export interface RawGammaMarket {
-  id: string;
-  question: string;
-  slug: string;
-  outcomes: string;       // JSON string: '["Yes","No"]'
-  outcomePrices: string;  // JSON string: '["0.7","0.3"]'
-  volume: number;
-  volume24hr: number;
-  active: boolean;
-  closed: boolean;
-  events?: Array<{ slug: string; title: string; [key: string]: unknown }>;
-}
-
 export interface OrderbookDepth {
   bestAsk: number;
   bestBid: number;
@@ -250,36 +239,6 @@ export async function getOrderbookDepth(
   } catch {
     return null;
   }
-}
-
-export async function getGammaTrendingMarkets(): Promise<RawGammaMarket[]> {
-  const url = `${GAMMA_BASE}/markets?active=true&closed=false&order=volume&ascending=false&limit=10`;
-  const data = await httpsGet(url) as unknown[];
-  return Array.isArray(data) ? (data as RawGammaMarket[]) : [];
-}
-
-export interface RawProfileResponse {
-  address?: string;
-  volume?: string | number | null;
-  trades_count?: number | null;
-  win_rate?: number | null;        // Always null — Polymarket API does not expose win rate
-  biggest_win?: string | null;
-  account_age_days?: number | null;
-  name?: string | null;
-  pseudonym?: string | null;
-  recent_trades?: unknown[] | null;
-  error?: string;
-  [key: string]: unknown;
-}
-
-// NOTE: The Polymarket profile API never returns win_rate (always null).
-// Use only for trades_count / biggest_win display.
-export async function getTraderProfile(address: string): Promise<RawProfileResponse> {
-  return run([
-    'polymarket', 'data', 'profile',
-    address,           // positional arg — NOT --trades <ADDRESS>
-    '--output', 'json',
-  ]) as Promise<RawProfileResponse>;
 }
 
 /**

@@ -91,50 +91,20 @@ export interface TraderHistory {
   trades?: TraderHistoryEntry[];  // legacy — migrated to buys/sells on first read
 }
 
-export interface LeaderboardFilters {
-  categories: string[];  // empty = no filter; e.g. ['sports', 'crypto'] = match any
-  minWinRate: number;    // 0–1 fraction (0 = disabled)
-  minTrades: number;     // min trades in last 30d (0 = disabled)
-  minSharpe: number;     // min Falcon Sharpe ratio (0 = disabled)
-  minRoi: number;        // min Falcon ROI percentage (0 = disabled)
-}
-
-export interface LeaderboardStats {
-  candidatesChecked: number;
-  passedFilters: number;
-  trackedCount: number;
-  filters: LeaderboardFilters;
-  updatedAt: string;
-}
-
 export interface TradesStore {
+  // Frozen historical record (leaderboard removed 2026-05-29). Loaded read-only:
+  // the weekly macro scan updates tracked_traders externally and
+  // /api/discovery/candidates reads falconSharpe from it. Never persisted back.
   trackedTraders: LeaderboardTrader[];
-  excludedCategories: string[];        // market categories excluded from BUY simulation
-  leaderboardFilters: LeaderboardFilters;
-  lastLeaderboardStats?: LeaderboardStats;
   openTrades: SimulatedTrade[];
   closedTrades: SimulatedTrade[];
   processedTradeIds: string[];
   traderLastSeen: Record<string, string>;
-  traderLastOnLeaderboard: Record<string, string>; // when each address was last seen in top-50 candidates
   traderHistory: Record<string, TraderHistory>;  // accumulated raw activity per trader
-  lastLeaderboardUpdate: string;
   watchlistTraders: WatchlistTrader[];
-  // Shadow tracking for excluded traders: observe without copying.
-  shadowOpenTrades?: SimulatedTrade[];
+  // Frozen historical record (leaderboard removed 2026-05-29). Loaded read-only
+  // for /api/shadow/stats; never persisted back.
   shadowClosedTrades?: SimulatedTrade[];
-  processedShadowIds?: string[];
-  shadowLastSeen?: Record<string, string>;
-}
-
-export interface ShadowTraderStats {
-  address: string;
-  username?: string;
-  openCount: number;
-  wins: number;
-  losses: number;
-  pnl: number;
-  lastSeen?: string;
 }
 
 export interface DashboardStats {

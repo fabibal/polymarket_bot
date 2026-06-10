@@ -1,7 +1,7 @@
 import { pollTrader, resetSkipDedup } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
-import { readStore, runDailyCleanup, startAutoFlush, stopAutoFlush, flushIfDirty, initInsertionCounter, updateOpenTradeDepth } from './store';
+import { readStore, runDailyCleanup, startWalCheckpoint, stopWalCheckpoint, initInsertionCounter, updateOpenTradeDepth } from './store';
 import { getOrderbookDepth } from './bullpen';
 import { CONFIG } from './config';
 
@@ -52,8 +52,15 @@ async function runPollingCycle(): Promise<void> {
   let totalNew = 0;
   for (const w of watchlistTraders) {
     const trader = { rank: 0, address: w.address, weeklyPnl: 0 };
-    const n = await pollTrader(trader, { copyEnabled: w.copyEnabled, source: 'watchlist', tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT });
-    totalNew += n;
+    try {
+      const n = await pollTrader(trader, { copyEnabled: w.copyEnabled, source: 'watchlist', tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT });
+      totalNew += n;
+    } catch (err) {
+      // Per-trader isolation: one trader's failure (e.g. an SQL error mid-poll)
+      // must not abort the remaining traders this cycle. The failed trader's
+      // cursor doesn't advance, so its items are refetched next cycle.
+      console.error(`[bot] Poll failed for ${w.address.slice(0, 10)}...:`, err instanceof Error ? err.message : err);
+    }
     // Brief pause between traders to avoid rate-limiting
     await new Promise(r => setTimeout(r, 1_000));
   }
@@ -89,10 +96,9 @@ async function main(): Promise<void> {
   // so post-restart trades sort correctly in FIFO close queries.
   initInsertionCounter();
 
-  // Background debounced flusher: persists pending store mutations every 60s
-  // to collapse bursts of metric/cache updates into one disk write. Critical
-  // financial mutations still flush immediately via writeStore().
-  startAutoFlush(60_000);
+  // Periodic PASSIVE WAL checkpoint (all store mutations persist immediately
+  // via targeted SQL — this only keeps the WAL file from growing unbounded).
+  startWalCheckpoint(60_000);
 
   startDashboard();
   scheduleMidnightCleanup();
@@ -120,24 +126,22 @@ async function main(): Promise<void> {
 }
 
 function shutdown(signal: string): void {
-  console.log(`[bot] Received ${signal} — flushing pending store writes and exiting.`);
-  try { stopAutoFlush(); } catch (err) { console.error('[bot] flush on shutdown failed:', err); }
+  // All store writes are persisted at mutation time — nothing to flush.
+  console.log(`[bot] Received ${signal} — exiting.`);
+  try { stopWalCheckpoint(); } catch (err) { console.error('[bot] shutdown cleanup failed:', err); }
   process.exit(0);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('exit', () => { try { flushIfDirty(); } catch {} });
 
 process.on('uncaughtException', (err) => {
   console.error('[fatal] uncaughtException:', err instanceof Error ? err.stack || err.message : err);
-  try { flushIfDirty(); } catch {}
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
   console.error('[fatal] unhandledRejection:', reason instanceof Error ? reason.stack || reason.message : reason);
-  try { flushIfDirty(); } catch {}
   process.exit(1);
 });
 

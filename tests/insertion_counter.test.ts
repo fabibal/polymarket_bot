@@ -6,9 +6,7 @@ import Database from 'better-sqlite3';
 
 vi.mock('../src/config', () => ({
   CONFIG: {
-    DATA_FILE: ':memory:',
     DB_FILE: ':memory:',
-    FORCE_EXCLUDE_CATEGORIES: [],
     GAS_COST_PER_BUY: 0,
     SLIPPAGE_RATE: 0.02,
   },

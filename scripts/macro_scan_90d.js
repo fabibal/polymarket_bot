@@ -182,4 +182,21 @@ async function pool(items, fn, n) {
     const m=r.m;
     console.log(`${r.addr}  tr=${m.trades_90d} t/wk=${m.trades_per_week.toFixed(1)} closed=${m.closed} hold=${(m.avg_hold_d||0).toFixed(1)}d >48h=${((m.pct_over_48h||0)*100).toFixed(0)}% wr=${((m.wr||0)*100).toFixed(0)}% pnl=$${(m.pnl||0).toFixed(0)} open=${m.open_remaining}`);
   }
+
+  // Machine-readable candidate list for the dashboard (/api/discovery/candidates).
+  // The human table above is position-parsed by weekly-macro-scan.sh — keep it
+  // unchanged; the dashboard prefers this single JSON line instead so a table
+  // format change can't silently shift its fields. Field meanings match the
+  // table columns (winRate is a 0-100 percentage, avgHoldDays in days).
+  const candidatesJson = macro.slice(0,20).map(r => ({
+    address:    r.addr,
+    onFalcon7d: set7.has(r.addr),
+    tr90:       r.m.trades_90d,
+    tpw:        Number(r.m.trades_per_week.toFixed(1)),
+    closed:     r.m.closed,
+    avgHoldDays:Number((r.m.avg_hold_d||0).toFixed(1)),
+    winRate:    Number(((r.m.wr||0)*100).toFixed(0)),
+    pnl:        Number((r.m.pnl||0).toFixed(0)),
+  }));
+  console.log(`\nCANDIDATES_JSON ${JSON.stringify(candidatesJson)}`);
 })().catch(e=>{console.error('FATAL',e); process.exit(1);});

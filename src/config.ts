@@ -5,7 +5,6 @@ export const CONFIG = {
   PRICE_UPDATE_INTERVAL_MS: parseInt(process.env.PRICE_UPDATE_INTERVAL_MS ?? '300000', 10),
   ACTIVITY_LIMIT: 100,
   PORT: parseInt(process.env.PORT ?? '8080', 10),
-  DATA_FILE: process.env.DATA_FILE ?? './data/trades.json',
   DB_FILE: process.env.DB_FILE ?? './data/store.db',
   // If price crosses this threshold treat the market as resolved
   RESOLVED_THRESHOLD: 0.93,

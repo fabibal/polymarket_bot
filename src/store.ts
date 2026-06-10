@@ -1,17 +1,14 @@
 /**
- * SQLite-backed trades store. Same public API as the previous JSON store:
- * readStore() returns a full in-memory snapshot of type TradesStore, and
- * writeStore(store) persists that snapshot transactionally. Hot-path
- * mutations (addOpenTrade, closeOpenTrade, resolveByPrice, markProcessed,
- * and their shadow siblings) do direct SQL writes and mirror the in-memory
- * cache so callers observing the snapshot stay consistent.
+ * SQLite-backed trades store. readStore() returns a full in-memory snapshot
+ * of type TradesStore. Every mutation (addOpenTrade, closeOpenTrade,
+ * resolveByPrice, markProcessed, watchlist CRUD, appendTraderHistory, ...)
+ * does a targeted, transactional SQL write at call time and mirrors the
+ * in-memory cache, so the DB is always current — there is no deferred-flush
+ * path. writeStore(store) bulk-rewrites only the cleanup-state datasets
+ * (processed_trade_ids, trader_history) and exists for runDailyCleanup's
+ * in-memory prunes.
  *
  * Crash-safety: WAL mode. Atomicity: per-mutation transactions.
- *
- * Migration scope (Phase 1): only config-like rows are preserved on cutover
- * from the old JSON format; operational state (open/closed trades, dedup
- * IDs, history, caches) starts empty. The legacy-format runtime migrations
- * that lived in the old readStore() have been removed.
  */
 import fs from 'fs';
 import path from 'path';
@@ -20,11 +17,9 @@ import type { Database as Db } from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
 import {
   TradesStore, SimulatedTrade, LeaderboardTrader, WatchlistTrader,
-  TraderHistoryEntry, LeaderboardFilters, LeaderboardStats,
+  TraderHistoryEntry,
 } from './types';
 import { CONFIG } from './config';
-
-const DEFAULT_FILTERS: LeaderboardFilters = { categories: [], minWinRate: 0, minTrades: 0, minSharpe: 0, minRoi: 0 };
 
 const WATCHLIST_DEFAULTS: WatchlistTrader[] = [
   { address: '0x8a6c6811e8937f9e8afc1b9249fa540262c30b3f', label: 'MultiSport-Analytics', addedAt: new Date(0).toISOString(), copyEnabled: true,  copyAmount: 5 },
@@ -36,25 +31,17 @@ const WATCHLIST_DEFAULTS: WatchlistTrader[] = [
 
 const EMPTY_STORE = (): TradesStore => ({
   trackedTraders: [],
-  excludedCategories: [],
-  leaderboardFilters: { ...DEFAULT_FILTERS },
   openTrades: [],
   closedTrades: [],
   processedTradeIds: [],
   traderLastSeen: {},
-  traderLastOnLeaderboard: {},
   traderHistory: {},
-  lastLeaderboardUpdate: new Date(0).toISOString(),
   watchlistTraders: [],
-  shadowOpenTrades: [],
   shadowClosedTrades: [],
-  processedShadowIds: [],
-  shadowLastSeen: {},
 });
 
 const PROCESSED_IDS_CAP = 100_000;
 const PROCESSED_IDS_WARN = 80_000;
-const SHADOW_IDS_CAP = 50_000;
 const SIDE_CAP = 100;
 
 // ── Schema ──────────────────────────────────────────────────────────────────
@@ -263,8 +250,7 @@ CREATE INDEX IF NOT EXISTS idx_skipped_reason ON skipped_trades (skip_reason, sk
 let db: Db | null = null;
 let dbPathOverride: string | null = null;
 let cachedStore: TradesStore | null = null;
-let isDirty = false;
-let flushTimer: NodeJS.Timeout | null = null;
+let checkpointTimer: NodeJS.Timeout | null = null;
 let insertionCounter = 0; // monotonic counter for FIFO ordering in-session
 
 function getDb(): Db {
@@ -350,11 +336,6 @@ function seedIfFresh(d: Db): void {
     });
     tx();
   }
-  // leaderboardFilters singleton
-  const f = d.prepare(`SELECT value FROM meta WHERE key = 'leaderboardFilters'`).get() as { value: string } | undefined;
-  if (!f) {
-    d.prepare(`INSERT INTO meta (key, value) VALUES (?, ?)`).run('leaderboardFilters', JSON.stringify(DEFAULT_FILTERS));
-  }
 }
 
 /** Test hook: point the store at a fresh DB (file path or ':memory:'). */
@@ -362,7 +343,6 @@ export function _setDbPathForTests(p: string | null): void {
   if (db) { db.close(); db = null; }
   dbPathOverride = p;
   cachedStore = null;
-  isDirty = false;
   insertionCounter = 0;
 }
 
@@ -374,7 +354,6 @@ export function _getInsertionCounter(): number {
 /** Test hook: drop the in-memory snapshot cache. */
 export function _resetStoreCache(): void {
   cachedStore = null;
-  isDirty = false;
 }
 
 /** Close the DB. Intended for shutdown paths and tests. */
@@ -493,6 +472,9 @@ function loadSnapshot(): TradesStore {
   const d = getDb();
   const s = EMPTY_STORE();
 
+  // Read-only: tracked_traders is frozen runtime-side (leaderboard removed
+  // 2026-05-29) but still updated externally by the weekly macro scan; loaded
+  // so /api/discovery/candidates can enrich candidates with falconSharpe.
   s.trackedTraders = (d.prepare('SELECT * FROM tracked_traders ORDER BY rank ASC').all() as any[]).map(r => {
     const t: LeaderboardTrader = {
       rank: r.rank, address: r.address,
@@ -507,8 +489,6 @@ function loadSnapshot(): TradesStore {
     if (r.tracked_since   != null) t.trackedSince   = r.tracked_since;
     return t;
   });
-
-  s.excludedCategories = (d.prepare('SELECT category FROM excluded_categories').all() as Array<{ category: string }>).map(r => r.category);
 
   s.watchlistTraders = (d.prepare('SELECT * FROM watchlist_traders ORDER BY added_at ASC').all() as any[]).map(r => {
     const w: WatchlistTrader = {
@@ -525,7 +505,7 @@ function loadSnapshot(): TradesStore {
 
   s.openTrades     = (d.prepare('SELECT * FROM open_trades     ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
   s.closedTrades   = (d.prepare('SELECT * FROM closed_trades   ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
-  s.shadowOpenTrades   = (d.prepare('SELECT * FROM shadow_open_trades   ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
+  // Read-only: frozen historical record for /api/shadow/stats.
   s.shadowClosedTrades = (d.prepare('SELECT * FROM shadow_closed_trades ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
 
   s.processedTradeIds  = (d.prepare('SELECT id FROM processed_trade_ids  ORDER BY added_order ASC').all() as Array<{ id: string }>).map(r => r.id);
@@ -557,71 +537,21 @@ function loadSnapshot(): TradesStore {
     if (!s.traderHistory[r.address]) s.traderHistory[r.address] = { buys: [], sells: [], lastFetched: r.last_fetched };
   }
 
-  const fr = d.prepare(`SELECT value FROM meta WHERE key = 'leaderboardFilters'`).get() as { value: string } | undefined;
-  if (fr) try { s.leaderboardFilters = { ...DEFAULT_FILTERS, ...JSON.parse(fr.value) }; } catch {}
-
-  const lu = d.prepare(`SELECT value FROM meta WHERE key = 'lastLeaderboardUpdate'`).get() as { value: string } | undefined;
-  if (lu) s.lastLeaderboardUpdate = lu.value;
-
-  const ls = d.prepare(`SELECT value FROM meta WHERE key = 'lastLeaderboardStats'`).get() as { value: string } | undefined;
-  if (ls) try { s.lastLeaderboardStats = JSON.parse(ls.value); } catch {}
-
   return s;
 }
 
-// ── Snapshot persist (full rewrite in one transaction) ──────────────────────
+// ── Cleanup-state persist ───────────────────────────────────────────────────
+// Rewrites ONLY the two datasets runDailyCleanup prunes through the in-memory
+// snapshot: processed_trade_ids and trader_history. Hot tables (open_trades,
+// closed_trades, watchlist_traders, trader_last_seen, skipped_trades) are
+// persisted by targeted SQL at mutation time and are NEVER bulk-rewritten —
+// the old full delete+reinsert of every table (30k+ closed_trades rows) on
+// each 60s flush was the main driver of unbounded WAL growth. Frozen
+// historical tables (tracked_traders — externally updated by the weekly macro
+// scan —, excluded_traders, excluded_categories, shadow_*) are never written.
 function persistSnapshot(store: TradesStore): void {
   const d = getDb();
   const tx = d.transaction(() => {
-    d.prepare('DELETE FROM tracked_traders').run();
-    const tt = d.prepare(
-      `INSERT INTO tracked_traders (address, rank, username, weekly_pnl, total_volume, inactive,
-         falcon_win_rate, falcon_roi, falcon_sharpe, tracked_since) VALUES (?,?,?,?,?,?,?,?,?,?)`);
-    for (const t of store.trackedTraders) {
-      tt.run(
-        t.address, t.rank, t.username ?? null, t.weeklyPnl,
-        t.totalVolume ?? null, t.inactive == null ? null : (t.inactive ? 1 : 0),
-        t.falconWinRate ?? null, t.falconRoi ?? null, t.falconSharpe ?? null,
-        t.trackedSince ?? null,
-      );
-    }
-
-    // excluded_traders is no longer maintained at runtime (leaderboard removed
-    // 2026-05-29) — left frozen as a historical record, never rewritten here.
-
-    d.prepare('DELETE FROM excluded_categories').run();
-    const ec = d.prepare('INSERT INTO excluded_categories (category) VALUES (?)');
-    // De-dupe forced categories that may already be present.
-    const seenCat = new Set<string>();
-    for (const c of store.excludedCategories) if (!seenCat.has(c)) { ec.run(c); seenCat.add(c); }
-
-    d.prepare('DELETE FROM watchlist_traders').run();
-    const wt = d.prepare(
-      `INSERT INTO watchlist_traders (address, label, added_at, copy_enabled, copy_amount,
-         falcon_win_rate, falcon_roi, falcon_sharpe) VALUES (?,?,?,?,?,?,?,?)`);
-    for (const w of store.watchlistTraders) {
-      wt.run(w.address, w.label ?? null, w.addedAt, w.copyEnabled ? 1 : 0, w.copyAmount,
-             w.falconWinRate ?? null, w.falconRoi ?? null, w.falconSharpe ?? null);
-    }
-
-    d.prepare('DELETE FROM open_trades').run();
-    const oi = d.prepare(`INSERT INTO open_trades ${OPEN_INSERT_COLS} VALUES ${OPEN_INSERT_PLACEHOLDERS}`);
-    let order = 1;
-    for (const t of store.openTrades) oi.run(...openTradeRowParams(t, order++));
-
-    d.prepare('DELETE FROM closed_trades').run();
-    const ci = d.prepare(`INSERT INTO closed_trades ${CLOSED_INSERT_COLS} VALUES ${CLOSED_INSERT_PLACEHOLDERS}`);
-    order = 1;
-    for (const t of store.closedTrades) ci.run(...closedTradeRowParams(t, order++));
-
-    d.prepare('DELETE FROM shadow_open_trades').run();
-    const soi = d.prepare(`INSERT INTO shadow_open_trades ${OPEN_INSERT_COLS} VALUES ${OPEN_INSERT_PLACEHOLDERS}`);
-    order = 1;
-    for (const t of (store.shadowOpenTrades ?? [])) soi.run(...openTradeRowParams(t, order++));
-
-    // shadow_closed_trades is frozen historical (leaderboard removed 2026-05-29):
-    // loaded read-only at startup for /api/shadow/stats, never rewritten here.
-
     d.prepare('DELETE FROM processed_trade_ids').run();
     const pi = d.prepare('INSERT INTO processed_trade_ids (id, added_order) VALUES (?,?)');
     {
@@ -629,10 +559,6 @@ function persistSnapshot(store: TradesStore): void {
       const seen = new Set<string>();
       for (const id of store.processedTradeIds) if (!seen.has(id)) { pi.run(id, i++); seen.add(id); }
     }
-
-    d.prepare('DELETE FROM trader_last_seen').run();
-    const tls = d.prepare('INSERT INTO trader_last_seen (address, timestamp) VALUES (?,?)');
-    for (const [a, ts] of Object.entries(store.traderLastSeen ?? {})) tls.run(a, ts);
 
     d.prepare('DELETE FROM trader_history').run();
     d.prepare('DELETE FROM trader_history_meta').run();
@@ -648,12 +574,6 @@ function persistSnapshot(store: TradesStore): void {
       for (const s of h.sells ?? []) { if (!s.transaction_hash || seenS.has(s.transaction_hash)) continue; seenS.add(s.transaction_hash);
         thi.run(addr, 'SELL', s.transaction_hash, s.timestamp, s.slug, s.title ?? null, s.outcome ?? null, s.type, s.price ?? null, s.size ?? null); }
     }
-
-    const setMeta = d.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)');
-    setMeta.run('leaderboardFilters', JSON.stringify(store.leaderboardFilters));
-    setMeta.run('lastLeaderboardUpdate', store.lastLeaderboardUpdate);
-    if (store.lastLeaderboardStats) setMeta.run('lastLeaderboardStats', JSON.stringify(store.lastLeaderboardStats));
-    else d.prepare(`DELETE FROM meta WHERE key = 'lastLeaderboardStats'`).run();
   });
   tx();
 }
@@ -667,38 +587,26 @@ export function readStore(): TradesStore {
 
 export function writeStore(store: TradesStore): void {
   cachedStore = store;
-  isDirty = false;
   persistSnapshot(store);
 }
 
-export function markDirty(store: TradesStore): void {
-  cachedStore = store;
-  isDirty = true;
-}
-
-export function flushIfDirty(): void {
-  if (isDirty && cachedStore) {
-    persistSnapshot(cachedStore);
-    isDirty = false;
-  }
-}
-
-export function startAutoFlush(intervalMs: number = 60_000): void {
-  if (flushTimer) return;
-  flushTimer = setInterval(() => {
-    flushIfDirty();
-    // Periodic PASSIVE checkpoint keeps the WAL from growing unbounded across
-    // multi-day uptime — the startup TRUNCATE alone let it reach ~38MB by
-    // 2026-06-03. PASSIVE never blocks on readers and is a no-op if it can't
-    // reclaim, so it is safe to run every cycle.
+/**
+ * Periodic PASSIVE WAL checkpoint. All store mutations are persisted by
+ * targeted SQL at call time, so there is nothing to flush — this timer only
+ * keeps the WAL from growing unbounded across multi-day uptime (the startup
+ * TRUNCATE alone let it reach ~38MB by 2026-06-03). PASSIVE never blocks on
+ * readers and is a no-op if it can't reclaim, so it is safe to run every cycle.
+ */
+export function startWalCheckpoint(intervalMs: number = 60_000): void {
+  if (checkpointTimer) return;
+  checkpointTimer = setInterval(() => {
     try { getDb().pragma('wal_checkpoint(PASSIVE)'); } catch { /* non-fatal */ }
   }, intervalMs);
-  if (typeof flushTimer.unref === 'function') flushTimer.unref();
+  if (typeof checkpointTimer.unref === 'function') checkpointTimer.unref();
 }
 
-export function stopAutoFlush(): void {
-  if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
-  flushIfDirty();
+export function stopWalCheckpoint(): void {
+  if (checkpointTimer) { clearInterval(checkpointTimer); checkpointTimer = null; }
 }
 
 // ── Targeted mutations (direct SQL + cache mirror) ─────────────────────────
@@ -859,8 +767,6 @@ export function updateOpenTradePrices(
   const stmt = d.prepare('UPDATE open_trades SET current_price = ?, unrealized_pnl = ? WHERE id = ?');
   const tx = d.transaction(() => { for (const u of updates) stmt.run(u.currentPrice, u.unrealizedPnl, u.id); });
   tx();
-  // Still mark dirty so any callers that also mutated through the snapshot (besides prices) get flushed.
-  isDirty = true;
 }
 
 export function resolveByPrice(
@@ -895,59 +801,6 @@ export function resolveByPrice(
   tx();
 }
 
-// Shadow variants ---------------------------------------------------------
-
-export function updateShadowPrices(
-  updates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }>,
-): void {
-  if (updates.length === 0) return;
-  const store = readStore();
-  if (!store.shadowOpenTrades) return;
-  for (const u of updates) {
-    const t = store.shadowOpenTrades.find(x => x.id === u.id);
-    if (t) { t.currentPrice = u.currentPrice; t.unrealizedPnl = u.unrealizedPnl; }
-  }
-  const d = getDb();
-  const stmt = d.prepare('UPDATE shadow_open_trades SET current_price = ?, unrealized_pnl = ? WHERE id = ?');
-  const tx = d.transaction(() => { for (const u of updates) stmt.run(u.currentPrice, u.unrealizedPnl, u.id); });
-  tx();
-  isDirty = true;
-}
-
-export function resolveShadowByPrice(
-  toResolve: Array<{ id: string; exitPrice: number }>,
-  status: 'resolved' | 'expired' = 'resolved',
-): void {
-  if (toResolve.length === 0) return;
-  const store = readStore();
-  if (!store.shadowOpenTrades) return;
-  if (!store.shadowClosedTrades) store.shadowClosedTrades = [];
-  const closedAt = new Date().toISOString();
-  const closedMs = new Date(closedAt).getTime();
-  const resolved: SimulatedTrade[] = [];
-  store.shadowOpenTrades = store.shadowOpenTrades.filter(t => {
-    const r = toResolve.find(x => x.id === t.id);
-    if (!r) return true;
-    t.status = status;
-    t.exitPrice = r.exitPrice;
-    t.realizedPnl = (r.exitPrice - t.entryPrice) * t.simulatedShares;
-    t.closedAt = closedAt;
-    t.holdingPeriodMs = closedMs - new Date(t.timestamp).getTime();
-    applyExitCosts(t, r.exitPrice);
-    resolved.push(t);
-    return false;
-  });
-  store.shadowClosedTrades.push(...resolved);
-
-  const d = getDb();
-  const del = d.prepare('DELETE FROM shadow_open_trades WHERE id = ?');
-  const insClosed = d.prepare(`INSERT INTO shadow_closed_trades ${CLOSED_INSERT_COLS} VALUES ${CLOSED_INSERT_PLACEHOLDERS}`);
-  const tx = d.transaction(() => {
-    for (const t of resolved) { del.run(t.id); insClosed.run(...closedTradeRowParams(t, insertionCounter++)); }
-  });
-  tx();
-}
-
 export function markProcessed(id: string): void {
   const store = readStore();
   if (store.processedTradeIds.includes(id)) return;
@@ -966,19 +819,6 @@ export function markProcessed(id: string): void {
     }
   });
   tx();
-}
-
-export function setCategoryExclusion(category: string, excluded: boolean): void {
-  const store = readStore();
-  if (!store.excludedCategories) store.excludedCategories = [];
-  if (excluded) {
-    if (!store.excludedCategories.includes(category)) store.excludedCategories.push(category);
-  } else {
-    store.excludedCategories = store.excludedCategories.filter(c => c !== category);
-  }
-  const d = getDb();
-  if (excluded) d.prepare('INSERT OR IGNORE INTO excluded_categories (category) VALUES (?)').run(category);
-  else          d.prepare('DELETE FROM excluded_categories WHERE category = ?').run(category);
 }
 
 export function setTraderLastSeen(address: string, timestamp: string): void {
@@ -1027,12 +867,6 @@ export function appendTraderHistory(address: string, items: TraderHistoryEntry[]
     d.prepare('INSERT OR REPLACE INTO trader_history_meta (address, last_fetched) VALUES (?,?)').run(address, lastFetched);
   });
   tx();
-}
-
-export function setLeaderboardFilters(filters: LeaderboardFilters): void {
-  const store = readStore();
-  store.leaderboardFilters = filters;
-  getDb().prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)').run('leaderboardFilters', JSON.stringify(filters));
 }
 
 // Watchlist ---------------------------------------------------------------
@@ -1125,7 +959,6 @@ export function runDailyCleanup(): void {
 
   const store = readStore();
   const now = Date.now();
-  const cutoff7d  = now - 7 * 86_400_000;
 
   // closed_trades archival/pruning was removed 2026-05-27: query perf at 30k+
   // rows is ~12ms and disk is 1TB free, so keeping the full history in-DB is
@@ -1135,7 +968,7 @@ export function runDailyCleanup(): void {
   // 2. Trim processedTradeIds: drop IDs whose underlying trade is no longer referenced.
   //
   // CURSOR DEPENDENCY (L1) — this trim is only safe because of the per-trader
-  // `since` cursor (trader_last_seen / shadow_last_seen). A processed-ID for a
+  // `since` cursor (trader_last_seen). A processed-ID for a
   // trade that was fetched-but-skipped (depth gate, wallet cap, entry cap, price
   // filter) survives here only via traderHistory, which is itself capped at
   // SIDE_CAP per side. Once a skipped trade's hash ages out of that cap, this
@@ -1164,30 +997,26 @@ export function runDailyCleanup(): void {
     console.log(`[cleanup] processedTradeIds: ${before} → ${store.processedTradeIds.length}`);
   }
 
-  const shadowRefIds = new Set<string>();
-  for (const t of store.shadowOpenTrades   ?? []) shadowRefIds.add(t.sourceTradeId);
-  for (const t of store.shadowClosedTrades ?? []) shadowRefIds.add(t.sourceTradeId);
-  if (Array.isArray(store.processedShadowIds)) {
-    const before = store.processedShadowIds.length;
-    store.processedShadowIds = store.processedShadowIds.filter(id => shadowRefIds.has(id));
-    if (store.processedShadowIds.length > SHADOW_IDS_CAP) {
-      store.processedShadowIds = store.processedShadowIds.slice(-SHADOW_IDS_CAP);
-    }
-    console.log(`[cleanup] processedShadowIds: ${before} → ${store.processedShadowIds.length}`);
+  // 3. Prune traderHistory entries older than 90 days. (The previous prune
+  // keyed on traderLastOnLeaderboard, which nothing populates since the
+  // leaderboard removal 2026-05-29 — it could never fire.) SIDE_CAP bounds the
+  // per-side count, but entries for removed watchlist traders would otherwise
+  // sit forever; no consumer looks further back than 30 days.
+  const cutoff90d = now - 90 * 86_400_000;
+  const keepEntry = (e: TraderHistoryEntry) => {
+    const t = new Date(e.timestamp).getTime();
+    return Number.isNaN(t) || t >= cutoff90d; // unparseable timestamp: keep (safe)
+  };
+  let prunedEntries = 0;
+  for (const [addr, hist] of Object.entries(store.traderHistory ?? {})) {
+    const buys  = (hist.buys  ?? []).filter(keepEntry);
+    const sells = (hist.sells ?? []).filter(keepEntry);
+    prunedEntries += (hist.buys?.length ?? 0) - buys.length
+                   + (hist.sells?.length ?? 0) - sells.length;
+    if (buys.length === 0 && sells.length === 0) delete store.traderHistory[addr];
+    else store.traderHistory[addr] = { ...hist, buys, sells };
   }
-
-  // 3. Prune traderHistory for traders absent from leaderboard for 7+ days.
-  const lastOnLb = store.traderLastOnLeaderboard ?? {};
-  let pruned = 0;
-  for (const addr of Object.keys(store.traderHistory ?? {})) {
-    const lastSeen = lastOnLb[addr];
-    if (!lastSeen) continue;
-    if (new Date(lastSeen).getTime() < cutoff7d) {
-      delete store.traderHistory[addr];
-      pruned++;
-    }
-  }
-  console.log(`[cleanup] traderHistory: pruned ${pruned} stale trader(s), ${Object.keys(store.traderHistory).length} remaining`);
+  console.log(`[cleanup] traderHistory: pruned ${prunedEntries} entr(y/ies) older than 90d, ${Object.keys(store.traderHistory).length} trader(s) remaining`);
 
   writeStore(store);
   console.log('[cleanup] Daily maintenance complete.');

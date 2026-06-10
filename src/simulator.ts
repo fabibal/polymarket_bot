@@ -1,7 +1,10 @@
 /**
  * Periodically fetches current prices for all open simulated positions
  * and updates unrealized PNL. Two auto-close conditions:
- *   1. Price threshold: ≥0.93 (WIN) or ≤0.07 (LOSS) → status 'resolved'
+ *   1. Price threshold: ≥0.93 (WIN) or ≤0.07 (LOSS) → status 'resolved' —
+ *      only once the position is at least one price-update interval old, so an
+ *      entry already near the threshold (e.g. a favorite bought at 0.95) isn't
+ *      instantly booked as a guaranteed win/loss on the very next sweep.
  *   2. Max hold age: older than MAX_HOLD_DAYS → closed at current price, status 'expired'
  */
 import { getMarketPrice } from './bullpen';
@@ -100,6 +103,12 @@ export async function updatePrices(): Promise<void> {
     const resolutions: Array<{ id: string; exitPrice: number }> = [];
     const staleResolutions: Array<{ id: string; exitPrice: number }> = [];
     const maxAgeMs = CONFIG.MAX_HOLD_DAYS * 86_400_000;
+    // Threshold resolution requires the position to have lived through at least
+    // one full price-update cycle. Without this, an entry at/near the threshold
+    // (watchlist has no MAX_PRICE filter) was resolved at exitPrice 1/0 on the
+    // first sweep after open, booking a guaranteed win/loss the real market
+    // hadn't decided yet and biasing the go-live statistics.
+    const minResolveAgeMs = CONFIG.PRICE_UPDATE_INTERVAL_MS;
     const nowMs = Date.now();
 
     // Process in concurrent batches to reduce total wall-clock time.
@@ -145,9 +154,9 @@ export async function updatePrices(): Promise<void> {
           for (const trade of related) {
             const unrealizedPnl = (currentPrice - trade.entryPrice) * trade.simulatedShares;
             const ageMs = nowMs - new Date(trade.timestamp).getTime();
-            if (currentPrice >= CONFIG.RESOLVED_THRESHOLD) {
+            if (currentPrice >= CONFIG.RESOLVED_THRESHOLD && ageMs >= minResolveAgeMs) {
               resolutions.push({ id: trade.id, exitPrice: 1 });
-            } else if (currentPrice <= 1 - CONFIG.RESOLVED_THRESHOLD) {
+            } else if (currentPrice <= 1 - CONFIG.RESOLVED_THRESHOLD && ageMs >= minResolveAgeMs) {
               resolutions.push({ id: trade.id, exitPrice: 0 });
             } else if (ageMs > maxAgeMs) {
               staleResolutions.push({ id: trade.id, exitPrice: currentPrice });
