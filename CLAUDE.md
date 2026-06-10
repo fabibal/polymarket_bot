@@ -49,13 +49,82 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
   **skips the copy** and instead records the would-be entry in the `skipped_trades` table with
   `skip_reason='longshot_filter_0x12d6'`. Record-only — no PnL lifecycle. Logged as
   `skip <slug> entry=<price> trader=0x12d6 reason=longshot_filter`. The check lives at the top
-  of the BUY branch in `monitor.ts` (before wallet/entry-cap/depth gates). Rationale: this
-  trader's sub-$0.10 longshots are a suspected losing pattern; the carve-out stops copying them
-  while `skipped_trades` preserves count + cumulative would-be notional so the pattern can be
+  of the BUY branch in `monitor.ts` (before wallet/entry-cap/depth gates). Rationale
+  (re-verified 2026-06-10 on Gamma-corrected data after the threshold-resolution fix): the
+  original justification used stats contaminated by the insta-resolution artifact, but the
+  conclusion survives clean accounting — all-time 89 sub-$0.10 trades, corrected net ≈ -$196;
+  0 of 57 ride-to-resolution longshots won (~2 expected at fair pricing); the trader's own
+  later activity (0 REDEEMs, 1 SELL at a loss) confirms the booked outcomes. The carve-out
+  stays; `skipped_trades` preserves count + cumulative would-be notional so the pattern can be
   monitored for change over time. Dashboard surfaces it via `/api/stats`
   (`longshotSkipCount`, `longshotSkipNotional`) and the "🚫 Longshot Skips" card. This is the
   ONLY per-trader filter override; to retire it, drop the `monitor.ts` block and the two config
   keys. Other watchlist traders are unaffected.
+- **Threshold resolution (reworked 2026-06-10, `src/simulator.ts`):** positions at price
+  ≥0.93 / ≤0.07 are no longer blindly proxy-booked at $1/$0. Three-way decision
+  (`decideThresholdResolution`, pure + unit-tested): (1) Gamma-confirmed resolution
+  (market `closed` AND all `outcomePrices` pinned to 0/1, `isMarketResolved`) → book actual
+  final outcome immediately, no age gate; (2) entry price already beyond the threshold
+  (longshots ≤0.07, favorites ≥0.93) → NEVER proxy-resolved — held until Gamma confirms,
+  a copy-SELL closes, or max-hold expiry (pre-fix these were insta-booked as total
+  wins/losses while still live, corrupting all sub-$0.10 / >$0.93 bucket stats before
+  2026-06-10); (3) entry crossed the threshold after open → legacy price-proxy fallback
+  after one price-update interval, each one logged
+  (`price-proxy resolve ... (Gamma does not show market resolved)`) — kept because Gamma
+  delists resolved sports markets within ~a day, usually before ever showing
+  `closed=true`, so requiring confirmation would misbook winners as 'expired' at last price.
+- **Observation forward-test (added 2026-06-10):** copy-disabled watchlist traders are no
+  longer discarded — their trades run the full simulated lifecycle in the separate
+  `observation_trades` table (single table; rows mutate in place from `status='open'` to
+  `resolved`/`expired`). Same cost model and same threshold-resolution decision as real
+  copies, but deliberately RAW: no wallet cap, no entry cap, no depth gate, no longshot
+  filter — the ledger measures the trader, not our execution constraints — and observation
+  rows never enter `open_trades`, so the wallet cap is unaffected. Store API:
+  `addObservationTrade`, `closeObservationTrade` (FIFO), `updateObservationTradePrices`,
+  `resolveObservationByPrice`. The 5-min price sweep covers observation positions in the
+  same pass (shared slug fetches). Dashboard: `/api/observation` (per-trader n/WR/PF/net,
+  cost-adjusted) + "👁 Observation Forward-Test" section. Logs: `[OBS] BUY/SELL`. Purpose:
+  macro-scan candidates can be added copy-disabled and build a real forward-test record
+  before copying is enabled.
+- **Risk controls (added 2026-06-10, `src/risk.ts`):** two automatic guards, both alerting
+  via Telegram (`src/alerts.ts`, creds injected from `~/.env.shared` via `env_file` in
+  docker-compose — the `[polymarket_bot]` prefix groups messages):
+  1. *Per-trader decay kill switch* — after each poll cycle, any copy-enabled watchlist
+     trader whose rolling 30d cost-adjusted net drops below `TRADER_DECAY_THRESHOLD_30D`
+     (default -50) is auto-disabled (`watchlist_traders.auto_disabled_at/_reason`); the
+     trader keeps accruing observation forward-test data. Manual re-enable via dashboard
+     clears the marker, but if still under threshold the next check re-disables — raise
+     the env threshold to truly override.
+  2. *Daily-loss circuit breaker* — when total cost-adjusted realized PnL over the last
+     24h drops below `DAILY_LOSS_CIRCUIT_BREAKER` (default -30), ALL copying pauses for
+     24h (`meta.circuit_breaker_until`). While paused, polling continues and cursors
+     advance (missed BUYs are NOT copied late — a paused real wallet misses trades), and
+     copy-SELLs still close existing positions (the breaker stops new exposure, not
+     risk-reducing exits). Observation ledger unaffected. Auto-resumes on expiry; manual
+     reset: dashboard banner button → `POST /api/breaker/reset`. Note: trades that close
+     during the pause count in the next 24h window, so a still-bleeding book can re-trip
+     immediately on resume — intended.
+  Dashboard: `/api/stats` returns `circuitBreaker {active, until, net24h, threshold}` +
+  `traderDecayThreshold30d`; `/api/watchlist` items carry `pnl30d`/`decayDistance`; the
+  watchlist table shows a "30d Net (kill switch)" column with headroom tooltip and ⛔ badge.
+  Window math is pure (`rollingNetForTrader`, `rollingNetTotal`, `evaluateCircuitBreaker`)
+  and unit-tested (`tests/risk.test.ts` host-runnable, `tests/kill_switch.test.ts` DB-backed).
+- **Sizing + maker-execution research (added 2026-06-10, GROUP D):**
+  1. *Source notional* — every watchlist BUY persists the trader's OWN bet size
+     (`source_notional` = activity `usdc_size`, falling back to `price*size`) on
+     `open_trades`/`closed_trades` for conviction-weighted sizing analysis (~3-4 weeks of
+     data needed; the old `trader_history` join only matched 40 trades).
+  2. *Dynamic sizing* — `DYNAMIC_SIZING=false` (OFF; flip env to test): when on, BUY size
+     = 1% of `ask_depth_5`, clamped to `[MIN_TRADE_AMOUNT=5, MAX_TRADE_AMOUNT=25]`;
+     falls back to per-trader `copyAmount` when depth is unavailable. Pure helper
+     `computeDynamicTradeAmount` in `filters.ts`. NOTE: the wallet-cap check moved AFTER
+     the depth fetch (it needs the final amount), so wallet-capped skips now cost two
+     Gamma/CLOB calls — rare, accepted.
+  3. *Maker study* — `entry_price_gap` = `best_ask - entry_price` at copy time, persisted
+     per BUY (a maker limit at the trader's price vs taker at the ask). After ~2 weeks:
+     fill-rate proxy = share of trades with gap ≤ 0/within spread; PnL improvement =
+     avg(gap)*shares. Measured baseline (review 2026-06-10, 1,167 trades): avg gap 6.8%
+     vs the 2% modeled slippage — taker execution would eat the whole edge.
 - `store.ts` persistence (reworked 2026-06-10): every mutation (addOpenTrade, closeOpenTrade, resolveByPrice, markProcessed, watchlist CRUD, appendTraderHistory, addSkippedTrade) is a targeted, transactional SQL write at call time — the DB is always current and nothing needs flushing on exit. `writeStore()` bulk-rewrites ONLY cleanup state (`processed_trade_ids`, `trader_history`) and is called solely by `runDailyCleanup()` after its in-memory prunes (processedTradeIds referenced-ID trim; traderHistory 90-day entry prune). `markDirty()`/`flushIfDirty()`/`startAutoFlush()` were removed. `startWalCheckpoint()` (called from `index.ts`) runs a PASSIVE WAL checkpoint every 60 s to bound WAL growth. Hot tables are never bulk-rewritten; frozen historical tables (`tracked_traders` — updated externally by the weekly macro scan —, `excluded_traders`, `shadow_*`) are never written by the bot.
 - **`closed_trades` retention: unlimited.** As of 2026-05-27 the 7-day archival step in `runDailyCleanup()` was removed — the table holds the full history in-DB (query perf ~12 ms at 30k rows). Existing `data/archive/*.json` files are historical artifacts; the importer ran once to merge them back. Daily backups in `data/backups/` (last 30 retained) remain the disaster-recovery path. `traderHistory` and `processedTradeIds` still prune in the same daily run.
 

@@ -37,6 +37,7 @@ const EMPTY_STORE = (): TradesStore => ({
   traderLastSeen: {},
   traderHistory: {},
   watchlistTraders: [],
+  observationTrades: [],
   shadowClosedTrades: [],
 });
 
@@ -244,6 +245,41 @@ CREATE TABLE IF NOT EXISTS skipped_trades (
   skipped_at             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_skipped_reason ON skipped_trades (skip_reason, skipped_at);
+
+-- Forward-test ledger for copy-disabled watchlist traders. Full simulated
+-- lifecycle (BUY opens, copy-SELL / threshold resolution / expiry closes) in a
+-- single table: rows mutate in place from status='open' to resolved/expired.
+-- Same cost model as real copies; no depth snapshot (no gates apply).
+CREATE TABLE IF NOT EXISTS observation_trades (
+  id                        TEXT PRIMARY KEY,
+  source_trade_id           TEXT NOT NULL,
+  timestamp                 TEXT NOT NULL,
+  copied_trader             TEXT NOT NULL,
+  copied_trader_rank        INTEGER NOT NULL,
+  copied_trader_username    TEXT,
+  copied_trader_source      TEXT,
+  market_slug               TEXT NOT NULL,
+  market_title              TEXT NOT NULL,
+  outcome                   TEXT NOT NULL,
+  side                      TEXT NOT NULL,
+  entry_price               REAL NOT NULL,
+  simulated_amount          REAL NOT NULL,
+  simulated_shares          REAL NOT NULL,
+  current_price             REAL,
+  unrealized_pnl            REAL,
+  status                    TEXT NOT NULL,
+  exit_price                REAL,
+  realized_pnl              REAL,
+  closed_at                 TEXT,
+  holding_period_ms         INTEGER,
+  entry_gas_cost            REAL,
+  entry_slippage_cost       REAL,
+  exit_slippage_cost        REAL,
+  cost_adjusted_pnl         REAL,
+  insertion_order           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_observation_fifo
+  ON observation_trades (copied_trader, market_slug, outcome, status, insertion_order);
 `;
 
 // ── DB lifecycle ────────────────────────────────────────────────────────────
@@ -267,6 +303,8 @@ function getDb(): Db {
   // Truncate stale WAL on startup; saw 44MB WAL alongside 41MB db on 2026-05-28.
   try { d.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* non-fatal */ }
   migrateDepthColumns(d);
+  migrateAutoDisableColumns(d);
+  migrateResearchColumns(d);
   seedIfFresh(d);
   _initInsertionCounterFromDb(d);
   db = d;
@@ -284,6 +322,7 @@ function _initInsertionCounterFromDb(d: Db): void {
        UNION ALL SELECT MAX(insertion_order) FROM closed_trades
        UNION ALL SELECT MAX(insertion_order) FROM shadow_open_trades
        UNION ALL SELECT MAX(insertion_order) FROM shadow_closed_trades
+       UNION ALL SELECT MAX(insertion_order) FROM observation_trades
      )`
   ).get() as { m: number | null };
   insertionCounter = (row?.m ?? 0) + 1;
@@ -320,6 +359,27 @@ function migrateDepthColumns(d: Db): void {
       if (!existing.has(col)) d.exec(`ALTER TABLE ${t} ADD COLUMN ${col} ${type}`);
     }
   }
+}
+
+// GROUP D research columns (2026-06-10): trader's own bet notional + taker
+// entry-price gap, on the live copy tables only (shadow tables are frozen;
+// observation trades don't fetch depth).
+function migrateResearchColumns(d: Db): void {
+  for (const t of ['open_trades', 'closed_trades']) {
+    const existing = new Set(
+      (d.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map(r => r.name)
+    );
+    if (!existing.has('source_notional'))  d.exec(`ALTER TABLE ${t} ADD COLUMN source_notional REAL`);
+    if (!existing.has('entry_price_gap')) d.exec(`ALTER TABLE ${t} ADD COLUMN entry_price_gap REAL`);
+  }
+}
+
+function migrateAutoDisableColumns(d: Db): void {
+  const existing = new Set(
+    (d.prepare('PRAGMA table_info(watchlist_traders)').all() as Array<{ name: string }>).map(r => r.name)
+  );
+  if (!existing.has('auto_disabled_at'))     d.exec('ALTER TABLE watchlist_traders ADD COLUMN auto_disabled_at TEXT');
+  if (!existing.has('auto_disabled_reason')) d.exec('ALTER TABLE watchlist_traders ADD COLUMN auto_disabled_reason TEXT');
 }
 
 function seedIfFresh(d: Db): void {
@@ -376,6 +436,7 @@ type TradeRow = {
   best_ask?: number | null; best_bid?: number | null;
   ask_depth_5?: number | null; ask_depth_10?: number | null;
   spread_at_entry?: number | null; depth_backfilled?: number | null;
+  source_notional?: number | null; entry_price_gap?: number | null;
   insertion_order: number;
 };
 
@@ -396,7 +457,7 @@ function rowToTrade(r: TradeRow): SimulatedTrade {
     status: r.status as 'open' | 'resolved' | 'expired',
   };
   if (r.copied_trader_username != null) t.copiedTraderUsername = r.copied_trader_username;
-  if (r.copied_trader_source   != null) t.copiedTraderSource   = r.copied_trader_source as 'leaderboard' | 'watchlist';
+  if (r.copied_trader_source   != null) t.copiedTraderSource   = r.copied_trader_source as SimulatedTrade['copiedTraderSource'];
   if (r.current_price          != null) t.currentPrice         = r.current_price;
   if (r.unrealized_pnl         != null) t.unrealizedPnl        = r.unrealized_pnl;
   if (r.entry_gas_cost         != null) t.entryGasCost         = r.entry_gas_cost;
@@ -413,6 +474,8 @@ function rowToTrade(r: TradeRow): SimulatedTrade {
   if (r.ask_depth_10           != null) t.askDepth10           = r.ask_depth_10;
   if (r.spread_at_entry        != null) t.spreadAtEntry        = r.spread_at_entry;
   if (r.depth_backfilled       != null) t.depthBackfilled      = !!r.depth_backfilled;
+  if (r.source_notional        != null) t.sourceNotional       = r.source_notional;
+  if (r.entry_price_gap        != null) t.entryPriceGap        = r.entry_price_gap;
   return t;
 }
 
@@ -421,6 +484,10 @@ const DEPTH_VALS = (t: SimulatedTrade) => [
   t.askDepth5 ?? null, t.askDepth10 ?? null,
   t.spreadAtEntry ?? null,
   t.depthBackfilled == null ? null : (t.depthBackfilled ? 1 : 0),
+];
+
+const RESEARCH_VALS = (t: SimulatedTrade) => [
+  t.sourceNotional ?? null, t.entryPriceGap ?? null,
 ];
 
 function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
@@ -432,6 +499,7 @@ function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
     t.currentPrice ?? null, t.unrealizedPnl ?? null, t.status,
     t.entryGasCost ?? null, t.entrySlippageCost ?? null,
     ...DEPTH_VALS(t),
+    ...RESEARCH_VALS(t),
     order,
   ];
 }
@@ -448,24 +516,26 @@ function closedTradeRowParams(t: SimulatedTrade, order: number): any[] {
     t.entryGasCost ?? null, t.entrySlippageCost ?? null,
     t.exitSlippageCost ?? null, t.costAdjustedPnl ?? null,
     ...DEPTH_VALS(t),
+    ...RESEARCH_VALS(t),
     order,
   ];
 }
 
 const DEPTH_COL_NAMES = 'best_ask, best_bid, ask_depth_5, ask_depth_10, spread_at_entry, depth_backfilled';
+const RESEARCH_COL_NAMES = 'source_notional, entry_price_gap';
 
 const OPEN_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
-  entry_gas_cost, entry_slippage_cost, ${DEPTH_COL_NAMES}, insertion_order)`;
-const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(26).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES}, insertion_order)`;
+const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(28).fill('?').join(',') + ')';
 
 const CLOSED_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
   exit_price, realized_pnl, closed_at, holding_period_ms,
-  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, ${DEPTH_COL_NAMES}, insertion_order)`;
-const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(32).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES}, insertion_order)`;
+const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(34).fill('?').join(',') + ')';
 
 // ── Snapshot load ───────────────────────────────────────────────────────────
 function loadSnapshot(): TradesStore {
@@ -500,11 +570,14 @@ function loadSnapshot(): TradesStore {
     if (r.falcon_win_rate != null) w.falconWinRate = r.falcon_win_rate;
     if (r.falcon_roi      != null) w.falconRoi     = r.falcon_roi;
     if (r.falcon_sharpe   != null) w.falconSharpe  = r.falcon_sharpe;
+    if (r.auto_disabled_at     != null) w.autoDisabledAt     = r.auto_disabled_at;
+    if (r.auto_disabled_reason != null) w.autoDisabledReason = r.auto_disabled_reason;
     return w;
   });
 
   s.openTrades     = (d.prepare('SELECT * FROM open_trades     ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
   s.closedTrades   = (d.prepare('SELECT * FROM closed_trades   ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
+  s.observationTrades = (d.prepare('SELECT * FROM observation_trades ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
   // Read-only: frozen historical record for /api/shadow/stats.
   s.shadowClosedTrades = (d.prepare('SELECT * FROM shadow_closed_trades ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
 
@@ -801,6 +874,122 @@ export function resolveByPrice(
   tx();
 }
 
+// Observation ledger ---------------------------------------------------------
+// Forward-test lifecycle for copy-disabled watchlist traders. Single-table
+// design: closes are in-place UPDATEs (no row movement between tables).
+
+const OBS_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
+  copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
+  entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
+  exit_price, realized_pnl, closed_at, holding_period_ms,
+  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, insertion_order)`;
+const OBS_INSERT_PLACEHOLDERS = '(' + new Array(26).fill('?').join(',') + ')';
+
+function obsTradeRowParams(t: SimulatedTrade, order: number): any[] {
+  return [
+    t.id, t.sourceTradeId, t.timestamp, t.copiedTrader, t.copiedTraderRank,
+    t.copiedTraderUsername ?? null, t.copiedTraderSource ?? null,
+    t.marketSlug, t.marketTitle, t.outcome, t.side,
+    t.entryPrice, t.simulatedAmount, t.simulatedShares,
+    t.currentPrice ?? null, t.unrealizedPnl ?? null, t.status,
+    t.exitPrice ?? null, t.realizedPnl ?? null, t.closedAt ?? null,
+    t.holdingPeriodMs ?? null,
+    t.entryGasCost ?? null, t.entrySlippageCost ?? null,
+    t.exitSlippageCost ?? null, t.costAdjustedPnl ?? null,
+    order,
+  ];
+}
+
+const OBS_CLOSE_SQL = `UPDATE observation_trades SET status=?, exit_price=?, realized_pnl=?,
+  closed_at=?, holding_period_ms=?, current_price=?, unrealized_pnl=?,
+  entry_gas_cost=?, entry_slippage_cost=?, exit_slippage_cost=?, cost_adjusted_pnl=? WHERE id=?`;
+
+function obsCloseRowParams(t: SimulatedTrade): any[] {
+  return [
+    t.status, t.exitPrice ?? null, t.realizedPnl ?? null,
+    t.closedAt ?? null, t.holdingPeriodMs ?? null,
+    t.currentPrice ?? null, t.unrealizedPnl ?? null,
+    t.entryGasCost ?? null, t.entrySlippageCost ?? null,
+    t.exitSlippageCost ?? null, t.costAdjustedPnl ?? null, t.id,
+  ];
+}
+
+export function addObservationTrade(trade: SimulatedTrade): void {
+  const store = readStore();
+  store.observationTrades.push(trade);
+  getDb().prepare(`INSERT INTO observation_trades ${OBS_INSERT_COLS} VALUES ${OBS_INSERT_PLACEHOLDERS}`)
+    .run(...obsTradeRowParams(trade, insertionCounter++));
+}
+
+/** FIFO-close the oldest open observation position matching (trader, slug, outcome). */
+export function closeObservationTrade(
+  copiedTrader: string, marketSlug: string, outcome: string, sellPrice: number,
+): boolean {
+  const store = readStore();
+  // Array is insertion-ordered, so find() returns the oldest open match.
+  const trade = store.observationTrades.find(
+    t => t.status === 'open' && t.copiedTrader === copiedTrader
+      && t.marketSlug === marketSlug && t.outcome === outcome,
+  );
+  if (!trade) return false;
+
+  const closedAt = new Date().toISOString();
+  trade.status = 'resolved';
+  trade.exitPrice = sellPrice;
+  trade.realizedPnl = (sellPrice - trade.entryPrice) * trade.simulatedShares;
+  trade.closedAt = closedAt;
+  trade.holdingPeriodMs = new Date(closedAt).getTime() - new Date(trade.timestamp).getTime();
+  trade.currentPrice = sellPrice;
+  trade.unrealizedPnl = 0;
+  applyExitCosts(trade, sellPrice);
+
+  getDb().prepare(OBS_CLOSE_SQL).run(...obsCloseRowParams(trade));
+  return true;
+}
+
+export function updateObservationTradePrices(
+  updates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }>,
+): void {
+  if (updates.length === 0) return;
+  const store = readStore();
+  for (const u of updates) {
+    const t = store.observationTrades.find(x => x.id === u.id && x.status === 'open');
+    if (t) { t.currentPrice = u.currentPrice; t.unrealizedPnl = u.unrealizedPnl; }
+  }
+  const d = getDb();
+  const stmt = d.prepare('UPDATE observation_trades SET current_price = ?, unrealized_pnl = ? WHERE id = ?');
+  const tx = d.transaction(() => { for (const u of updates) stmt.run(u.currentPrice, u.unrealizedPnl, u.id); });
+  tx();
+}
+
+export function resolveObservationByPrice(
+  toResolve: Array<{ id: string; exitPrice: number }>,
+  status: 'resolved' | 'expired' = 'resolved',
+): void {
+  if (toResolve.length === 0) return;
+  const store = readStore();
+  const closedAt = new Date().toISOString();
+  const closedMs = new Date(closedAt).getTime();
+  const resolved: SimulatedTrade[] = [];
+  for (const t of store.observationTrades) {
+    if (t.status !== 'open') continue;
+    const r = toResolve.find(x => x.id === t.id);
+    if (!r) continue;
+    t.status = status;
+    t.exitPrice = r.exitPrice;
+    t.realizedPnl = (r.exitPrice - t.entryPrice) * t.simulatedShares;
+    t.closedAt = closedAt;
+    t.holdingPeriodMs = closedMs - new Date(t.timestamp).getTime();
+    applyExitCosts(t, r.exitPrice);
+    resolved.push(t);
+  }
+  if (resolved.length === 0) return;
+  const d = getDb();
+  const stmt = d.prepare(OBS_CLOSE_SQL);
+  const tx = d.transaction(() => { for (const t of resolved) stmt.run(...obsCloseRowParams(t)); });
+  tx();
+}
+
 export function markProcessed(id: string): void {
   const store = readStore();
   if (store.processedTradeIds.includes(id)) return;
@@ -899,8 +1088,53 @@ export function setWatchlistCopyEnabled(address: string, enabled: boolean): bool
   const w = store.watchlistTraders.find(w => w.address === addr);
   if (!w) return false;
   w.copyEnabled = enabled;
-  getDb().prepare('UPDATE watchlist_traders SET copy_enabled = ? WHERE address = ?').run(enabled ? 1 : 0, addr);
+  if (enabled) {
+    // Manual re-enable clears the kill-switch marker. NOTE: if the trader's 30d
+    // net is still under TRADER_DECAY_THRESHOLD_30D, the next decay check will
+    // re-disable and re-alert — raise the threshold via env to truly override.
+    delete w.autoDisabledAt;
+    delete w.autoDisabledReason;
+    getDb().prepare(
+      'UPDATE watchlist_traders SET copy_enabled = 1, auto_disabled_at = NULL, auto_disabled_reason = NULL WHERE address = ?'
+    ).run(addr);
+  } else {
+    getDb().prepare('UPDATE watchlist_traders SET copy_enabled = 0 WHERE address = ?').run(addr);
+  }
   return true;
+}
+
+/**
+ * Per-trader decay kill switch: disable copying and record why. The trader
+ * stays on the watchlist and keeps accruing observation forward-test data.
+ */
+export function autoDisableWatchlistTrader(address: string, reason: string): boolean {
+  const store = readStore();
+  const addr = address.toLowerCase();
+  const w = store.watchlistTraders.find(w => w.address === addr);
+  if (!w) return false;
+  const at = new Date().toISOString();
+  w.copyEnabled = false;
+  w.autoDisabledAt = at;
+  w.autoDisabledReason = reason;
+  getDb().prepare(
+    'UPDATE watchlist_traders SET copy_enabled = 0, auto_disabled_at = ?, auto_disabled_reason = ? WHERE address = ?'
+  ).run(at, reason, addr);
+  return true;
+}
+
+// Meta key-value helpers (circuit-breaker state lives here) ------------------
+
+export function getMetaValue(key: string): string | null {
+  const row = getDb().prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function setMetaValue(key: string, value: string): void {
+  getDb().prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)').run(key, value);
+}
+
+export function deleteMetaValue(key: string): void {
+  getDb().prepare('DELETE FROM meta WHERE key = ?').run(key);
 }
 
 export function setWatchlistCopyAmount(address: string, amount: number): boolean {
@@ -984,6 +1218,7 @@ export function runDailyCleanup(): void {
   const refIds = new Set<string>();
   for (const t of store.openTrades)   refIds.add(t.sourceTradeId);
   for (const t of store.closedTrades) refIds.add(t.sourceTradeId);
+  for (const t of store.observationTrades ?? []) refIds.add(t.sourceTradeId);
   for (const hist of Object.values(store.traderHistory ?? {})) {
     for (const b of hist.buys  ?? []) if (b.transaction_hash) refIds.add(b.transaction_hash);
     for (const s of hist.sells ?? []) if (s.transaction_hash) refIds.add(s.transaction_hash);

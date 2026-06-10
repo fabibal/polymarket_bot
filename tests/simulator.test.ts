@@ -7,11 +7,16 @@ vi.mock('../src/config', () => ({
   CONFIG: {
     GAS_COST_PER_BUY: 0,
     SLIPPAGE_RATE: 0.02,
+    RESOLVED_THRESHOLD: 0.93,
   },
 }));
 
-import { computeEntryCosts, tradeCostAdjustedPnl, tradeTotalCosts } from '../src/simulator';
+import {
+  computeEntryCosts, tradeCostAdjustedPnl, tradeTotalCosts,
+  decideThresholdResolution, isMarketResolved,
+} from '../src/simulator';
 import { SimulatedTrade } from '../src/types';
+import { RawPriceResponse } from '../src/bullpen';
 
 function makeOpenTrade(overrides: Partial<SimulatedTrade> = {}): SimulatedTrade {
   return {
@@ -99,6 +104,90 @@ describe('tradeCostAdjustedPnl', () => {
       - 0.02 * 0.70 * shares
       - 0.02 * 0.90 * shares;
     expect(tradeCostAdjustedPnl(t)).toBeCloseTo(expected, 10);
+  });
+});
+
+describe('isMarketResolved', () => {
+  function priceResponse(closed: boolean, prices: Array<number | null>): RawPriceResponse {
+    return {
+      closed,
+      outcomes: prices.map((p, i) => ({
+        outcome: i === 0 ? 'Yes' : 'No',
+        midpoint: p,
+        last_trade: null,
+        best_bid: null,
+        best_ask: null,
+        spread: null,
+      })),
+    };
+  }
+
+  it('true when closed and all outcome prices pinned to 0/1', () => {
+    expect(isMarketResolved(priceResponse(true, [1, 0]))).toBe(true);
+    expect(isMarketResolved(priceResponse(true, [0.001, 0.999]))).toBe(true);
+  });
+
+  it('false when not closed, even with pinned prices', () => {
+    expect(isMarketResolved(priceResponse(false, [1, 0]))).toBe(false);
+  });
+
+  it('false when closed but prices are not final', () => {
+    expect(isMarketResolved(priceResponse(true, [0.93, 0.07]))).toBe(false);
+    expect(isMarketResolved(priceResponse(true, [1, 0.5]))).toBe(false);
+  });
+
+  it('false when closed but a price is missing', () => {
+    expect(isMarketResolved(priceResponse(true, [1, null]))).toBe(false);
+    expect(isMarketResolved({ closed: true, outcomes: [] })).toBe(false);
+  });
+});
+
+describe('decideThresholdResolution', () => {
+  const base = { ageMs: 600_000, minResolveAgeMs: 300_000, marketResolved: false };
+
+  it('mid-market price: update, no resolution', () => {
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 0.6 }))
+      .toEqual({ action: 'update' });
+  });
+
+  it('after-entry cross with Gamma confirmation: resolve at final outcome', () => {
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 1, marketResolved: true }))
+      .toEqual({ action: 'resolve', exitPrice: 1, confirmed: true });
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 0, marketResolved: true }))
+      .toEqual({ action: 'resolve', exitPrice: 0, confirmed: true });
+  });
+
+  it('after-entry cross without confirmation: price-proxy fallback', () => {
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 0.95 }))
+      .toEqual({ action: 'resolve', exitPrice: 1, confirmed: false });
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 0.05 }))
+      .toEqual({ action: 'resolve', exitPrice: 0, confirmed: false });
+  });
+
+  it('entry already beyond threshold: NEVER price-proxy resolved (the 0x12d6 longshot artifact)', () => {
+    // longshot bought at 0.03, market still trades 0.03 — previously insta-booked as a $5 loss
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.03, currentPrice: 0.03 }))
+      .toEqual({ action: 'hold' });
+    // favorite bought at 0.95, market still at 0.95 — previously insta-booked as a win
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.95, currentPrice: 0.96 }))
+      .toEqual({ action: 'hold' });
+  });
+
+  it('entry beyond threshold WITH Gamma confirmation: resolves at final outcome', () => {
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.03, currentPrice: 1, marketResolved: true }))
+      .toEqual({ action: 'resolve', exitPrice: 1, confirmed: true });
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.03, currentPrice: 0, marketResolved: true }))
+      .toEqual({ action: 'resolve', exitPrice: 0, confirmed: true });
+  });
+
+  it('after-entry cross younger than one price-update interval: update (no proxy resolve yet)', () => {
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 0.95, ageMs: 60_000 }))
+      .toEqual({ action: 'update' });
+  });
+
+  it('confirmed resolution ignores the age gate', () => {
+    expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 1, ageMs: 1_000, marketResolved: true }))
+      .toEqual({ action: 'resolve', exitPrice: 1, confirmed: true });
   });
 });
 

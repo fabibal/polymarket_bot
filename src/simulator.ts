@@ -1,14 +1,27 @@
 /**
  * Periodically fetches current prices for all open simulated positions
  * and updates unrealized PNL. Two auto-close conditions:
- *   1. Price threshold: ≥0.93 (WIN) or ≤0.07 (LOSS) → status 'resolved' —
- *      only once the position is at least one price-update interval old, so an
- *      entry already near the threshold (e.g. a favorite bought at 0.95) isn't
- *      instantly booked as a guaranteed win/loss on the very next sweep.
+ *   1. Resolution (status 'resolved') when price is ≥0.93 (WIN) or ≤0.07 (LOSS):
+ *      - Gamma-confirmed: market `closed` with all outcome prices pinned to 0/1
+ *        → book the actual final outcome immediately.
+ *      - Entry already beyond the threshold (e.g. a 0.03 longshot or a 0.95
+ *        favorite): NEVER resolved by price proxy — the price can't distinguish
+ *        "still where it started" from "decided". Held until Gamma confirms,
+ *        a copy-SELL closes it, or max-hold expiry. (Before 2026-06-10 these
+ *        were insta-booked as total wins/losses while the market was still
+ *        live, corrupting longshot statistics.)
+ *      - Entry crossed the threshold after open: price-proxy resolve (legacy
+ *        behavior) once at least one price-update interval old — Gamma rarely
+ *        shows sports markets as resolved before delisting them, so requiring
+ *        confirmation there would misbook winners as 'expired' at last price.
+ *        Each proxy resolve is logged clearly for auditability.
  *   2. Max hold age: older than MAX_HOLD_DAYS → closed at current price, status 'expired'
  */
-import { getMarketPrice } from './bullpen';
-import { readStore, updateOpenTradePrices, resolveByPrice } from './store';
+import { getMarketPrice, RawPriceResponse } from './bullpen';
+import {
+  readStore, updateOpenTradePrices, resolveByPrice,
+  updateObservationTradePrices, resolveObservationByPrice,
+} from './store';
 import { CONFIG } from './config';
 import { SimulatedTrade } from './types';
 
@@ -57,6 +70,63 @@ export function tradeTotalCosts(t: SimulatedTrade): number {
   return gas + eSlip + xSlip;
 }
 
+// ── Threshold-resolution decision ──────────────────────────────────────────
+
+// A market is confirmed resolved when Gamma marks it closed AND every outcome
+// price is pinned to 0/1 — outcomePrices stay at market levels until actual
+// resolution, so pinned prices on a closed market mean the outcome is final.
+const FINAL_PRICE_EPS = 0.005;
+export function isMarketResolved(data: RawPriceResponse): boolean {
+  if (data.closed !== true) return false;
+  if (!Array.isArray(data.outcomes) || data.outcomes.length === 0) return false;
+  return data.outcomes.every(o => {
+    const p = o.midpoint ?? o.last_trade;
+    return typeof p === 'number' && (p <= FINAL_PRICE_EPS || p >= 1 - FINAL_PRICE_EPS);
+  });
+}
+
+export type ResolveDecision =
+  | { action: 'resolve'; exitPrice: 0 | 1; confirmed: boolean }
+  | { action: 'hold' }     // beyond-threshold entry, unconfirmed — keep open, mark to market
+  | { action: 'update' };  // not at threshold (or too young to proxy-resolve)
+
+export function decideThresholdResolution(args: {
+  entryPrice: number;
+  currentPrice: number;
+  ageMs: number;
+  minResolveAgeMs: number;
+  marketResolved: boolean;
+}): ResolveDecision {
+  const T = CONFIG.RESOLVED_THRESHOLD;
+  const crossedHigh = args.currentPrice >= T;
+  const crossedLow  = args.currentPrice <= 1 - T;
+  if (!crossedHigh && !crossedLow) return { action: 'update' };
+
+  // Gamma-confirmed resolution: book the final outcome regardless of entry
+  // price or position age — the market is genuinely over.
+  if (args.marketResolved) return { action: 'resolve', exitPrice: crossedHigh ? 1 : 0, confirmed: true };
+
+  // Entry already beyond the threshold: the price proxy carries no information
+  // (the market sitting at 0.03 does not mean a 0.03 entry has lost).
+  if (args.entryPrice >= T || args.entryPrice <= 1 - T) return { action: 'hold' };
+
+  // Crossed after entry but not yet one full price-update interval old.
+  if (args.ageMs < args.minResolveAgeMs) return { action: 'update' };
+
+  // Legacy price-proxy fallback for after-entry crossers.
+  return { action: 'resolve', exitPrice: crossedHigh ? 1 : 0, confirmed: false };
+}
+
+// Log-once dedup for hold/proxy lines — beyond-threshold longshots would
+// otherwise re-log on every 5-min sweep for days.
+const loggedResolutionKeys = new Set<string>();
+function logResolutionOnce(key: string, msg: string): void {
+  if (loggedResolutionKeys.has(key)) return;
+  if (loggedResolutionKeys.size > 2000) loggedResolutionKeys.clear();
+  loggedResolutionKeys.add(key);
+  console.log(msg);
+}
+
 function extractOutcomePrice(data: ReturnType<typeof getMarketPrice> extends Promise<infer T> ? T : never, outcome: string): number | null {
   if (!Array.isArray(data.outcomes)) return null;
 
@@ -86,14 +156,16 @@ export async function updatePrices(): Promise<void> {
 
   try {
     const store = readStore();
-    if (store.openTrades.length === 0) return;
+    // Observation positions (copy-disabled forward test) ride the same sweep.
+    const obsOpen = (store.observationTrades ?? []).filter(t => t.status === 'open');
+    if (store.openTrades.length === 0 && obsOpen.length === 0) return;
 
     const startMs = Date.now();
-    console.log(`[simulator] Refreshing prices for ${store.openTrades.length} open position(s)...`);
+    console.log(`[simulator] Refreshing prices for ${store.openTrades.length} open position(s) + ${obsOpen.length} observation...`);
 
     // Build slug → outcomes map (fetch each slug once, distribute to all its outcome positions)
     const slugOutcomes = new Map<string, Set<string>>();
-    for (const t of store.openTrades) {
+    for (const t of [...store.openTrades, ...obsOpen]) {
       if (!slugOutcomes.has(t.marketSlug)) slugOutcomes.set(t.marketSlug, new Set());
       slugOutcomes.get(t.marketSlug)!.add(t.outcome);
     }
@@ -102,6 +174,9 @@ export async function updatePrices(): Promise<void> {
     const priceUpdates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }> = [];
     const resolutions: Array<{ id: string; exitPrice: number }> = [];
     const staleResolutions: Array<{ id: string; exitPrice: number }> = [];
+    const obsPriceUpdates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }> = [];
+    const obsResolutions: Array<{ id: string; exitPrice: number }> = [];
+    const obsStaleResolutions: Array<{ id: string; exitPrice: number }> = [];
     const maxAgeMs = CONFIG.MAX_HOLD_DAYS * 86_400_000;
     // Threshold resolution requires the position to have lived through at least
     // one full price-update cycle. Without this, an entry at/near the threshold
@@ -132,11 +207,15 @@ export async function updatePrices(): Promise<void> {
             // Markets that return 404 from the Gamma API have almost certainly resolved
             // and been removed — we can't know the final price, so we exit at last price.
             const deadPositions = store.openTrades.filter(t => t.marketSlug === slug);
-            if (deadPositions.length > 0) {
+            const deadObs = obsOpen.filter(t => t.marketSlug === slug);
+            if (deadPositions.length > 0 || deadObs.length > 0) {
               staleResolutions.push(
                 ...deadPositions.map(t => ({ id: t.id, exitPrice: t.currentPrice ?? t.entryPrice }))
               );
-              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead, expiring ${deadPositions.length} position(s) at last price`);
+              obsStaleResolutions.push(
+                ...deadObs.map(t => ({ id: t.id, exitPrice: t.currentPrice ?? t.entryPrice }))
+              );
+              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead, expiring ${deadPositions.length + deadObs.length} position(s) at last price`);
             } else {
               console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead (no open positions)`);
             }
@@ -146,22 +225,44 @@ export async function updatePrices(): Promise<void> {
           return;
         }
 
+        const marketResolved = isMarketResolved(data);
         for (const outcome of outcomes) {
           const currentPrice = extractOutcomePrice(data, outcome);
           if (currentPrice === null) continue;
 
-          const related = store.openTrades.filter(t => t.marketSlug === slug && t.outcome === outcome);
-          for (const trade of related) {
+          // Same decision logic for real copies and observation positions —
+          // only the sink arrays (and thus the target tables) differ.
+          const groups: Array<{
+            trades: SimulatedTrade[];
+            upd: typeof priceUpdates; res: typeof resolutions; stale: typeof staleResolutions;
+          }> = [
+            { trades: store.openTrades.filter(t => t.marketSlug === slug && t.outcome === outcome),
+              upd: priceUpdates, res: resolutions, stale: staleResolutions },
+            { trades: obsOpen.filter(t => t.marketSlug === slug && t.outcome === outcome),
+              upd: obsPriceUpdates, res: obsResolutions, stale: obsStaleResolutions },
+          ];
+          for (const g of groups) for (const trade of g.trades) {
             const unrealizedPnl = (currentPrice - trade.entryPrice) * trade.simulatedShares;
             const ageMs = nowMs - new Date(trade.timestamp).getTime();
-            if (currentPrice >= CONFIG.RESOLVED_THRESHOLD && ageMs >= minResolveAgeMs) {
-              resolutions.push({ id: trade.id, exitPrice: 1 });
-            } else if (currentPrice <= 1 - CONFIG.RESOLVED_THRESHOLD && ageMs >= minResolveAgeMs) {
-              resolutions.push({ id: trade.id, exitPrice: 0 });
-            } else if (ageMs > maxAgeMs) {
-              staleResolutions.push({ id: trade.id, exitPrice: currentPrice });
+            const decision = decideThresholdResolution({
+              entryPrice: trade.entryPrice, currentPrice, ageMs, minResolveAgeMs, marketResolved,
+            });
+            if (decision.action === 'resolve') {
+              if (!decision.confirmed) {
+                logResolutionOnce(`proxy:${slug}:${outcome}`,
+                  `[simulator] ${slug} ${outcome} — price-proxy resolve at ${currentPrice.toFixed(3)} (Gamma does not show market resolved)`);
+              }
+              g.res.push({ id: trade.id, exitPrice: decision.exitPrice });
             } else {
-              priceUpdates.push({ id: trade.id, currentPrice, unrealizedPnl });
+              if (decision.action === 'hold') {
+                logResolutionOnce(`hold:${slug}:${outcome}`,
+                  `[simulator] ${slug} ${outcome} at ${currentPrice.toFixed(3)} — entry ${trade.entryPrice.toFixed(3)} already beyond threshold, holding until Gamma confirms resolution`);
+              }
+              if (ageMs > maxAgeMs) {
+                g.stale.push({ id: trade.id, exitPrice: currentPrice });
+              } else {
+                g.upd.push({ id: trade.id, currentPrice, unrealizedPnl });
+              }
             }
           }
         }
@@ -177,8 +278,17 @@ export async function updatePrices(): Promise<void> {
       resolveByPrice(staleResolutions, 'expired');
       console.log(`[simulator] Expired ${staleResolutions.length} position(s) (age>${CONFIG.MAX_HOLD_DAYS}d or dead market)`);
     }
+    if (obsPriceUpdates.length) updateObservationTradePrices(obsPriceUpdates);
+    if (obsResolutions.length) {
+      resolveObservationByPrice(obsResolutions);
+      console.log(`[simulator] Auto-resolved ${obsResolutions.length} observation trade(s) by price threshold`);
+    }
+    if (obsStaleResolutions.length) {
+      resolveObservationByPrice(obsStaleResolutions, 'expired');
+      console.log(`[simulator] Expired ${obsStaleResolutions.length} observation position(s)`);
+    }
     const elapsedS = ((Date.now() - startMs) / 1000).toFixed(1);
-    console.log(`[simulator] Price update complete — ${uniqueSlugs.length} slugs checked in ${elapsedS}s, ${resolutions.length} resolved, ${staleResolutions.length} expired`);
+    console.log(`[simulator] Price update complete — ${uniqueSlugs.length} slugs checked in ${elapsedS}s, ${resolutions.length}+${obsResolutions.length} resolved, ${staleResolutions.length}+${obsStaleResolutions.length} expired`);
   } finally {
     priceUpdateRunning = false;
   }

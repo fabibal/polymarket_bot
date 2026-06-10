@@ -4,6 +4,7 @@ import { startDashboard } from './dashboard';
 import { readStore, runDailyCleanup, startWalCheckpoint, stopWalCheckpoint, initInsertionCounter, updateOpenTradeDepth } from './store';
 import { getOrderbookDepth } from './bullpen';
 import { CONFIG } from './config';
+import { isCircuitBreakerActive, checkCircuitBreaker, checkTraderDecay } from './risk';
 
 /**
  * One-shot startup task: for every open watchlist trade missing orderbook depth,
@@ -45,15 +46,19 @@ async function runPollingCycle(): Promise<void> {
     return;
   }
 
+  // Daily-loss circuit breaker: while active, polling continues (cursors must
+  // advance so missed trades are never copied late) but new BUYs are discarded.
+  const suspended = isCircuitBreakerActive();
+
   const disabledCount = watchlistTraders.filter(w => !w.copyEnabled).length;
   const note = disabledCount > 0 ? ` (${disabledCount} copy-disabled — enable via dashboard)` : '';
-  console.log(`[bot] Polling ${watchlistTraders.length} watchlist trader(s)${note}`);
+  console.log(`[bot] Polling ${watchlistTraders.length} watchlist trader(s)${note}${suspended ? ' [BREAKER PAUSED]' : ''}`);
 
   let totalNew = 0;
   for (const w of watchlistTraders) {
     const trader = { rank: 0, address: w.address, weeklyPnl: 0 };
     try {
-      const n = await pollTrader(trader, { copyEnabled: w.copyEnabled, source: 'watchlist', tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT });
+      const n = await pollTrader(trader, { copyEnabled: w.copyEnabled, source: 'watchlist', tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT, suspended });
       totalNew += n;
     } catch (err) {
       // Per-trader isolation: one trader's failure (e.g. an SQL error mid-poll)
@@ -68,6 +73,13 @@ async function runPollingCycle(): Promise<void> {
   if (totalNew > 0) {
     console.log(`[bot] Simulated ${totalNew} new trade(s) this cycle`);
   }
+
+  // Risk checks run after each cycle on the fresh in-memory store. Both are
+  // cheap (in-memory scans) and alert via Telegram on state transitions only.
+  try { await checkTraderDecay(); }
+  catch (err) { console.error('[risk] trader decay check failed:', err instanceof Error ? err.message : err); }
+  try { await checkCircuitBreaker(); }
+  catch (err) { console.error('[risk] circuit breaker check failed:', err instanceof Error ? err.message : err); }
 }
 
 function scheduleMidnightCleanup(): void {

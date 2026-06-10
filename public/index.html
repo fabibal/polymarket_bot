@@ -550,6 +550,12 @@
 </div>
 
 <main>
+  <!-- Daily-loss circuit breaker banner (hidden unless tripped) -->
+  <div id="breaker-banner" style="display:none; margin:0 0 14px 0; padding:10px 14px; border:1px solid var(--red); border-radius:var(--r-sm); background:rgba(248,113,113,0.12); font-size:13px; align-items:center; gap:12px;">
+    <span>🚨 <b>Daily loss circuit breaker active</b> — all copying paused. <span id="breaker-detail"></span></span>
+    <button class="btn-toggle btn-exclude" style="margin-left:auto" onclick="resetBreaker(this)">Resume now</button>
+  </div>
+
   <!-- Watchlist stat cards -->
   <h2 style="margin:0 0 10px 0; font-size:15px; color:var(--muted); font-weight:600; letter-spacing:.04em; text-transform:uppercase;">
     Watchlist Performance <span style="color:var(--text); text-transform:none; letter-spacing:0; font-weight:400; font-size:12px;">— watchlist sim trades only</span>
@@ -712,6 +718,26 @@
     </div>
   </div>
 
+  <!-- Observation forward-test (copy-disabled watchlist traders) -->
+  <div class="section">
+    <div class="section-header">
+      <div class="section-header-left">
+        <span class="section-title">👁 Observation Forward-Test</span>
+        <span class="section-count" id="obs-count">0</span>
+        <span style="font-size:11px;color:var(--muted)">copy-disabled traders · simulated full lifecycle, never copied · cost-adjusted</span>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Trader</th><th>Status</th><th>Open</th><th>Closed</th><th>Win Rate</th>
+          <th title="Gross wins / gross losses (cost-adjusted)">PF</th><th>Net PNL</th><th>Unrealized</th><th>Last Trade</th>
+        </tr></thead>
+        <tbody id="obs-body"><tr class="empty-row"><td colspan="9">No observation trades yet — they accrue as copy-disabled traders trade.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Risk metrics -->
   <div class="section">
     <div class="section-header">
@@ -818,6 +844,7 @@
             <th title="Number of trades with logged orderbook-depth data">Liq Samples</th>
             <th>Open Pos</th>
             <th title="Cost-adjusted realized PNL (after slippage), closed simulated trades">Realized PNL <span style="font-size:9px;opacity:.5">(adj)</span></th>
+            <th title="Rolling 30-day cost-adjusted net — copying auto-disables below the decay threshold">30d Net <span style="font-size:9px;opacity:.5">(kill switch)</span></th>
             <th title="Daily realized PNL over the last 30 days (UTC buckets, cost-adjusted)">PNL 30d</th>
             <th title="Per-trade copy amount — click to edit">Amount</th>
             <th>Copy</th>
@@ -825,7 +852,7 @@
           </tr>
         </thead>
         <tbody id="watchlist-body">
-          <tr class="empty-row"><td colspan="15">Loading watchlist…</td></tr>
+          <tr class="empty-row"><td colspan="16">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -920,7 +947,7 @@
 
   async function refresh() {
     try {
-      await Promise.all([loadWatchlistStats(), loadWatchlist(), loadWatchlistTrades(), loadDiscoveryCandidates(), loadGoLive(), loadShadowStats(), loadRiskMetrics()]);
+      await Promise.all([loadWatchlistStats(), loadWatchlist(), loadWatchlistTrades(), loadDiscoveryCandidates(), loadGoLive(), loadShadowStats(), loadObservation(), loadRiskMetrics()]);
     } catch (e) {
       const dot = $('status-dot'); if (dot) dot.className = 'err';
       const lu  = $('last-updated'); if (lu) lu.textContent = 'Error';
@@ -1375,6 +1402,19 @@
     return w.liqSampleCount > 0 ? String(w.liqSampleCount) : '<span style="color:var(--muted)">—</span>';
   }
 
+  // Rolling 30d net + headroom to the per-trader decay kill switch.
+  function decayCell(w) {
+    if (w.pnl30d == null) return '—';
+    const v = Number(w.pnl30d);
+    const thr = Number(w.decayThreshold ?? -50);
+    const dist = Number(w.decayDistance ?? (v - thr));
+    const cls = dist <= 0 ? 'red' : dist < 20 ? 'yellow' : (v >= 0 ? 'green' : '');
+    const badge = w.autoDisabledAt
+      ? ` <span title="Auto-disabled ${w.autoDisabledAt}: ${w.autoDisabledReason || ''}" style="cursor:help">⛔</span>`
+      : '';
+    return `<span class="${cls}" title="headroom ${fmtPnl(dist)} to auto-disable at ${fmtPnl(thr)}">${fmtPnl(v)}</span>${badge}`;
+  }
+
   function buildWatchlistRow(w, idx) {
     const addr = w.address;
     const name = w.label || w.username || shortAddr(addr);
@@ -1395,6 +1435,7 @@
     const pnlCell    = (w.realizedPnl != null && w.realizedPnl !== 0)
       ? `<span class="${w.realizedPnl >= 0 ? 'green' : 'red'}">${fmtPnl(w.realizedPnl)}</span>`
       : '—';
+    const decayCellHtml = decayCell(w);
     const sparkCell  = buildSparkline(w.dailyPnl30d || []);
 
     const amt = w.copyAmount ?? 5;
@@ -1432,13 +1473,14 @@
       <td id="wl-cell-liq-${addr}">${liqCell}</td>
       <td id="wl-cell-openpos-${addr}">${openCell}</td>
       <td id="wl-cell-pnl-${addr}">${pnlCell}</td>
+      <td id="wl-cell-decay-${addr}">${decayCellHtml}</td>
       <td id="wl-cell-spark-${addr}">${sparkCell}</td>
       <td>${amtCell}</td>
       <td id="wl-cell-copy-${addr}">${copyBtn}</td>
       <td>${removeBtn}</td>
     </tr>
     <tr id="${subRowId}" class="wl-sub-row" data-address="${addr}">
-      <td colspan="15" style="padding:0">
+      <td colspan="16" style="padding:0">
         <div class="wl-expand-wrap">
           <div class="wl-expand-grid">
             <div class="wl-expand-side">
@@ -1546,6 +1588,10 @@
     const openEl = document.getElementById(`wl-cell-openpos-${addr}`);
     if (openEl) openEl.innerHTML = w.openPositions > 0 ? `<span class="blue">${w.openPositions}</span>` : '—';
 
+    // 30d net (decay kill switch)
+    const decayEl = document.getElementById(`wl-cell-decay-${addr}`);
+    if (decayEl) decayEl.innerHTML = decayCell(w);
+
     // Realized PNL
     const pnlEl = document.getElementById(`wl-cell-pnl-${addr}`);
     if (pnlEl) {
@@ -1609,7 +1655,7 @@
       if (!tbody) return;
 
       if (items.length === 0) {
-        tbody.innerHTML = '<tr class="empty-row"><td colspan="15">No traders in watchlist — add one above.</td></tr>';
+        tbody.innerHTML = '<tr class="empty-row"><td colspan="16">No traders in watchlist — add one above.</td></tr>';
         return;
       }
 
@@ -1730,6 +1776,42 @@
     } catch (e) { console.error('[shadow] load failed:', e); }
   }
 
+  // ── Observation forward-test ──────────────────────────────────────────────
+  async function loadObservation() {
+    try {
+      const d = await fetch('/api/observation').then(r => r.json());
+      const tb = $('obs-body');
+      if (!tb) return;
+      const cnt = $('obs-count');
+      if (cnt) cnt.textContent = d.count ?? 0;
+      if (!Array.isArray(d.items) || d.items.length === 0) {
+        tb.innerHTML = '<tr class="empty-row"><td colspan="9">No observation trades yet — they accrue as copy-disabled traders trade.</td></tr>';
+        return;
+      }
+      tb.innerHTML = d.items.map(it => {
+        const name = it.label || shortAddr(it.address);
+        const status = it.copyEnabled === null ? 'removed'
+          : it.copyEnabled ? '<span class="green">copy enabled</span>'
+          : '<span style="color:var(--yellow)">observing</span>';
+        const wr = it.winRate != null ? (it.winRate * 100).toFixed(1) + '%' : '—';
+        const wrCls = it.winRate != null ? (it.winRate >= 0.5 ? 'green' : 'red') : '';
+        const pf = it.profitFactor != null ? Number(it.profitFactor).toFixed(2) : '—';
+        const last = it.lastTrade ? it.lastTrade.slice(0, 10) : '—';
+        return `<tr>
+          <td title="${it.address}">${truncate(name, 24)}</td>
+          <td>${status}</td>
+          <td>${it.openCount}</td>
+          <td>${it.closedCount}</td>
+          <td class="${wrCls}">${wr}</td>
+          <td>${pf}</td>
+          <td class="${pnlClass(it.netPnl)}">${fmtPnl(it.netPnl)}</td>
+          <td class="${pnlClass(it.unrealizedPnl)}">${fmtPnl(it.unrealizedPnl)}</td>
+          <td>${last}</td>
+        </tr>`;
+      }).join('');
+    } catch (e) { console.error('[observation] load failed:', e); }
+  }
+
   // ── Risk metrics ──────────────────────────────────────────────────────────
   function concentrationBars(items, nameKey) {
     if (!Array.isArray(items) || items.length === 0) {
@@ -1847,6 +1929,16 @@
     }
   }
 
+  async function resetBreaker(btn) {
+    if (!confirm('Resume copying now? The circuit breaker tripped on a real 24h loss.')) return;
+    if (btn) btn.disabled = true;
+    try {
+      await fetch('/api/breaker/reset', { method: 'POST' });
+      await loadWatchlistStats();
+    } catch (e) { console.error('Breaker reset failed:', e); }
+    if (btn) btn.disabled = false;
+  }
+
   async function removeWatchlistTrader(address) {
     if (!confirm(`Remove ${shortAddr(address)} from watchlist?`)) return;
     try {
@@ -1879,6 +1971,19 @@
       const totalPnl = (s.totalRealizedPnl || 0) + (s.totalUnrealizedPnl || 0);
 
       const setVal = (id, text, cls) => { const el = $(id); if (!el) return; el.textContent = text; if (cls) el.className = 'value ' + cls; };
+      // Circuit-breaker banner
+      const bb = $('breaker-banner');
+      if (bb) {
+        const cb = s.circuitBreaker || {};
+        if (cb.active) {
+          bb.style.display = 'flex';
+          const det = $('breaker-detail');
+          if (det) det.textContent = `24h net ${fmtPnl(cb.net24h ?? 0)} (threshold ${fmtPnl(cb.threshold ?? 0)}) · auto-resumes ${cb.until ? new Date(cb.until).toLocaleString() : '—'}`;
+        } else {
+          bb.style.display = 'none';
+        }
+      }
+
       setVal('wl-s-total-pnl',     fmtPnl(totalPnl),          pnlClass(totalPnl));
       const wlAdjPnl = (s.totalRealizedPnlAdjusted || 0) + (s.totalUnrealizedPnlAdjusted || 0);
       setVal('wl-s-adj-pnl', fmtPnl(wlAdjPnl), pnlClass(wlAdjPnl));

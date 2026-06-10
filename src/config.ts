@@ -41,6 +41,22 @@ export const CONFIG = {
   // copy and record it in skipped_trades (record-only, for monitoring). See CLAUDE.md.
   LONGSHOT_FILTER_TRADER: (process.env.LONGSHOT_FILTER_TRADER ?? '0x12d6cccfc7470a3f4bafc53599a4779cbf2cf2a8').toLowerCase(),
   LONGSHOT_FILTER_MAX_PRICE: parseFloat(process.env.LONGSHOT_FILTER_MAX_PRICE ?? '0.10'),
+  // Dynamic position sizing (added 2026-06-10, OFF by default — flip manually when
+  // ready to test): instead of a flat per-trader copyAmount, size each watchlist BUY
+  // as 1% of CLOB ask_depth_5, clamped to [MIN_TRADE_AMOUNT, MAX_TRADE_AMOUNT].
+  // Falls back to the per-trader copyAmount when depth is unavailable.
+  DYNAMIC_SIZING: (process.env.DYNAMIC_SIZING ?? 'false').toLowerCase() === 'true',
+  MIN_TRADE_AMOUNT: parseFloat(process.env.MIN_TRADE_AMOUNT ?? '5'),
+  MAX_TRADE_AMOUNT: parseFloat(process.env.MAX_TRADE_AMOUNT ?? '25'),
+  // Per-trader kill switch (added 2026-06-10): when a copy-enabled watchlist trader's
+  // rolling 30-day cost-adjusted net PnL drops below this, copying is auto-disabled
+  // (the trader keeps accruing observation forward-test data) and a Telegram alert fires.
+  TRADER_DECAY_THRESHOLD_30D: parseFloat(process.env.TRADER_DECAY_THRESHOLD_30D ?? '-50'),
+  // Account-wide circuit breaker (added 2026-06-10): when total cost-adjusted realized
+  // PnL over the last 24h drops below this, ALL copying pauses for 24h (cursors still
+  // advance; missed trades are NOT copied late on resume). Auto-resumes after 24h;
+  // manual reset via dashboard POST /api/breaker/reset.
+  DAILY_LOSS_CIRCUIT_BREAKER: parseFloat(process.env.DAILY_LOSS_CIRCUIT_BREAKER ?? '-30'),
   // Falcon (Polymarket Analytics) API key — optional, enables Falcon leaderboard enrichment
   POLYMARKET_ANALYTICS_API_KEY: process.env.POLYMARKET_ANALYTICS_API_KEY ?? '',
 };

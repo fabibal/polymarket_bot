@@ -80,6 +80,21 @@ export function getOutcomeSpread(data: RawPriceResponse, outcome: string): numbe
   return null;
 }
 
+/**
+ * Dynamic position sizing (GROUP D, 2026-06-10): 1% of the CLOB ask depth
+ * within 5% of best ask, clamped to [min, max]. Disabled or depth-unknown →
+ * the base (per-trader copyAmount) is used unchanged.
+ */
+export function computeDynamicTradeAmount(
+  askDepth5: number | null | undefined,
+  baseAmount: number,
+  cfg: { enabled: boolean; min: number; max: number },
+): number {
+  if (!cfg.enabled) return baseAmount;
+  if (askDepth5 == null || !Number.isFinite(askDepth5) || askDepth5 <= 0) return baseAmount;
+  return Math.min(Math.max(askDepth5 * 0.01, cfg.min), cfg.max);
+}
+
 export interface WatchlistEntry {
   marketSlug: string;
   copiedTraderSource?: string; // only 'watchlist' is counted; widened so SimulatedTrade is assignable

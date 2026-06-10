@@ -19,7 +19,8 @@ export interface ActivityTrade {
   outcome: string;
   side: 'buy' | 'sell';
   price: number;
-  size: number;
+  size: number;        // token amount
+  usdcSize?: number;   // USD notional of the trader's own fill, when the API provides it
 }
 
 export interface WatchlistTrader {
@@ -31,6 +32,10 @@ export interface WatchlistTrader {
   falconWinRate?: number; // 0–1 fraction
   falconRoi?: number;     // percentage (e.g. 18.6)
   falconSharpe?: number;
+  // Set by the per-trader decay kill switch when it auto-disables copying.
+  // Cleared when the operator manually re-enables via the dashboard.
+  autoDisabledAt?: string;
+  autoDisabledReason?: string;
 }
 
 export interface SimulatedTrade {
@@ -40,7 +45,7 @@ export interface SimulatedTrade {
   copiedTrader: string;
   copiedTraderRank: number;
   copiedTraderUsername?: string;
-  copiedTraderSource?: 'leaderboard' | 'watchlist';
+  copiedTraderSource?: 'leaderboard' | 'watchlist' | 'observation';
   marketSlug: string;
   marketTitle: string;
   outcome: string;
@@ -62,6 +67,13 @@ export interface SimulatedTrade {
   entrySlippageCost?: number;
   exitSlippageCost?: number;
   costAdjustedPnl?: number;
+  // Research fields (GROUP D, 2026-06-10), set on watchlist BUYs at copy time:
+  // sourceNotional = the trader's OWN bet size in USD (usdc_size, falling back
+  // to price*size) — enables conviction-weighted sizing analysis;
+  // entryPriceGap = best_ask - trader's fill price — measures what taker
+  // execution would cost vs a maker limit at the trader's price.
+  sourceNotional?: number;
+  entryPriceGap?: number;
   // Orderbook snapshot at fill time. Populated for watchlist BUYs via CLOB
   // /book; depthBackfilled=true if filled in after the fact from current state.
   bestAsk?: number;
@@ -102,6 +114,10 @@ export interface TradesStore {
   traderLastSeen: Record<string, string>;
   traderHistory: Record<string, TraderHistory>;  // accumulated raw activity per trader
   watchlistTraders: WatchlistTrader[];
+  // Forward-test ledger for copy-disabled watchlist traders. Single table,
+  // full open/close lifecycle in place (status open → resolved/expired).
+  // Never copied live; excluded from wallet cap and all entry gates.
+  observationTrades: SimulatedTrade[];
   // Frozen historical record (leaderboard removed 2026-05-29). Loaded read-only
   // for /api/shadow/stats; never persisted back.
   shadowClosedTrades?: SimulatedTrade[];

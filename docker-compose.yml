@@ -57,6 +57,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Host logs dir (read-only) — dashboard reads weekly-macro-scan output
       - ./logs:/app/logs:ro
+    # Shared Telegram credentials (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) — used by
+    # the in-bot risk alerts (trader decay kill switch, daily-loss circuit breaker).
+    env_file:
+      - /home/user/.env.shared
     environment:
       - NODE_OPTIONS=--max-old-space-size=450
       - DRY_RUN=true
@@ -74,6 +78,11 @@ services:
       - WALLET_CAP_UTILIZATION=0.80  # stop opening new BUYs at 80% utilization ($800 of $1000)
       - GAS_COST_PER_BUY=0  # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
       - SLIPPAGE_RATE=0.02   # 2% slippage each side (entry at ask, exit at bid)
+      - TRADER_DECAY_THRESHOLD_30D=-50   # per-trader kill switch: auto-disable copy when 30d net (cost-adj) drops below
+      - DAILY_LOSS_CIRCUIT_BREAKER=-30   # account breaker: pause ALL copying 24h when 24h realized net drops below
+      - DYNAMIC_SIZING=false             # OFF: flat per-trader copyAmount. ON: 1% of ask_depth_5, clamped to [MIN,MAX]_TRADE_AMOUNT
+      - MIN_TRADE_AMOUNT=5               # dynamic-sizing floor ($)
+      - MAX_TRADE_AMOUNT=25              # dynamic-sizing cap ($)
       - POLYMARKET_ANALYTICS_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
     deploy:
       resources:

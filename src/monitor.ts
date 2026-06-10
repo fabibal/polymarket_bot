@@ -4,10 +4,13 @@
  * - SELL → close the oldest matching open position at sell price (realized PNL)
  */
 import { getTraderActivity, getOrderbookDepth, RawActivityItem } from './bullpen';
-import { readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSeen, appendTraderHistory, addSkippedTrade } from './store';
+import {
+  readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSeen,
+  appendTraderHistory, addSkippedTrade, addObservationTrade, closeObservationTrade,
+} from './store';
 import { LeaderboardTrader, ActivityTrade, SimulatedTrade, TraderHistoryEntry } from './types';
 import { CONFIG } from './config';
-import { countWatchlistEntriesInWindow } from './filters';
+import { countWatchlistEntriesInWindow, computeDynamicTradeAmount } from './filters';
 import { computeEntryCosts } from './simulator';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -46,16 +49,23 @@ function parseActivity(raw: RawActivityItem): ActivityTrade | null {
     return null;
   }
   const size = Number(raw.size ?? 0);
+  const usdcSize = raw.usdc_size != null && Number.isFinite(Number(raw.usdc_size))
+    ? Number(raw.usdc_size) : undefined;
 
   const marketTitle = String(raw.title ?? marketSlug);
-  return { id, timestamp, marketSlug, marketTitle, outcome, side: side as 'buy' | 'sell', price, size };
+  return { id, timestamp, marketSlug, marketTitle, outcome, side: side as 'buy' | 'sell', price, size, usdcSize };
 }
 
 export async function pollTrader(
   trader: LeaderboardTrader,
-  options: { copyEnabled?: boolean; source?: 'leaderboard' | 'watchlist'; tradeAmount?: number } = {}
+  options: { copyEnabled?: boolean; source?: 'leaderboard' | 'watchlist'; tradeAmount?: number; suspended?: boolean } = {}
 ): Promise<number> {
   const copyEnabled  = options.copyEnabled !== false; // default true
+  // Daily-loss circuit breaker: copy-enabled traders' trades are discarded
+  // (cursor advances, nothing recorded — a paused real wallet misses trades,
+  // it doesn't fill them late). Observation traders are unaffected: their
+  // ledger is not real money and must stay continuous.
+  const suspended    = options.suspended === true;
   const tradeAmount  = options.tradeAmount ?? CONFIG.TRADE_AMOUNT;
   const isWatchlist  = options.source === 'watchlist';
   const store = readStore();
@@ -118,8 +128,63 @@ export async function pollTrader(
       continue;
     }
 
-    // ── Copy-disabled: advance cursor and mark processed, skip simulation ──
+    // ── Copy-disabled: observation forward-test ────────────────────────────
+    // Simulate the full trade lifecycle in the separate observation ledger so
+    // candidates build a real forward-test record before copying is enabled.
+    // Deliberately RAW — no wallet cap, entry cap, depth gate, or longshot
+    // filter: the ledger measures the trader, not our execution constraints.
     if (!copyEnabled) {
+      if (activity.side === 'buy') {
+        const shares = tradeAmount / activity.price;
+        const entryCosts = computeEntryCosts(activity.price, shares);
+        addObservationTrade({
+          id: uuidv4(),
+          sourceTradeId: activity.id,
+          timestamp: activity.timestamp,
+          copiedTrader: trader.address,
+          copiedTraderRank: trader.rank,
+          copiedTraderUsername: trader.username,
+          copiedTraderSource: 'observation',
+          marketSlug: activity.marketSlug,
+          marketTitle: activity.marketTitle,
+          outcome: activity.outcome,
+          side: 'buy',
+          entryPrice: activity.price,
+          simulatedAmount: tradeAmount,
+          simulatedShares: shares,
+          currentPrice: activity.price,
+          unrealizedPnl: 0,
+          status: 'open',
+          entryGasCost:      entryCosts.gas,
+          entrySlippageCost: entryCosts.slippage,
+        });
+        newTrades++;
+        console.log(
+          `[OBS] BUY  ${activity.marketTitle.slice(0, 40).padEnd(40)} | ` +
+          `${activity.outcome.padEnd(4)} @ $${activity.price.toFixed(3)} | ` +
+          `$${tradeAmount} → ${shares.toFixed(2)} shares | ` +
+          `${trader.username ?? trader.address.slice(0, 8) + '...'} (observation)`
+        );
+      } else {
+        const closed = closeObservationTrade(trader.address, activity.marketSlug, activity.outcome, activity.price);
+        if (closed) {
+          newTrades++;
+          console.log(
+            `[OBS] SELL ${activity.marketTitle.slice(0, 40).padEnd(40)} | ` +
+            `${activity.outcome.padEnd(4)} @ $${activity.price.toFixed(3)} | ` +
+            `${trader.username ?? trader.address.slice(0, 8) + '...'} (observation)`
+          );
+        }
+      }
+      markProcessed(activity.id);
+      continue;
+    }
+
+    // ── Circuit breaker pause: discard new BUYs ─────────────────────────────
+    // SELLs still process: the breaker stops new exposure, but existing open
+    // positions must keep following the trader's exits — holding what the
+    // trader already sold would be unmanaged risk, not protection.
+    if (suspended && activity.side === 'buy') {
       markProcessed(activity.id);
       continue;
     }
@@ -178,27 +243,10 @@ export async function pollTrader(
         }
       }
 
-      // ── Simulated wallet cap (applies to BOTH watchlist and leaderboard) ──
-      // Models a fixed-size real wallet. When sum of open simulatedAmount reaches
-      // SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION, refuse new BUYs.
-      if (CONFIG.SIMULATED_WALLET_SIZE > 0) {
-        const inUse = currentStore.openTrades.reduce(
-          (s, t) => s + (t.simulatedAmount ?? CONFIG.TRADE_AMOUNT), 0
-        );
-        const cap = CONFIG.SIMULATED_WALLET_SIZE * CONFIG.WALLET_CAP_UTILIZATION;
-        if (inUse + tradeAmount > cap) {
-          console.log(
-            `[monitor] Skip BUY ${activity.marketSlug} — wallet_cap: ` +
-            `$${inUse.toFixed(0)}/$${CONFIG.SIMULATED_WALLET_SIZE} in use ` +
-            `(cap $${cap.toFixed(0)} @ ${(CONFIG.WALLET_CAP_UTILIZATION * 100).toFixed(0)}%)`
-          );
-          markProcessed(activity.id);
-          continue;
-        }
-      }
-
       // Depth gate: fetch CLOB orderbook BEFORE creating the trade so we can
       // skip thin books. Non-blocking — depth fetch failure falls through to copy.
+      // Runs before the wallet cap since dynamic sizing needs ask_depth_5 to know
+      // the final amount (costs two HTTP calls on wallet-capped skips — rare).
       let watchlistDepth: Awaited<ReturnType<typeof getOrderbookDepth>> = null;
       if (isWatchlist) {
         watchlistDepth = await getOrderbookDepth(activity.marketSlug, activity.outcome);
@@ -213,7 +261,33 @@ export async function pollTrader(
         }
       }
 
-      const shares = tradeAmount / activity.price;
+      // Dynamic sizing (DYNAMIC_SIZING=false → amount = per-trader copyAmount).
+      const amount = computeDynamicTradeAmount(watchlistDepth?.askDepth5 ?? null, tradeAmount, {
+        enabled: CONFIG.DYNAMIC_SIZING,
+        min: CONFIG.MIN_TRADE_AMOUNT,
+        max: CONFIG.MAX_TRADE_AMOUNT,
+      });
+
+      // ── Simulated wallet cap (checked with the FINAL amount) ──
+      // Models a fixed-size real wallet. When sum of open simulatedAmount reaches
+      // SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION, refuse new BUYs.
+      if (CONFIG.SIMULATED_WALLET_SIZE > 0) {
+        const inUse = currentStore.openTrades.reduce(
+          (s, t) => s + (t.simulatedAmount ?? CONFIG.TRADE_AMOUNT), 0
+        );
+        const cap = CONFIG.SIMULATED_WALLET_SIZE * CONFIG.WALLET_CAP_UTILIZATION;
+        if (inUse + amount > cap) {
+          console.log(
+            `[monitor] Skip BUY ${activity.marketSlug} — wallet_cap: ` +
+            `$${inUse.toFixed(0)}/$${CONFIG.SIMULATED_WALLET_SIZE} in use ` +
+            `(cap $${cap.toFixed(0)} @ ${(CONFIG.WALLET_CAP_UTILIZATION * 100).toFixed(0)}%)`
+          );
+          markProcessed(activity.id);
+          continue;
+        }
+      }
+
+      const shares = amount / activity.price;
       const entryCosts = computeEntryCosts(activity.price, shares);
       const trade: SimulatedTrade = {
         id: uuidv4(),
@@ -228,7 +302,7 @@ export async function pollTrader(
         outcome: activity.outcome,
         side: 'buy',
         entryPrice: activity.price,
-        simulatedAmount: tradeAmount,
+        simulatedAmount: amount,
         simulatedShares: shares,
         currentPrice: activity.price,
         unrealizedPnl: 0,
@@ -236,6 +310,11 @@ export async function pollTrader(
         entryGasCost:      entryCosts.gas,
         entrySlippageCost: entryCosts.slippage,
       };
+      // Research fields (GROUP D): the trader's own bet notional (conviction
+      // signal) and the taker entry-price gap (maker-execution study).
+      const notional = activity.usdcSize ?? (activity.size > 0 ? activity.price * activity.size : undefined);
+      if (notional != null && Number.isFinite(notional)) trade.sourceNotional = notional;
+      if (watchlistDepth) trade.entryPriceGap = watchlistDepth.bestAsk - activity.price;
       // Watchlist BUYs: persist the depth snapshot fetched above for the gate check.
       if (isWatchlist) {
         if (watchlistDepth) {
@@ -257,10 +336,11 @@ export async function pollTrader(
       addOpenTrade(trade);
       newTrades++;
       const srcTag = isWatchlist ? '[WL]' : '[DRY_RUN]';
+      const sizeTag = amount !== tradeAmount ? ` (dyn, base $${tradeAmount})` : '';
       console.log(
         `${srcTag} BUY  ${activity.marketTitle.slice(0, 40).padEnd(40)} | ` +
         `${activity.outcome.padEnd(4)} @ $${activity.price.toFixed(3)} | ` +
-        `$${tradeAmount} → ${shares.toFixed(2)} shares | ` +
+        `$${amount.toFixed(2)}${sizeTag} → ${shares.toFixed(2)} shares | ` +
         `${trader.username ?? trader.address.slice(0, 8) + '...'} (#${trader.rank})`
       );
     } else {

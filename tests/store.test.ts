@@ -170,3 +170,33 @@ describe('store: trader history append + cap', () => {
     expect(h.sells[0].transaction_hash).toBe('h2');
   });
 });
+
+describe('store: GROUP D research columns', () => {
+  it('sourceNotional and entryPriceGap persist through open → close → reload', () => {
+    const t = makeTrade({ id: 'rd-1', sourceTradeId: 'rd-src-1' });
+    t.sourceNotional = 1234.56;
+    t.entryPriceGap = 0.025;
+    store.addOpenTrade(t);
+
+    store._resetStoreCache();
+    let s = store.readStore();
+    const open = s.openTrades.find(x => x.id === 'rd-1')!;
+    expect(open.sourceNotional).toBeCloseTo(1234.56, 10);
+    expect(open.entryPriceGap).toBeCloseTo(0.025, 10);
+
+    store.closeOpenTrade('0xabc', 'foo-market', 'Yes', 0.90);
+    store._resetStoreCache();
+    s = store.readStore();
+    const closed = s.closedTrades.find(x => x.id === 'rd-1')!;
+    expect(closed.sourceNotional).toBeCloseTo(1234.56, 10);
+    expect(closed.entryPriceGap).toBeCloseTo(0.025, 10);
+  });
+
+  it('trades without research fields persist as null and reload as undefined', () => {
+    store.addOpenTrade(makeTrade({ id: 'rd-2', sourceTradeId: 'rd-src-2' }));
+    store._resetStoreCache();
+    const open = store.readStore().openTrades.find(x => x.id === 'rd-2')!;
+    expect(open.sourceNotional).toBeUndefined();
+    expect(open.entryPriceGap).toBeUndefined();
+  });
+});

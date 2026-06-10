@@ -37,6 +37,7 @@ export interface RawPriceResponse {
   question?: string;
   slug?: string;
   outcomes?: RawPriceOutcome[];   // array, NOT a map
+  closed?: boolean;               // Gamma `closed` flag — true once the market is closed
   tick_size?: number;
   fee_bps?: number;
   [key: string]: unknown;
@@ -171,6 +172,7 @@ export async function getMarketPrice(slug: string): Promise<RawPriceResponse> {
   return {
     question: market.question as string | undefined,
     slug:     market.slug     as string | undefined,
+    closed:   market.closed === true,
     outcomes: outcomes.map((name, i) => ({
       outcome:    name,
       midpoint:   prices[i] != null ? Number(prices[i]) : null,

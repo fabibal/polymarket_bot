@@ -10,6 +10,7 @@ import { checkVpnConnectivity, RawActivityItem } from './bullpen';
 import { detectCategory } from './categories';
 import { tradeCostAdjustedPnl, tradeTotalCosts } from './simulator';
 import { groupStats } from './stats';
+import { getCircuitBreakerStatus, resetCircuitBreaker, rollingNetForTrader } from './risk';
 
 // $1k wallet-test cutover: leaderboard real copies frozen, watchlist-only sim begins.
 const TEST_START_MS = Date.UTC(2026, 4, 28, 0, 0, 0);
@@ -446,7 +447,9 @@ export function startDashboard(): void {
       testStart:                  new Date(TEST_START_MS).toISOString(),
       longshotSkipCount:          longshot.count,
       longshotSkipNotional:       longshot.notional,
-    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string; longshotSkipCount: number; longshotSkipNotional: number };
+      circuitBreaker:             getCircuitBreakerStatus(),
+      traderDecayThreshold30d:    CONFIG.TRADER_DECAY_THRESHOLD_30D,
+    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string; longshotSkipCount: number; longshotSkipNotional: number; circuitBreaker: ReturnType<typeof getCircuitBreakerStatus>; traderDecayThreshold30d: number };
     res.json(stats);
   });
 
@@ -692,9 +695,13 @@ export function startDashboard(): void {
         ? liqSamples.reduce((s, t) => s + (t.spreadAtEntry ?? 0), 0) / liqSamples.length
         : null;
 
+      // Rolling 30d net + distance to the decay kill-switch threshold.
+      const pnl30d = rollingNetForTrader(store.closedTrades, w.address, 30 * 86_400_000, Date.now());
+      const decayDistance = pnl30d - CONFIG.TRADER_DECAY_THRESHOLD_30D; // $ of headroom before auto-disable
+
       // Drop stale Falcon fields (leaderboard removed 2026-05-29 — no refresh path; no UI consumer).
       const { falconWinRate: _fwr, falconRoi: _fr, falconSharpe: _fs, ...wRest } = w;
-      return { ...wRest, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length };
+      return { ...wRest, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length, pnl30d, decayDistance, decayThreshold: CONFIG.TRADER_DECAY_THRESHOLD_30D };
     });
 
     // Watchlist-wide PNL totals (simulated)
@@ -1079,6 +1086,56 @@ export function startDashboard(): void {
     const shadow = edgeStats(store.shadowClosedTrades ?? []);
     const watchlist = edgeStats(store.closedTrades.filter(t => t.copiedTraderSource === 'watchlist'));
     res.json({ shadow, watchlist });
+  });
+
+  // ── Circuit breaker manual override ──────────────────────────────────────────
+  app.post('/api/breaker/reset', (_req, res) => {
+    resetCircuitBreaker();
+    res.json({ ok: true, circuitBreaker: getCircuitBreakerStatus() });
+  });
+
+  // ── Observation forward-test (copy-disabled watchlist traders) ───────────────
+  // Per-trader stats over the observation ledger: trades simulated with the full
+  // lifecycle but never copied. Same cost-adjusted basis as the active watchlist.
+  app.get('/api/observation', (_req, res) => {
+    const store = readStore();
+    const byTrader = new Map<string, typeof store.observationTrades>();
+    for (const t of store.observationTrades ?? []) {
+      const arr = byTrader.get(t.copiedTrader) ?? [];
+      arr.push(t);
+      byTrader.set(t.copiedTrader, arr);
+    }
+    const items = [...byTrader.entries()].map(([address, trades]) => {
+      const w = store.watchlistTraders.find(x => x.address === address);
+      const closed = trades.filter(t => t.status !== 'open');
+      const open   = trades.filter(t => t.status === 'open');
+      let netPnl = 0, grossWin = 0, grossLoss = 0, winners = 0;
+      for (const t of closed) {
+        const v = tradeCostAdjustedPnl(t);
+        netPnl += v;
+        if (v > 0) { winners++; grossWin += v; } else grossLoss += -v;
+      }
+      const unrealizedPnl = open.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
+      const avgEntryPrice = closed.length > 0
+        ? closed.reduce((s, t) => s + (Number(t.entryPrice) || 0), 0) / closed.length
+        : null;
+      const timestamps = trades.map(t => t.timestamp).sort();
+      return {
+        address,
+        label: w?.label ?? null,
+        copyEnabled: w?.copyEnabled ?? null,   // null = no longer on watchlist
+        openCount: open.length,
+        closedCount: closed.length,
+        winRate: closed.length >= 3 ? winners / closed.length : null,
+        profitFactor: (closed.length >= 3 && grossLoss > 0) ? grossWin / grossLoss : null,
+        netPnl,
+        unrealizedPnl,
+        avgEntryPrice,
+        firstTrade: timestamps[0] ?? null,
+        lastTrade: timestamps[timestamps.length - 1] ?? null,
+      };
+    }).sort((a, b) => b.netPnl - a.netPnl);
+    res.json({ count: items.length, items });
   });
 
   // ── Risk metrics ──────────────────────────────────────────────────────────────
