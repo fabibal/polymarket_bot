@@ -3,7 +3,7 @@ import https from 'https';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
-import { readStore, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount } from './store';
+import { readStore, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount, getSkippedTradeStats } from './store';
 import { DashboardStats } from './types';
 import { CONFIG } from './config';
 import { checkVpnConnectivity, RawActivityItem } from './bullpen';
@@ -408,6 +408,9 @@ export function startDashboard(): void {
     const testPnl    = testCloses.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
     const testTrades = testCloses.length;
 
+    // Per-trader longshot carve-out (0x12d6) — record-only count + would-be notional.
+    const longshot = getSkippedTradeStats('longshot_filter_0x12d6');
+
     const stats = {
       totalTrades: openTrades.length + closedTrades.length,
       openTrades: openTrades.length,
@@ -435,7 +438,9 @@ export function startDashboard(): void {
       testPnl,
       testTrades,
       testStart:                  new Date(TEST_START_MS).toISOString(),
-    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string };
+      longshotSkipCount:          longshot.count,
+      longshotSkipNotional:       longshot.notional,
+    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string; longshotSkipCount: number; longshotSkipNotional: number };
     res.json(stats);
   });
 

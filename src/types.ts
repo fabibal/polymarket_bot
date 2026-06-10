@@ -120,7 +120,6 @@ export interface TradesStore {
   traderHistory: Record<string, TraderHistory>;  // accumulated raw activity per trader
   lastLeaderboardUpdate: string;
   watchlistTraders: WatchlistTrader[];
-  traderFalconCache: Record<string, { winRate?: number; updatedAt: string }>;
   // Shadow tracking for excluded traders: observe without copying.
   shadowOpenTrades?: SimulatedTrade[];
   shadowClosedTrades?: SimulatedTrade[];

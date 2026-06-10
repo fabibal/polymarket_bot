@@ -283,30 +283,54 @@ export async function getTraderProfile(address: string): Promise<RawProfileRespo
 }
 
 /**
- * Check VPN connectivity via a direct HTTPS egress lookup (ipinfo.io) with a
- * 5-second timeout. Returns true when the request succeeds and the egress
- * country is not Hungary (the geo-blocked origin the VPN exists to mask).
+ * Check VPN connectivity via a direct HTTPS egress lookup. Returns true when a
+ * probe resolves an egress country that is not Hungary (the geo-blocked origin
+ * the VPN exists to mask).
+ *
+ * Resilient to a single service rate-limiting: probes Cloudflare's trace
+ * endpoint first (plain-text `loc=`, effectively no rate limit) and falls back
+ * to ipinfo.io only if that yields no country. ipinfo's free/unauthenticated
+ * tier returns HTTP 429 with a valid-JSON error body, which previously parsed
+ * cleanly but lacked `ip`/`country` and produced a false "VPN down" badge.
+ * Returns false only when a probe resolves country HU, or every probe fails.
  *
  * Note: this deliberately does NOT shell out to the bullpen CLI. The CLI's
  * authed path reads BULLPEN_HOME and refuses when the creds dir uid differs
  * from the process uid (root-vs-1000 under the bind-mount), which is unrelated
  * to actual tunnel health. A direct egress probe measures the tunnel itself.
  */
-export async function checkVpnConnectivity(): Promise<boolean> {
+function probeEgressCountry(url: string, parse: (status: number, body: string) => string | null): Promise<string | null> {
   return new Promise(resolve => {
-    const req = https.get('https://ipinfo.io/json', { timeout: 5_000 }, res => {
+    const req = https.get(url, { timeout: 5_000 }, res => {
       let body = '';
       res.on('data', d => body += d);
       res.on('end', () => {
-        try {
-          const d = JSON.parse(body);
-          resolve(!!d.ip && d.country !== 'HU');
-        } catch {
-          resolve(false);
-        }
+        try { resolve(parse(res.statusCode ?? 0, body)); }
+        catch { resolve(null); }
       });
     });
-    req.on('error', () => resolve(false));
-    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
   });
+}
+
+export async function checkVpnConnectivity(): Promise<boolean> {
+  // Primary: Cloudflare trace — plain text `loc=NL`, no rate limit.
+  let country = await probeEgressCountry('https://1.1.1.1/cdn-cgi/trace', (status, body) => {
+    if (status !== 200) return null;
+    const m = body.match(/^loc=([A-Z]{2})$/m);
+    return m ? m[1] : null;
+  });
+
+  // Fallback: ipinfo.io JSON (only when the primary yields no country).
+  if (!country) {
+    country = await probeEgressCountry('https://ipinfo.io/json', (status, body) => {
+      if (status !== 200) return null;
+      const d = JSON.parse(body);
+      return d.ip && d.country ? String(d.country) : null;
+    });
+  }
+
+  // Up only when a probe resolved a non-HU country. All probes failing → down.
+  return country != null && country !== 'HU';
 }

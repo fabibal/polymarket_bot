@@ -4,7 +4,7 @@
  * - SELL → close the oldest matching open position at sell price (realized PNL)
  */
 import { getTraderActivity, getOrderbookDepth, RawActivityItem } from './bullpen';
-import { readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSeen, appendTraderHistory } from './store';
+import { readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSeen, appendTraderHistory, addSkippedTrade } from './store';
 import { LeaderboardTrader, ActivityTrade, SimulatedTrade, TraderHistoryEntry } from './types';
 import { CONFIG } from './config';
 import { countWatchlistEntriesInWindow } from './filters';
@@ -115,6 +115,35 @@ export async function pollTrader(
     }
 
     if (activity.side === 'buy') {
+      // ── Per-trader longshot carve-out (NARROW exception to "watchlist bypasses
+      // all filters", added 2026-06-09) ── For one specific trader, refuse BUYs
+      // priced below LONGSHOT_FILTER_MAX_PRICE and record the would-be entry in
+      // skipped_trades for monitoring. See CLAUDE.md "Key rules".
+      if (
+        trader.address.toLowerCase() === CONFIG.LONGSHOT_FILTER_TRADER &&
+        activity.price < CONFIG.LONGSHOT_FILTER_MAX_PRICE
+      ) {
+        addSkippedTrade({
+          sourceTradeId:        activity.id,
+          timestamp:            activity.timestamp,
+          copiedTrader:         trader.address,
+          copiedTraderUsername: trader.username,
+          marketSlug:           activity.marketSlug,
+          marketTitle:          activity.marketTitle,
+          outcome:              activity.outcome,
+          entryPrice:           activity.price,
+          simulatedAmount:      tradeAmount,
+          simulatedShares:      tradeAmount / activity.price,
+          skipReason:           'longshot_filter_0x12d6',
+        });
+        console.log(
+          `[monitor] skip ${activity.marketSlug} entry=${activity.price.toFixed(3)} ` +
+          `trader=0x12d6 reason=longshot_filter`
+        );
+        markProcessed(activity.id);
+        continue;
+      }
+
       const currentStore = readStore();
 
       // ── Watchlist-only: per-market entry cap within a rolling window ──

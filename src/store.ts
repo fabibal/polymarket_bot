@@ -17,6 +17,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import type { Database as Db } from 'better-sqlite3';
+import { v4 as uuidv4 } from 'uuid';
 import {
   TradesStore, SimulatedTrade, LeaderboardTrader, WatchlistTrader,
   TraderHistoryEntry, LeaderboardFilters, LeaderboardStats,
@@ -45,7 +46,6 @@ const EMPTY_STORE = (): TradesStore => ({
   traderHistory: {},
   lastLeaderboardUpdate: new Date(0).toISOString(),
   watchlistTraders: [],
-  traderFalconCache: {},
   shadowOpenTrades: [],
   shadowClosedTrades: [],
   processedShadowIds: [],
@@ -237,6 +237,26 @@ CREATE TABLE IF NOT EXISTS trader_history_meta (
   address      TEXT PRIMARY KEY,
   last_fetched TEXT NOT NULL
 );
+
+-- Trades that an active filter refused to copy. Record-only (no PnL lifecycle):
+-- holds the would-be entry so the pattern can be monitored over time. Currently
+-- written by the per-trader longshot carve-out (skip_reason='longshot_filter_0x12d6').
+CREATE TABLE IF NOT EXISTS skipped_trades (
+  id                     TEXT PRIMARY KEY,
+  source_trade_id        TEXT NOT NULL,
+  timestamp              TEXT NOT NULL,
+  copied_trader          TEXT NOT NULL,
+  copied_trader_username TEXT,
+  market_slug            TEXT NOT NULL,
+  market_title           TEXT NOT NULL,
+  outcome                TEXT NOT NULL,
+  entry_price            REAL NOT NULL,
+  simulated_amount       REAL NOT NULL,
+  simulated_shares       REAL NOT NULL,
+  skip_reason            TEXT NOT NULL,
+  skipped_at             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skipped_reason ON skipped_trades (skip_reason, skipped_at);
 `;
 
 // ── DB lifecycle ────────────────────────────────────────────────────────────
@@ -713,6 +733,51 @@ export function addOpenTrade(trade: SimulatedTrade): void {
     }
   });
   tx();
+}
+
+/**
+ * Record a BUY that an active filter refused to copy. Record-only: no open/close
+ * lifecycle, no PnL resolution — just the would-be entry for monitoring. Not part
+ * of the TradesStore snapshot, so it writes directly to the DB without cache mirror.
+ */
+export interface SkippedTradeRecord {
+  sourceTradeId: string;
+  timestamp: string;
+  copiedTrader: string;
+  copiedTraderUsername?: string;
+  marketSlug: string;
+  marketTitle: string;
+  outcome: string;
+  entryPrice: number;
+  simulatedAmount: number;
+  simulatedShares: number;
+  skipReason: string;
+}
+
+export function addSkippedTrade(rec: SkippedTradeRecord): void {
+  const d = getDb();
+  d.prepare(
+    `INSERT INTO skipped_trades
+       (id, source_trade_id, timestamp, copied_trader, copied_trader_username,
+        market_slug, market_title, outcome, entry_price, simulated_amount,
+        simulated_shares, skip_reason, skipped_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(
+    uuidv4(), rec.sourceTradeId, rec.timestamp, rec.copiedTrader,
+    rec.copiedTraderUsername ?? null, rec.marketSlug, rec.marketTitle, rec.outcome,
+    rec.entryPrice, rec.simulatedAmount, rec.simulatedShares, rec.skipReason,
+    new Date().toISOString(),
+  );
+}
+
+/** Count + total would-be notional of skipped trades, optionally filtered by reason. */
+export function getSkippedTradeStats(reason?: string): { count: number; notional: number } {
+  const d = getDb();
+  const sql = reason
+    ? `SELECT COUNT(*) AS c, COALESCE(SUM(simulated_amount),0) AS n FROM skipped_trades WHERE skip_reason = ?`
+    : `SELECT COUNT(*) AS c, COALESCE(SUM(simulated_amount),0) AS n FROM skipped_trades`;
+  const row = (reason ? d.prepare(sql).get(reason) : d.prepare(sql).get()) as { c: number; n: number };
+  return { count: row.c, notional: row.n };
 }
 
 function applyExitCosts(trade: SimulatedTrade, exitPrice: number): void {

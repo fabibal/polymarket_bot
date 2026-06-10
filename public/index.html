@@ -610,6 +610,11 @@
       <div class="value blue" id="wl-s-test-trades">—</div>
       <div class="sub">watchlist closes since May 28</div>
     </div>
+    <div class="stat-card">
+      <div class="label">🚫 Longshot Skips <span style="color:var(--muted); font-weight:400;">· 0x12d6</span></div>
+      <div class="value" id="wl-s-longshot-skips">—</div>
+      <div class="sub" id="wl-s-longshot-skips-sub">&lt;$0.10 BUYs filtered · notional —</div>
+    </div>
   </div>
 
   <!-- Watchlist charts 2×2 -->
@@ -1939,6 +1944,15 @@
       }
       const testTradesEl = $('wl-s-test-trades');
       if (testTradesEl) testTradesEl.textContent = Number(s.testTrades || 0);
+
+      const lsEl = $('wl-s-longshot-skips');
+      if (lsEl) {
+        const n = Number(s.longshotSkipCount || 0);
+        lsEl.textContent = n;
+        lsEl.className = 'value ' + (n > 0 ? 'yellow' : 'blue');
+        const lsSub = $('wl-s-longshot-skips-sub');
+        if (lsSub) lsSub.textContent = `<$0.10 BUYs filtered · notional $${Number(s.longshotSkipNotional || 0).toFixed(0)}`;
+      }
 
       $('last-updated').textContent = 'Updated ' + timeAgo(s.lastUpdated);
       $('status-dot').className = 'ok';

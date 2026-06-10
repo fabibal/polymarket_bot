@@ -41,6 +41,21 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
   As of 2026-05-29 the now-inert filter config keys above were removed from `config.ts` and
   `docker-compose.yml`; the dead `!isWatchlist` / shadow branches in `monitor.ts` that read
   them were deleted.
+
+  **Per-trader carve-out exception (added 2026-06-09):** a single, NARROW exception to the
+  "bypass all filters" rule, scoped to ONE trader by full address. When a BUY comes from
+  `LONGSHOT_FILTER_TRADER` (`0x12d6cccfc7470a3f4bafc53599a4779cbf2cf2a8`, label
+  *Geopolitics-Macro*) at `entryPrice < LONGSHOT_FILTER_MAX_PRICE` (default `0.10`), the bot
+  **skips the copy** and instead records the would-be entry in the `skipped_trades` table with
+  `skip_reason='longshot_filter_0x12d6'`. Record-only — no PnL lifecycle. Logged as
+  `skip <slug> entry=<price> trader=0x12d6 reason=longshot_filter`. The check lives at the top
+  of the BUY branch in `monitor.ts` (before wallet/entry-cap/depth gates). Rationale: this
+  trader's sub-$0.10 longshots are a suspected losing pattern; the carve-out stops copying them
+  while `skipped_trades` preserves count + cumulative would-be notional so the pattern can be
+  monitored for change over time. Dashboard surfaces it via `/api/stats`
+  (`longshotSkipCount`, `longshotSkipNotional`) and the "🚫 Longshot Skips" card. This is the
+  ONLY per-trader filter override; to retire it, drop the `monitor.ts` block and the two config
+  keys. Other watchlist traders are unaffected.
 - `store.ts` persistence: `writeStore()` is an immediate atomic flush (temp+rename) used for financial mutations (addOpenTrade, closeOpenTrade, resolveByPrice) and user-driven dashboard actions. `markDirty()` defers the write; a 60 s background flusher started by `startAutoFlush()` in `index.ts` coalesces bursts. Signal handlers force a final flush on exit.
 - **`closed_trades` retention: unlimited.** As of 2026-05-27 the 7-day archival step in `runDailyCleanup()` was removed — the table holds the full history in-DB (query perf ~12 ms at 30k rows). Existing `data/archive/*.json` files are historical artifacts; the importer ran once to merge them back. Daily backups in `data/backups/` (last 30 retained) remain the disaster-recovery path. `traderHistory` and `processedTradeIds` still prune in the same daily run.
 

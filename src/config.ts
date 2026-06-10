@@ -36,6 +36,12 @@ export const CONFIG = {
   // validity of the watchlist edge by removing low-liquidity tail trades. Non-blocking
   // on depth-fetch failure (copy proceeds when orderbook unavailable).
   DEPTH_GATE_MIN_DEPTH_5: parseFloat(process.env.DEPTH_GATE_MIN_DEPTH_5 ?? '500'),
+  // Per-trader longshot carve-out (added 2026-06-09) — a NARROW exception to the
+  // "watchlist bypasses all filters" rule, scoped to ONE trader. When a BUY comes
+  // from LONGSHOT_FILTER_TRADER at entry price < LONGSHOT_FILTER_MAX_PRICE, skip the
+  // copy and record it in skipped_trades (record-only, for monitoring). See CLAUDE.md.
+  LONGSHOT_FILTER_TRADER: (process.env.LONGSHOT_FILTER_TRADER ?? '0x12d6cccfc7470a3f4bafc53599a4779cbf2cf2a8').toLowerCase(),
+  LONGSHOT_FILTER_MAX_PRICE: parseFloat(process.env.LONGSHOT_FILTER_MAX_PRICE ?? '0.10'),
   // Falcon (Polymarket Analytics) API key — optional, enables Falcon leaderboard enrichment
   POLYMARKET_ANALYTICS_API_KEY: process.env.POLYMARKET_ANALYTICS_API_KEY ?? '',
 };
