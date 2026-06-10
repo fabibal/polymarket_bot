@@ -97,4 +97,13 @@ describe('observation ledger: lifecycle', () => {
     expect(s.openTrades.length).toBe(0);
     expect(s.observationTrades.length).toBe(1);
   });
+
+  it('sourceNotional persists and reloads on observation trades (FIX 4)', () => {
+    store.addObservationTrade(makeObsTrade({ id: 'o-n', sourceTradeId: 's-n', sourceNotional: 789.12 }));
+    store.addObservationTrade(makeObsTrade({ id: 'o-no', sourceTradeId: 's-no' }));
+    store._resetStoreCache();
+    const s = store.readStore();
+    expect(s.observationTrades.find(t => t.id === 'o-n')!.sourceNotional).toBeCloseTo(789.12, 10);
+    expect(s.observationTrades.find(t => t.id === 'o-no')!.sourceNotional).toBeUndefined();
+  });
 });

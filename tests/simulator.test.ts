@@ -13,7 +13,7 @@ vi.mock('../src/config', () => ({
 
 import {
   computeEntryCosts, tradeCostAdjustedPnl, tradeTotalCosts,
-  decideThresholdResolution, isMarketResolved,
+  decideThresholdResolution, isMarketResolved, snapDelistExitPrice,
 } from '../src/simulator';
 import { SimulatedTrade } from '../src/types';
 import { RawPriceResponse } from '../src/bullpen';
@@ -188,6 +188,23 @@ describe('decideThresholdResolution', () => {
   it('confirmed resolution ignores the age gate', () => {
     expect(decideThresholdResolution({ ...base, entryPrice: 0.5, currentPrice: 1, ageMs: 1_000, marketResolved: true }))
       .toEqual({ action: 'resolve', exitPrice: 1, confirmed: true });
+  });
+});
+
+describe('snapDelistExitPrice', () => {
+  it('snaps decided-looking last prices to the actual payout', () => {
+    expect(snapDelistExitPrice(0.93)).toBe(1);
+    expect(snapDelistExitPrice(0.97)).toBe(1);
+    expect(snapDelistExitPrice(1)).toBe(1);
+    expect(snapDelistExitPrice(0.07)).toBe(0);
+    expect(snapDelistExitPrice(0.02)).toBe(0);
+    expect(snapDelistExitPrice(0)).toBe(0);
+  });
+
+  it('leaves mid prices unchanged (outcome unknowable from a delisting)', () => {
+    expect(snapDelistExitPrice(0.5)).toBe(0.5);
+    expect(snapDelistExitPrice(0.929)).toBe(0.929);
+    expect(snapDelistExitPrice(0.071)).toBe(0.071);
   });
 });
 

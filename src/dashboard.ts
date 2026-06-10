@@ -695,13 +695,15 @@ export function startDashboard(): void {
         ? liqSamples.reduce((s, t) => s + (t.spreadAtEntry ?? 0), 0) / liqSamples.length
         : null;
 
-      // Rolling 30d net + distance to the decay kill-switch threshold.
+      // Rolling 30d + 7d net + distance to each decay kill-switch threshold.
       const pnl30d = rollingNetForTrader(store.closedTrades, w.address, 30 * 86_400_000, Date.now());
-      const decayDistance = pnl30d - CONFIG.TRADER_DECAY_THRESHOLD_30D; // $ of headroom before auto-disable
+      const pnl7d  = rollingNetForTrader(store.closedTrades, w.address,  7 * 86_400_000, Date.now());
+      const decayDistance   = pnl30d - CONFIG.TRADER_DECAY_THRESHOLD_30D; // $ headroom, 30d window
+      const decayDistance7d = pnl7d  - CONFIG.TRADER_DECAY_THRESHOLD_7D;  // $ headroom, 7d window
 
       // Drop stale Falcon fields (leaderboard removed 2026-05-29 — no refresh path; no UI consumer).
       const { falconWinRate: _fwr, falconRoi: _fr, falconSharpe: _fs, ...wRest } = w;
-      return { ...wRest, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length, pnl30d, decayDistance, decayThreshold: CONFIG.TRADER_DECAY_THRESHOLD_30D };
+      return { ...wRest, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length, pnl30d, pnl7d, decayDistance, decayDistance7d, decayThreshold: CONFIG.TRADER_DECAY_THRESHOLD_30D, decayThreshold7d: CONFIG.TRADER_DECAY_THRESHOLD_7D };
     });
 
     // Watchlist-wide PNL totals (simulated)

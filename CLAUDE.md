@@ -73,6 +73,12 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
   (`price-proxy resolve ... (Gamma does not show market resolved)`) — kept because Gamma
   delists resolved sports markets within ~a day, usually before ever showing
   `closed=true`, so requiring confirmation would misbook winners as 'expired' at last price.
+  **Delist snap (FIX 1, later 2026-06-10):** when a market is marked dead (Gamma delisted),
+  positions whose last price was ≥0.93/≤0.07 book the actual payout 1/0 as `resolved`
+  (`snapDelistExitPrice`) — delisting IS the resolution event, so winners are no longer
+  clipped by ~the spread and mislabeled 'expired'. Deliberately NOT applied to the 7-day
+  max-hold expiry of still-listed markets: a live market at 0.95 is not resolved (Fujimori
+  precedent) — there, last price stays the honest mark-to-market exit.
 - **Observation forward-test (added 2026-06-10):** copy-disabled watchlist traders are no
   longer discarded — their trades run the full simulated lifecycle in the separate
   `observation_trades` table (single table; rows mutate in place from `status='open'` to
@@ -82,19 +88,23 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
   rows never enter `open_trades`, so the wallet cap is unaffected. Store API:
   `addObservationTrade`, `closeObservationTrade` (FIFO), `updateObservationTradePrices`,
   `resolveObservationByPrice`. The 5-min price sweep covers observation positions in the
-  same pass (shared slug fetches). Dashboard: `/api/observation` (per-trader n/WR/PF/net,
-  cost-adjusted) + "👁 Observation Forward-Test" section. Logs: `[OBS] BUY/SELL`. Purpose:
-  macro-scan candidates can be added copy-disabled and build a real forward-test record
-  before copying is enabled.
+  same pass (shared slug fetches). Observation BUYs also persist `source_notional` (FIX 4)
+  so conviction analysis covers candidates, not just live copies. Dashboard:
+  `/api/observation` (per-trader n/WR/PF/net, cost-adjusted) + "👁 Observation
+  Forward-Test" section. Logs: `[OBS] BUY/SELL`. Purpose: macro-scan candidates can be
+  added copy-disabled and build a real forward-test record before copying is enabled.
 - **Risk controls (added 2026-06-10, `src/risk.ts`):** two automatic guards, both alerting
   via Telegram (`src/alerts.ts`, creds injected from `~/.env.shared` via `env_file` in
   docker-compose — the `[polymarket_bot]` prefix groups messages):
   1. *Per-trader decay kill switch* — after each poll cycle, any copy-enabled watchlist
-     trader whose rolling 30d cost-adjusted net drops below `TRADER_DECAY_THRESHOLD_30D`
-     (default -50) is auto-disabled (`watchlist_traders.auto_disabled_at/_reason`); the
-     trader keeps accruing observation forward-test data. Manual re-enable via dashboard
-     clears the marker, but if still under threshold the next check re-disables — raise
-     the env threshold to truly override.
+     trader whose rolling cost-adjusted net drops below threshold in EITHER window is
+     auto-disabled (`watchlist_traders.auto_disabled_at/_reason`): 30d (slow decay) or
+     7d (FIX 2 — catches sustained bleeding hidden by a big 30d win cushion; e.g.
+     Shadow-Top4's +$1.3k 30d cushion made the 30d switch decorative). The alert and
+     reason name the window that fired. The trader keeps accruing observation
+     forward-test data. Manual re-enable via dashboard clears the marker, but if still
+     under threshold the next check re-disables — raise the env threshold to truly
+     override.
   2. *Daily-loss circuit breaker* — when total cost-adjusted realized PnL over the last
      24h drops below `DAILY_LOSS_CIRCUIT_BREAKER` (default -30), ALL copying pauses for
      24h (`meta.circuit_breaker_until`). While paused, polling continues and cursors
@@ -104,9 +114,18 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
      reset: dashboard banner button → `POST /api/breaker/reset`. Note: trades that close
      during the pause count in the next 24h window, so a still-bleeding book can re-trip
      immediately on resume — intended.
+  **Thresholds are %-of-wallet (FIX 3):** `TRADER_DECAY_THRESHOLD_PCT_30D=5`,
+  `TRADER_DECAY_THRESHOLD_PCT_7D=3`, `DAILY_LOSS_CIRCUIT_BREAKER_PCT=3` — derived from
+  `SIMULATED_WALLET_SIZE` (`resolveRiskThreshold` in config.ts; at $1000 → -50/-30/-30,
+  identical to the old absolutes). Absolute env vars (`TRADER_DECAY_THRESHOLD_30D`/`_7D`,
+  `DAILY_LOSS_CIRCUIT_BREAKER`) override the % when set; wallet sim disabled (size 0) →
+  fixed absolute defaults. Because thresholds scale with the wallet, enabling
+  `DYNAMIC_SIZING=true` no longer requires retuning them by hand — but sanity-check the
+  derived values whenever `SIMULATED_WALLET_SIZE` or `MAX_TRADE_AMOUNT` changes.
   Dashboard: `/api/stats` returns `circuitBreaker {active, until, net24h, threshold}` +
-  `traderDecayThreshold30d`; `/api/watchlist` items carry `pnl30d`/`decayDistance`; the
-  watchlist table shows a "30d Net (kill switch)" column with headroom tooltip and ⛔ badge.
+  `traderDecayThreshold30d`; `/api/watchlist` items carry `pnl30d`/`pnl7d`/
+  `decayDistance`/`decayDistance7d`; the watchlist table shows a "30d Net (kill switch)"
+  column whose tooltip lists both windows' headroom, with a ⛔ badge when auto-disabled.
   Window math is pure (`rollingNetForTrader`, `rollingNetTotal`, `evaluateCircuitBreaker`)
   and unit-tested (`tests/risk.test.ts` host-runnable, `tests/kill_switch.test.ts` DB-backed).
 - **Sizing + maker-execution research (added 2026-06-10, GROUP D):**

@@ -78,8 +78,13 @@ services:
       - WALLET_CAP_UTILIZATION=0.80  # stop opening new BUYs at 80% utilization ($800 of $1000)
       - GAS_COST_PER_BUY=0  # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
       - SLIPPAGE_RATE=0.02   # 2% slippage each side (entry at ask, exit at bid)
-      - TRADER_DECAY_THRESHOLD_30D=-50   # per-trader kill switch: auto-disable copy when 30d net (cost-adj) drops below
-      - DAILY_LOSS_CIRCUIT_BREAKER=-30   # account breaker: pause ALL copying 24h when 24h realized net drops below
+      # Risk thresholds as % of SIMULATED_WALLET_SIZE (scale automatically with wallet
+      # and stay sane if DYNAMIC_SIZING multiplies trade sizes). At $1000: -50 / -30 / -30.
+      # Absolute overrides (TRADER_DECAY_THRESHOLD_30D / _7D, DAILY_LOSS_CIRCUIT_BREAKER)
+      # win over the % vars when set.
+      - TRADER_DECAY_THRESHOLD_PCT_30D=5   # per-trader kill switch, 30d window
+      - TRADER_DECAY_THRESHOLD_PCT_7D=3    # per-trader kill switch, 7d window (catches slow bleed under a 30d cushion)
+      - DAILY_LOSS_CIRCUIT_BREAKER_PCT=3   # account breaker: pause ALL copying 24h
       - DYNAMIC_SIZING=false             # OFF: flat per-trader copyAmount. ON: 1% of ask_depth_5, clamped to [MIN,MAX]_TRADE_AMOUNT
       - MIN_TRADE_AMOUNT=5               # dynamic-sizing floor ($)
       - MAX_TRADE_AMOUNT=25              # dynamic-sizing cap ($)

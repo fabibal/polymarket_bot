@@ -1,3 +1,28 @@
+/**
+ * Risk-threshold resolution (FIX 3, 2026-06-10): explicit absolute env var wins;
+ * otherwise derive from a %-of-wallet env var (so thresholds scale with
+ * SIMULATED_WALLET_SIZE and stay sane if DYNAMIC_SIZING multiplies trade sizes);
+ * if the wallet simulation is disabled (size 0), fall back to a fixed absolute.
+ * Returns a negative dollar threshold.
+ */
+export function resolveRiskThreshold(
+  absRaw: string | undefined,
+  pctRaw: string | undefined,
+  walletSize: number,
+  defaultPct: number,
+  defaultAbs: number,
+): number {
+  if (absRaw != null && absRaw !== '' && Number.isFinite(parseFloat(absRaw))) return parseFloat(absRaw);
+  if (walletSize > 0) {
+    const pct = pctRaw != null && pctRaw !== '' && Number.isFinite(parseFloat(pctRaw))
+      ? parseFloat(pctRaw) : defaultPct;
+    return -(pct / 100) * walletSize;
+  }
+  return defaultAbs;
+}
+
+const WALLET_SIZE = parseFloat(process.env.SIMULATED_WALLET_SIZE ?? '0');
+
 export const CONFIG = {
   DRY_RUN: true,
   TRADE_AMOUNT: 5, // $5 per simulated trade
@@ -49,14 +74,25 @@ export const CONFIG = {
   MIN_TRADE_AMOUNT: parseFloat(process.env.MIN_TRADE_AMOUNT ?? '5'),
   MAX_TRADE_AMOUNT: parseFloat(process.env.MAX_TRADE_AMOUNT ?? '25'),
   // Per-trader kill switch (added 2026-06-10): when a copy-enabled watchlist trader's
-  // rolling 30-day cost-adjusted net PnL drops below this, copying is auto-disabled
-  // (the trader keeps accruing observation forward-test data) and a Telegram alert fires.
-  TRADER_DECAY_THRESHOLD_30D: parseFloat(process.env.TRADER_DECAY_THRESHOLD_30D ?? '-50'),
+  // rolling cost-adjusted net PnL drops below either window's threshold, copying is
+  // auto-disabled (the trader keeps accruing observation forward-test data) and a
+  // Telegram alert fires. The 7d window (FIX 2) catches sustained bleeding that a big
+  // 30d win cushion would otherwise hide. Thresholds: absolute env var wins; otherwise
+  // % of SIMULATED_WALLET_SIZE (TRADER_DECAY_THRESHOLD_PCT_30D=5, _PCT_7D=3).
+  TRADER_DECAY_THRESHOLD_30D: resolveRiskThreshold(
+    process.env.TRADER_DECAY_THRESHOLD_30D, process.env.TRADER_DECAY_THRESHOLD_PCT_30D,
+    WALLET_SIZE, 5, -50),
+  TRADER_DECAY_THRESHOLD_7D: resolveRiskThreshold(
+    process.env.TRADER_DECAY_THRESHOLD_7D, process.env.TRADER_DECAY_THRESHOLD_PCT_7D,
+    WALLET_SIZE, 3, -30),
   // Account-wide circuit breaker (added 2026-06-10): when total cost-adjusted realized
   // PnL over the last 24h drops below this, ALL copying pauses for 24h (cursors still
   // advance; missed trades are NOT copied late on resume). Auto-resumes after 24h;
-  // manual reset via dashboard POST /api/breaker/reset.
-  DAILY_LOSS_CIRCUIT_BREAKER: parseFloat(process.env.DAILY_LOSS_CIRCUIT_BREAKER ?? '-30'),
+  // manual reset via dashboard POST /api/breaker/reset. Threshold: absolute env var
+  // wins; otherwise DAILY_LOSS_CIRCUIT_BREAKER_PCT=3 % of SIMULATED_WALLET_SIZE.
+  DAILY_LOSS_CIRCUIT_BREAKER: resolveRiskThreshold(
+    process.env.DAILY_LOSS_CIRCUIT_BREAKER, process.env.DAILY_LOSS_CIRCUIT_BREAKER_PCT,
+    WALLET_SIZE, 3, -30),
   // Falcon (Polymarket Analytics) API key — optional, enables Falcon leaderboard enrichment
   POLYMARKET_ANALYTICS_API_KEY: process.env.POLYMARKET_ANALYTICS_API_KEY ?? '',
 };

@@ -137,6 +137,7 @@ export async function pollTrader(
       if (activity.side === 'buy') {
         const shares = tradeAmount / activity.price;
         const entryCosts = computeEntryCosts(activity.price, shares);
+        const obsNotional = activity.usdcSize ?? (activity.size > 0 ? activity.price * activity.size : undefined);
         addObservationTrade({
           id: uuidv4(),
           sourceTradeId: activity.id,
@@ -157,6 +158,7 @@ export async function pollTrader(
           status: 'open',
           entryGasCost:      entryCosts.gas,
           entrySlippageCost: entryCosts.slippage,
+          sourceNotional:    obsNotional != null && Number.isFinite(obsNotional) ? obsNotional : undefined,
         });
         newTrades++;
         console.log(

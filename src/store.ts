@@ -276,6 +276,7 @@ CREATE TABLE IF NOT EXISTS observation_trades (
   entry_slippage_cost       REAL,
   exit_slippage_cost        REAL,
   cost_adjusted_pnl         REAL,
+  source_notional           REAL,
   insertion_order           INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_observation_fifo
@@ -362,8 +363,9 @@ function migrateDepthColumns(d: Db): void {
 }
 
 // GROUP D research columns (2026-06-10): trader's own bet notional + taker
-// entry-price gap, on the live copy tables only (shadow tables are frozen;
-// observation trades don't fetch depth).
+// entry-price gap on the live copy tables (shadow tables are frozen).
+// observation_trades gets source_notional only (FIX 4) — conviction analysis
+// applies to candidates too, but there's no depth fetch there, so no gap.
 function migrateResearchColumns(d: Db): void {
   for (const t of ['open_trades', 'closed_trades']) {
     const existing = new Set(
@@ -372,6 +374,10 @@ function migrateResearchColumns(d: Db): void {
     if (!existing.has('source_notional'))  d.exec(`ALTER TABLE ${t} ADD COLUMN source_notional REAL`);
     if (!existing.has('entry_price_gap')) d.exec(`ALTER TABLE ${t} ADD COLUMN entry_price_gap REAL`);
   }
+  const obsExisting = new Set(
+    (d.prepare(`PRAGMA table_info(observation_trades)`).all() as Array<{ name: string }>).map(r => r.name)
+  );
+  if (!obsExisting.has('source_notional')) d.exec('ALTER TABLE observation_trades ADD COLUMN source_notional REAL');
 }
 
 function migrateAutoDisableColumns(d: Db): void {
@@ -882,8 +888,9 @@ const OBS_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
   exit_price, realized_pnl, closed_at, holding_period_ms,
-  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, insertion_order)`;
-const OBS_INSERT_PLACEHOLDERS = '(' + new Array(26).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl,
+  source_notional, insertion_order)`;
+const OBS_INSERT_PLACEHOLDERS = '(' + new Array(27).fill('?').join(',') + ')';
 
 function obsTradeRowParams(t: SimulatedTrade, order: number): any[] {
   return [
@@ -896,6 +903,7 @@ function obsTradeRowParams(t: SimulatedTrade, order: number): any[] {
     t.holdingPeriodMs ?? null,
     t.entryGasCost ?? null, t.entrySlippageCost ?? null,
     t.exitSlippageCost ?? null, t.costAdjustedPnl ?? null,
+    t.sourceNotional ?? null,
     order,
   ];
 }

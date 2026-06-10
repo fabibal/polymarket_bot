@@ -117,6 +117,25 @@ export function decideThresholdResolution(args: {
   return { action: 'resolve', exitPrice: crossedHigh ? 1 : 0, confirmed: false };
 }
 
+/**
+ * Exit price for a position whose market got DELISTED from Gamma (FIX 1,
+ * 2026-06-10). Delisting is the resolution event for sports markets that never
+ * show closed:true, so a decided-looking last price snaps to the actual payout:
+ * ≥0.93 → 1.00 (winner, previously clipped by ~the spread and mislabeled
+ * 'expired'), ≤0.07 → 0.00, otherwise the last fetched price (unknown outcome).
+ * Deliberately NOT applied to the max-hold (7d) expiry of still-listed markets:
+ * a live market sitting at 0.95 is not resolved (e.g. the Fujimori election
+ * market traded 0.935 for weeks while open) — there, last price is the honest
+ * mark-to-market exit a real wallet could take.
+ */
+export function snapDelistExitPrice(lastPrice: number): number {
+  // 1e-9 epsilon: 1 - 0.93 is 0.069999... in floats, and 0.07 is a real tick
+  // that must snap to 0 per the ≤0.07 rule.
+  if (lastPrice >= CONFIG.RESOLVED_THRESHOLD) return 1;
+  if (lastPrice <= 1 - CONFIG.RESOLVED_THRESHOLD + 1e-9) return 0;
+  return lastPrice;
+}
+
 // Log-once dedup for hold/proxy lines — beyond-threshold longshots would
 // otherwise re-log on every 5-min sweep for days.
 const loggedResolutionKeys = new Set<string>();
@@ -209,13 +228,26 @@ export async function updatePrices(): Promise<void> {
             const deadPositions = store.openTrades.filter(t => t.marketSlug === slug);
             const deadObs = obsOpen.filter(t => t.marketSlug === slug);
             if (deadPositions.length > 0 || deadObs.length > 0) {
-              staleResolutions.push(
-                ...deadPositions.map(t => ({ id: t.id, exitPrice: t.currentPrice ?? t.entryPrice }))
-              );
-              obsStaleResolutions.push(
-                ...deadObs.map(t => ({ id: t.id, exitPrice: t.currentPrice ?? t.entryPrice }))
-              );
-              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead, expiring ${deadPositions.length + deadObs.length} position(s) at last price`);
+              // Snap decided-looking last prices to the actual payout (delisting
+              // = resolution); those book as 'resolved'. Mid prices keep the
+              // last-price 'expired' exit (outcome unknowable from here).
+              let snapped = 0;
+              for (const [trades, res, stale] of [
+                [deadPositions, resolutions, staleResolutions],
+                [deadObs, obsResolutions, obsStaleResolutions],
+              ] as const) {
+                for (const t of trades) {
+                  const last = t.currentPrice ?? t.entryPrice;
+                  const exitPrice = snapDelistExitPrice(last);
+                  if (exitPrice !== last || last === 0 || last === 1) {
+                    res.push({ id: t.id, exitPrice });
+                    snapped++;
+                  } else {
+                    stale.push({ id: t.id, exitPrice: last });
+                  }
+                }
+              }
+              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead: ${snapped} resolved at snapped payout, ${deadPositions.length + deadObs.length - snapped} expired at last price`);
             } else {
               console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead (no open positions)`);
             }

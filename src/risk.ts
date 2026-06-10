@@ -76,8 +76,10 @@ export function evaluateCircuitBreaker(args: {
 // ── Side-effecting checks (called from the polling loop) ────────────────────
 
 /**
- * Disable copying for any copy-enabled watchlist trader whose rolling 30d net
- * is below the decay threshold. Returns the addresses disabled this call.
+ * Disable copying for any copy-enabled watchlist trader whose rolling net is
+ * below the decay threshold in EITHER window: 30d (slow decay) or 7d (FIX 2 —
+ * sustained bleeding that a big 30d win cushion would otherwise hide).
+ * Returns the addresses disabled this call.
  */
 export async function checkTraderDecay(nowMs: number = Date.now()): Promise<string[]> {
   const store = readStore();
@@ -85,15 +87,22 @@ export async function checkTraderDecay(nowMs: number = Date.now()): Promise<stri
   for (const w of store.watchlistTraders ?? []) {
     if (!w.copyEnabled) continue;
     const net30d = rollingNetForTrader(store.closedTrades, w.address, 30 * 86_400_000, nowMs);
-    if (net30d >= CONFIG.TRADER_DECAY_THRESHOLD_30D) continue;
+    const net7d  = rollingNetForTrader(store.closedTrades, w.address,  7 * 86_400_000, nowMs);
+    let trigger: { window: '30d' | '7d'; net: number; threshold: number } | null = null;
+    if (net30d < CONFIG.TRADER_DECAY_THRESHOLD_30D) {
+      trigger = { window: '30d', net: net30d, threshold: CONFIG.TRADER_DECAY_THRESHOLD_30D };
+    } else if (net7d < CONFIG.TRADER_DECAY_THRESHOLD_7D) {
+      trigger = { window: '7d', net: net7d, threshold: CONFIG.TRADER_DECAY_THRESHOLD_7D };
+    }
+    if (!trigger) continue;
 
-    const reason = `30d net $${net30d.toFixed(2)} below decay threshold $${CONFIG.TRADER_DECAY_THRESHOLD_30D}`;
+    const reason = `${trigger.window} net $${trigger.net.toFixed(2)} below decay threshold $${trigger.threshold.toFixed(2)}`;
     autoDisableWatchlistTrader(w.address, reason);
     disabled.push(w.address);
     const name = w.label ?? w.address.slice(0, 10) + '...';
     console.log(`[risk] ${new Date(nowMs).toISOString()} trader decay: ${name} (${w.address}) — ${reason}. Copy disabled automatically.`);
     await sendTelegramAlert(
-      `⚠️ trader decay detected: ${name} ${w.address} 30d net = $${net30d.toFixed(2)}. Copy disabled automatically.`
+      `⚠️ trader decay detected: ${name} ${w.address} ${trigger.window} net = $${trigger.net.toFixed(2)}. Copy disabled automatically.`
     );
   }
   return disabled;

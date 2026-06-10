@@ -7,6 +7,7 @@ vi.mock('../src/config', () => ({
     SLIPPAGE_RATE: 0,           // zero so window sums are exact in assertions
     RESOLVED_THRESHOLD: 0.93,
     TRADER_DECAY_THRESHOLD_30D: -50,
+    TRADER_DECAY_THRESHOLD_7D: -30,
     DAILY_LOSS_CIRCUIT_BREAKER: -30,
   },
 }));
