@@ -129,16 +129,20 @@ async function pool(items, fn, n) {
 
 (async () => {
   const db = new Database('/app/data/store.db', { readonly: true });
-  const addrs = db.prepare('SELECT lower(address) AS a FROM trader_falcon_cache').all().map(r=>r.a);
   const watchlist = new Set(db.prepare('SELECT lower(address) AS a FROM watchlist_traders').all().map(r=>r.a));
   const excluded = new Set(db.prepare('SELECT lower(address) AS a FROM excluded_traders').all().map(r=>r.a));
   db.close();
-  console.log(`[scan] cached=${addrs.length}, watchlist=${watchlist.size}, excluded=${excluded.size}`);
 
-  console.log('[scan] fetching falcon 7d for cross-ref...');
+  // Candidate universe: union of Falcon 7d/30d/90d leaderboards. (Previously
+  // read from trader_falcon_cache, dropped in the 2026-05-29 watchlist-only
+  // cleanup — the stale reference broke the scan with SQLITE_ERROR.)
+  console.log('[scan] fetching falcon 7d/30d/90d for candidate universe...');
   const fal7 = await fetchFalcon('7d');
   const set7 = new Set(fal7.map(t=>t.address));
-  console.log(`[scan] falcon 7d: ${fal7.length} addrs`);
+  const fal30 = await fetchFalcon('30d');
+  const fal90 = await fetchFalcon('90d');
+  const addrs = [...new Set([...fal7, ...fal30, ...fal90].map(t=>t.address))];
+  console.log(`[scan] universe=${addrs.length} (7d=${fal7.length}, 30d=${fal30.length}, 90d=${fal90.length}), watchlist=${watchlist.size}, excluded=${excluded.size}`);
 
   console.log(`[scan] scanning 90d activity for ${addrs.length} addrs @ concurrency=${CONCURRENCY}...`);
   const t0 = Date.now();
