@@ -23,6 +23,15 @@ export function resolveRiskThreshold(
 
 const WALLET_SIZE = parseFloat(process.env.SIMULATED_WALLET_SIZE ?? '0');
 
+// Daily-loss circuit breaker kill value: DAILY_LOSS_CIRCUIT_BREAKER=off (or
+// false/disabled/none) disables the breaker entirely — no trip, no pause, the
+// meta key is ignored. INTENTIONALLY DISABLED 2026-06-11: a single bad day
+// doesn't predict future performance; the per-trader decay kill switches cover
+// the real risk. Re-enable by setting the env var to a number (absolute $) or
+// removing it (falls back to DAILY_LOSS_CIRCUIT_BREAKER_PCT of wallet).
+const BREAKER_RAW = (process.env.DAILY_LOSS_CIRCUIT_BREAKER ?? '').trim().toLowerCase();
+const BREAKER_DISABLED = ['off', 'false', 'disabled', 'none'].includes(BREAKER_RAW);
+
 export const CONFIG = {
   DRY_RUN: true,
   TRADE_AMOUNT: 5, // $5 per simulated trade
@@ -49,7 +58,7 @@ export const CONFIG = {
   // 2% slippage each side (entry at ask, exit at bid) still applies.
   GAS_COST_PER_BUY: parseFloat(process.env.GAS_COST_PER_BUY ?? '0'),
   SLIPPAGE_RATE:    parseFloat(process.env.SLIPPAGE_RATE    ?? '0.02'),
-  // Simulated wallet cap — when >0, stop opening new BUYs (both watchlist and leaderboard)
+  // Simulated wallet cap — when >0, stop opening new BUYs
   // once sum(simulatedAmount) on open trades reaches SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION.
   // 0 disables the check. Buffer keeps headroom for slippage/price drift in a real wallet.
   SIMULATED_WALLET_SIZE: parseFloat(process.env.SIMULATED_WALLET_SIZE ?? '0'),
@@ -90,9 +99,11 @@ export const CONFIG = {
   // advance; missed trades are NOT copied late on resume). Auto-resumes after 24h;
   // manual reset via dashboard POST /api/breaker/reset. Threshold: absolute env var
   // wins; otherwise DAILY_LOSS_CIRCUIT_BREAKER_PCT=3 % of SIMULATED_WALLET_SIZE.
+  DAILY_LOSS_BREAKER_ENABLED: !BREAKER_DISABLED,
   DAILY_LOSS_CIRCUIT_BREAKER: resolveRiskThreshold(
-    process.env.DAILY_LOSS_CIRCUIT_BREAKER, process.env.DAILY_LOSS_CIRCUIT_BREAKER_PCT,
+    BREAKER_DISABLED ? undefined : process.env.DAILY_LOSS_CIRCUIT_BREAKER,
+    process.env.DAILY_LOSS_CIRCUIT_BREAKER_PCT,
     WALLET_SIZE, 3, -30),
-  // Falcon (Polymarket Analytics) API key — optional, enables Falcon leaderboard enrichment
+  // Falcon (Polymarket Analytics) API key — optional, used by the weekly macro-scan Falcon enrichment
   POLYMARKET_ANALYTICS_API_KEY: process.env.POLYMARKET_ANALYTICS_API_KEY ?? '',
 };

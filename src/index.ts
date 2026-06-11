@@ -34,8 +34,8 @@ async function backfillOpenTradeDepth(): Promise<void> {
   console.log(`[backfill] Done: ${ok}/${targets.length} succeeded`);
 }
 
-// Watchlist-only polling (leaderboard tracking removed 2026-05-29). Each watchlist
-// trader's recent activity is polled and copied per its copyEnabled / copyAmount.
+// Watchlist-only polling. Each watchlist trader's recent activity is polled
+// and copied per its copyEnabled / copyAmount.
 async function runPollingCycle(): Promise<void> {
   resetSkipDedup();
   const store = readStore();
@@ -56,9 +56,8 @@ async function runPollingCycle(): Promise<void> {
 
   let totalNew = 0;
   for (const w of watchlistTraders) {
-    const trader = { rank: 0, address: w.address, weeklyPnl: 0 };
     try {
-      const n = await pollTrader(trader, { copyEnabled: w.copyEnabled, source: 'watchlist', tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT, suspended });
+      const n = await pollTrader({ address: w.address }, { copyEnabled: w.copyEnabled, tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT, suspended });
       totalNew += n;
     } catch (err) {
       // Per-trader isolation: one trader's failure (e.g. an SQL error mid-poll)
@@ -99,7 +98,7 @@ async function main(): Promise<void> {
   console.log('║  Polymarket Copy Trading Bot  [DRY RUN]    ║');
   console.log('╚════════════════════════════════════════════╝');
   console.log(`  Trade amount : $${CONFIG.TRADE_AMOUNT} per trade (simulated)`);
-  console.log(`  Tracking     : Watchlist traders only (leaderboard removed)`);
+  console.log(`  Tracking     : Watchlist traders only`);
   console.log(`  Poll interval: every ${CONFIG.POLL_INTERVAL_MS / 1_000}s per trader`);
   console.log(`  Price update : every ${CONFIG.PRICE_UPDATE_INTERVAL_MS / 60_000} min`);
   console.log('');

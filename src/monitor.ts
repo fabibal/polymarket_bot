@@ -1,16 +1,16 @@
 /**
- * Polls a single trader's recent activity.
- * - BUY  → create a new simulated $5 position (subject to price/spread filters)
+ * Polls a single watchlist trader's recent activity.
+ * - BUY  → create a new simulated $5 position (subject to entry cap, depth gate, wallet cap)
  * - SELL → close the oldest matching open position at sell price (realized PNL)
  */
-import { getTraderActivity, getOrderbookDepth, RawActivityItem } from './bullpen';
+import { getTraderActivity, getOrderbookDepth, getTraderPositionSize, RawActivityItem } from './bullpen';
 import {
   readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSeen,
   appendTraderHistory, addSkippedTrade, addObservationTrade, closeObservationTrade,
 } from './store';
-import { LeaderboardTrader, ActivityTrade, SimulatedTrade, TraderHistoryEntry } from './types';
+import { ActivityTrade, SimulatedTrade, TraderHistoryEntry } from './types';
 import { CONFIG } from './config';
-import { countWatchlistEntriesInWindow, computeDynamicTradeAmount } from './filters';
+import { countWatchlistEntriesInWindow, computeDynamicTradeAmount, computeSellFraction, isMatchStyleSlug } from './filters';
 import { computeEntryCosts } from './simulator';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -57,8 +57,8 @@ function parseActivity(raw: RawActivityItem): ActivityTrade | null {
 }
 
 export async function pollTrader(
-  trader: LeaderboardTrader,
-  options: { copyEnabled?: boolean; source?: 'leaderboard' | 'watchlist'; tradeAmount?: number; suspended?: boolean } = {}
+  trader: { address: string; username?: string },
+  options: { copyEnabled?: boolean; tradeAmount?: number; suspended?: boolean } = {}
 ): Promise<number> {
   const copyEnabled  = options.copyEnabled !== false; // default true
   // Daily-loss circuit breaker: copy-enabled traders' trades are discarded
@@ -67,7 +67,6 @@ export async function pollTrader(
   // ledger is not real money and must stay continuous.
   const suspended    = options.suspended === true;
   const tradeAmount  = options.tradeAmount ?? CONFIG.TRADE_AMOUNT;
-  const isWatchlist  = options.source === 'watchlist';
   const store = readStore();
   const since = store.traderLastSeen[trader.address];
 
@@ -143,7 +142,7 @@ export async function pollTrader(
           sourceTradeId: activity.id,
           timestamp: activity.timestamp,
           copiedTrader: trader.address,
-          copiedTraderRank: trader.rank,
+          copiedTraderRank: 0, // legacy leaderboard-era column; always 0
           copiedTraderUsername: trader.username,
           copiedTraderSource: 'observation',
           marketSlug: activity.marketSlug,
@@ -223,44 +222,50 @@ export async function pollTrader(
 
       const currentStore = readStore();
 
-      // ── Watchlist-only: per-market entry cap within a rolling window ──
-      // Watchlist bypasses MAX_POSITIONS_PER_MARKET, but rapid BUY-SELL-BUY cycles
-      // on fast sports/tennis markets still drag PnL. Counts both open and closed
-      // watchlist entries on this slug within the window.
-      if (isWatchlist) {
-        const watchlistEntries = countWatchlistEntriesInWindow(
-          currentStore.openTrades,
-          currentStore.closedTrades,
-          activity.marketSlug,
-          Date.now(),
-          CONFIG.MAX_WATCHLIST_ENTRY_WINDOW_MS,
+      // ── Watchlist-only: per-market entry cap ──
+      // Match-style markets (ISO date in slug, e.g. fif-ksa-sen-2026-06-09-draw)
+      // resolve once, so every re-entry is a correlated bet on the same outcome:
+      // LIFETIME cap of 1 entry per slug. Stacking analysis 2026-06-11 (test
+      // window since 05-28): entries #2+ on match slugs added ~$0 net PnL but
+      // tripled drawdown; on 06-10 two match losses stacked to -$35.70 and
+      // tripped the circuit breaker. Non-dated markets (geo/political) keep the
+      // rolling-window cap — they live for weeks and scale-in/out re-entries
+      // there are genuine new trades (cap=1 would cost most of that cohort's
+      // net). Counts both open and closed watchlist entries on the slug.
+      const matchStyle = isMatchStyleSlug(activity.marketSlug);
+      const maxEntries = matchStyle ? 1 : CONFIG.MAX_WATCHLIST_ENTRIES_PER_MARKET;
+      const windowMs   = matchStyle ? Number.POSITIVE_INFINITY : CONFIG.MAX_WATCHLIST_ENTRY_WINDOW_MS;
+      const watchlistEntries = countWatchlistEntriesInWindow(
+        currentStore.openTrades,
+        currentStore.closedTrades,
+        activity.marketSlug,
+        Date.now(),
+        windowMs,
+      );
+      if (watchlistEntries >= maxEntries) {
+        const capDesc = matchStyle
+          ? 'match-style lifetime cap 1'
+          : `${CONFIG.MAX_WATCHLIST_ENTRIES_PER_MARKET}/${Math.round(CONFIG.MAX_WATCHLIST_ENTRY_WINDOW_MS / 3600000)}h`;
+        console.log(
+          `[monitor] Skip BUY ${activity.marketSlug} — watchlist entry cap ${capDesc} reached (n=${watchlistEntries})`
         );
-        if (watchlistEntries >= CONFIG.MAX_WATCHLIST_ENTRIES_PER_MARKET) {
-          const windowH = Math.round(CONFIG.MAX_WATCHLIST_ENTRY_WINDOW_MS / 3600000);
-          console.log(
-            `[monitor] Skip BUY ${activity.marketSlug} — watchlist entry cap ${CONFIG.MAX_WATCHLIST_ENTRIES_PER_MARKET}/${windowH}h reached (n=${watchlistEntries})`
-          );
-          markProcessed(activity.id);
-          continue;
-        }
+        markProcessed(activity.id);
+        continue;
       }
 
       // Depth gate: fetch CLOB orderbook BEFORE creating the trade so we can
       // skip thin books. Non-blocking — depth fetch failure falls through to copy.
       // Runs before the wallet cap since dynamic sizing needs ask_depth_5 to know
       // the final amount (costs two HTTP calls on wallet-capped skips — rare).
-      let watchlistDepth: Awaited<ReturnType<typeof getOrderbookDepth>> = null;
-      if (isWatchlist) {
-        watchlistDepth = await getOrderbookDepth(activity.marketSlug, activity.outcome);
-        if (watchlistDepth && watchlistDepth.askDepth5 < CONFIG.DEPTH_GATE_MIN_DEPTH_5) {
-          console.log(
-            `[monitor] Skip BUY ${activity.marketSlug} — depth_gate: ` +
-            `ask_depth_5=$${watchlistDepth.askDepth5.toFixed(0)} below ` +
-            `$${CONFIG.DEPTH_GATE_MIN_DEPTH_5} threshold`
-          );
-          markProcessed(activity.id);
-          continue;
-        }
+      const watchlistDepth = await getOrderbookDepth(activity.marketSlug, activity.outcome);
+      if (watchlistDepth && watchlistDepth.askDepth5 < CONFIG.DEPTH_GATE_MIN_DEPTH_5) {
+        console.log(
+          `[monitor] Skip BUY ${activity.marketSlug} — depth_gate: ` +
+          `ask_depth_5=$${watchlistDepth.askDepth5.toFixed(0)} below ` +
+          `$${CONFIG.DEPTH_GATE_MIN_DEPTH_5} threshold`
+        );
+        markProcessed(activity.id);
+        continue;
       }
 
       // Dynamic sizing (DYNAMIC_SIZING=false → amount = per-trader copyAmount).
@@ -296,7 +301,7 @@ export async function pollTrader(
         sourceTradeId: activity.id,
         timestamp: activity.timestamp,
         copiedTrader: trader.address,
-        copiedTraderRank: trader.rank,
+        copiedTraderRank: 0, // legacy leaderboard-era column; always 0
         copiedTraderUsername: trader.username,
         copiedTraderSource: 'watchlist',
         marketSlug: activity.marketSlug,
@@ -317,44 +322,55 @@ export async function pollTrader(
       const notional = activity.usdcSize ?? (activity.size > 0 ? activity.price * activity.size : undefined);
       if (notional != null && Number.isFinite(notional)) trade.sourceNotional = notional;
       if (watchlistDepth) trade.entryPriceGap = watchlistDepth.bestAsk - activity.price;
-      // Watchlist BUYs: persist the depth snapshot fetched above for the gate check.
-      if (isWatchlist) {
-        if (watchlistDepth) {
-          trade.bestAsk = watchlistDepth.bestAsk;
-          trade.bestBid = watchlistDepth.bestBid;
-          trade.askDepth5 = watchlistDepth.askDepth5;
-          trade.askDepth10 = watchlistDepth.askDepth10;
-          trade.spreadAtEntry = watchlistDepth.spread;
-          trade.depthBackfilled = false;
-          console.log(
-            `[depth] ${activity.marketSlug} ${activity.outcome} ` +
-            `ask=${watchlistDepth.bestAsk.toFixed(3)} bid=${watchlistDepth.bestBid.toFixed(3)} ` +
-            `spr=${watchlistDepth.spread.toFixed(3)} d5=$${watchlistDepth.askDepth5.toFixed(0)} d10=$${watchlistDepth.askDepth10.toFixed(0)}`
-          );
-        } else {
-          console.log(`[depth] ${activity.marketSlug} ${activity.outcome} — orderbook fetch failed (gate bypassed)`);
-        }
+      // Persist the depth snapshot fetched above for the gate check.
+      if (watchlistDepth) {
+        trade.bestAsk = watchlistDepth.bestAsk;
+        trade.bestBid = watchlistDepth.bestBid;
+        trade.askDepth5 = watchlistDepth.askDepth5;
+        trade.askDepth10 = watchlistDepth.askDepth10;
+        trade.spreadAtEntry = watchlistDepth.spread;
+        trade.depthBackfilled = false;
+        console.log(
+          `[depth] ${activity.marketSlug} ${activity.outcome} ` +
+          `ask=${watchlistDepth.bestAsk.toFixed(3)} bid=${watchlistDepth.bestBid.toFixed(3)} ` +
+          `spr=${watchlistDepth.spread.toFixed(3)} d5=$${watchlistDepth.askDepth5.toFixed(0)} d10=$${watchlistDepth.askDepth10.toFixed(0)}`
+        );
+      } else {
+        console.log(`[depth] ${activity.marketSlug} ${activity.outcome} — orderbook fetch failed (gate bypassed)`);
       }
       addOpenTrade(trade);
       newTrades++;
-      const srcTag = isWatchlist ? '[WL]' : '[DRY_RUN]';
       const sizeTag = amount !== tradeAmount ? ` (dyn, base $${tradeAmount})` : '';
       console.log(
-        `${srcTag} BUY  ${activity.marketTitle.slice(0, 40).padEnd(40)} | ` +
+        `[WL] BUY  ${activity.marketTitle.slice(0, 40).padEnd(40)} | ` +
         `${activity.outcome.padEnd(4)} @ $${activity.price.toFixed(3)} | ` +
         `$${amount.toFixed(2)}${sizeTag} → ${shares.toFixed(2)} shares | ` +
-        `${trader.username ?? trader.address.slice(0, 8) + '...'} (#${trader.rank})`
+        `${trader.username ?? trader.address.slice(0, 8) + '...'}`
       );
     } else {
       // SELL: close the oldest matching simulated position.
-      const closed = closeOpenTrade(trader.address, activity.marketSlug, activity.outcome, activity.price);
+      // Partial-sell research: record what fraction of THEIR position this
+      // SELL was (we always close 100% of ours). The /positions lookup runs
+      // only when we actually hold a matching copy — sells we never copied
+      // cost no API calls. The snapshot is the trader's balance at poll time
+      // (post-sell, up to one poll cycle late); lookup failure → not recorded.
+      const holding = readStore().openTrades.some(
+        t => t.copiedTrader === trader.address && t.marketSlug === activity.marketSlug && t.outcome === activity.outcome
+      );
+      let sellFraction: number | undefined;
+      if (holding) {
+        const remaining = await getTraderPositionSize(trader.address, activity.marketSlug, activity.outcome);
+        if (remaining !== null) sellFraction = computeSellFraction(activity.size, remaining) ?? undefined;
+      }
+      const closed = closeOpenTrade(trader.address, activity.marketSlug, activity.outcome, activity.price, sellFraction);
       markProcessed(activity.id);
       if (closed) {
         newTrades++;
+        const fracTag = sellFraction != null ? ` | sold ${(sellFraction * 100).toFixed(0)}% of theirs` : '';
         console.log(
           `[WL] SELL ${activity.marketTitle.slice(0, 40).padEnd(40)} | ` +
           `${activity.outcome.padEnd(4)} @ $${activity.price.toFixed(3)} | ` +
-          `${trader.username ?? trader.address.slice(0, 8) + '...'} (#${trader.rank})`
+          `${trader.username ?? trader.address.slice(0, 8) + '...'}${fracTag}`
         );
       }
     }

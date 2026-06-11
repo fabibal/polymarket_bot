@@ -6,6 +6,7 @@ import {
   checkBuyFilters,
   isSpreadOverLimit,
   getOutcomeSpread,
+  computeSellFraction,
   PriceLimits,
 } from '../src/filters';
 
@@ -103,5 +104,24 @@ describe('getOutcomeSpread', () => {
   it('returns null when outcomes is missing or outcome not found', () => {
     expect(getOutcomeSpread({} as any, 'Yes')).toBeNull();
     expect(getOutcomeSpread({ outcomes: [{ outcome: 'No', spread: 0.02 }] } as any, 'Yes')).toBeNull();
+  });
+});
+
+describe('computeSellFraction', () => {
+  it('computes sold / (remaining + sold)', () => {
+    expect(computeSellFraction(100, 900)).toBeCloseTo(0.1, 10);  // sold 10%
+    expect(computeSellFraction(500, 500)).toBeCloseTo(0.5, 10);
+    expect(computeSellFraction(100, 0)).toBe(1);                 // full exit
+  });
+
+  it('treats negative remaining (API noise) as a full exit', () => {
+    expect(computeSellFraction(100, -5)).toBe(1);
+  });
+
+  it('returns null on unusable inputs', () => {
+    expect(computeSellFraction(0, 100)).toBeNull();
+    expect(computeSellFraction(-1, 100)).toBeNull();
+    expect(computeSellFraction(NaN, 100)).toBeNull();
+    expect(computeSellFraction(100, NaN)).toBeNull();
   });
 });

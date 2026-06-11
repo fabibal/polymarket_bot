@@ -136,6 +136,31 @@ export function snapDelistExitPrice(lastPrice: number): number {
   return lastPrice;
 }
 
+/**
+ * Exit decision for a position on a DELISTED market (2026-06-11). Preferred
+ * path: the caller re-queries Gamma with `closed=true` (delisted resolved
+ * markets stay retrievable there) and passes the market in when
+ * isMarketResolved confirms it — the position's outcome books its actual
+ * pinned payout (status 'resolved', even when the last live price was
+ * mid-range and would previously have been guessed wrong). Fallback when
+ * Gamma doesn't confirm: legacy last-price inference via snapDelistExitPrice
+ * (decided-looking prices snap to 1/0 as 'resolved', mid prices exit
+ * 'expired' at last price).
+ */
+export function decideDelistExit(
+  resolvedMarket: RawPriceResponse | null,
+  outcome: string,
+  lastPrice: number,
+): { exitPrice: number; status: 'resolved' | 'expired'; confirmed: boolean } {
+  if (resolvedMarket) {
+    const p = extractOutcomePrice(resolvedMarket, outcome);
+    if (p !== null) return { exitPrice: p >= 0.5 ? 1 : 0, status: 'resolved', confirmed: true };
+  }
+  const snap = snapDelistExitPrice(lastPrice);
+  const decided = snap !== lastPrice || lastPrice === 0 || lastPrice === 1;
+  return { exitPrice: snap, status: decided ? 'resolved' : 'expired', confirmed: false };
+}
+
 // Log-once dedup for hold/proxy lines — beyond-threshold longshots would
 // otherwise re-log on every 5-min sweep for days.
 const loggedResolutionKeys = new Set<string>();
@@ -228,26 +253,37 @@ export async function updatePrices(): Promise<void> {
             const deadPositions = store.openTrades.filter(t => t.marketSlug === slug);
             const deadObs = obsOpen.filter(t => t.marketSlug === slug);
             if (deadPositions.length > 0 || deadObs.length > 0) {
-              // Snap decided-looking last prices to the actual payout (delisting
-              // = resolution); those book as 'resolved'. Mid prices keep the
-              // last-price 'expired' exit (outcome unknowable from here).
-              let snapped = 0;
+              // Delisting = resolution. Ask Gamma directly with closed=true
+              // (delisted resolved markets vanish from the default query but
+              // stay retrievable with the closed filter) and book each
+              // outcome's ACTUAL payout when confirmed. Only when Gamma
+              // doesn't confirm fall back to last-price inference: snap
+              // decided-looking prices to 1/0 as 'resolved', mid prices keep
+              // the last-price 'expired' exit (outcome unknowable from here).
+              let resolvedMarket: RawPriceResponse | null = null;
+              try {
+                const closedData = await getMarketPrice(slug, true);
+                if (isMarketResolved(closedData)) resolvedMarket = closedData;
+              } catch { /* not in Gamma even with closed=true — price fallback below */ }
+
+              let confirmed = 0, snapped = 0, expired = 0;
               for (const [trades, res, stale] of [
                 [deadPositions, resolutions, staleResolutions],
                 [deadObs, obsResolutions, obsStaleResolutions],
               ] as const) {
                 for (const t of trades) {
                   const last = t.currentPrice ?? t.entryPrice;
-                  const exitPrice = snapDelistExitPrice(last);
-                  if (exitPrice !== last || last === 0 || last === 1) {
-                    res.push({ id: t.id, exitPrice });
-                    snapped++;
+                  const exit = decideDelistExit(resolvedMarket, t.outcome, last);
+                  if (exit.status === 'resolved') {
+                    res.push({ id: t.id, exitPrice: exit.exitPrice });
+                    exit.confirmed ? confirmed++ : snapped++;
                   } else {
-                    stale.push({ id: t.id, exitPrice: last });
+                    stale.push({ id: t.id, exitPrice: exit.exitPrice });
+                    expired++;
                   }
                 }
               }
-              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead: ${snapped} resolved at snapped payout, ${deadPositions.length + deadObs.length - snapped} expired at last price`);
+              console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead: ${confirmed} resolved at Gamma-confirmed payout, ${snapped} resolved at snapped payout, ${expired} expired at last price`);
             } else {
               console.log(`[simulator] ${slug} — ${fails} fetch failures, marking dead (no open positions)`);
             }

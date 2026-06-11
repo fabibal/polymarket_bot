@@ -1,4 +1,6 @@
-export interface LeaderboardTrader {
+// Row in tracked_traders — written externally by the weekly macro scan,
+// read by /api/discovery/candidates for Falcon enrichment.
+export interface TrackedTrader {
   rank: number;
   address: string;
   username?: string;
@@ -45,6 +47,7 @@ export interface SimulatedTrade {
   copiedTrader: string;
   copiedTraderRank: number;
   copiedTraderUsername?: string;
+  // 'leaderboard' appears only on historical rows (leaderboard copying removed 2026-05-29).
   copiedTraderSource?: 'leaderboard' | 'watchlist' | 'observation';
   marketSlug: string;
   marketTitle: string;
@@ -74,6 +77,12 @@ export interface SimulatedTrade {
   // execution would cost vs a maker limit at the trader's price.
   sourceNotional?: number;
   entryPriceGap?: number;
+  // Set on copy-SELL closes (2026-06-11): fraction of the trader's OWN position
+  // their SELL represents (soldTokens / (remaining + soldTokens) via the
+  // data-api /positions snapshot at copy time). We always close 100% of ours,
+  // so values < 1 quantify the partial-sell mismatch. Unset when the position
+  // lookup failed or the close wasn't a copy-SELL (threshold/expiry/delist).
+  sourceSellFraction?: number;
   // Orderbook snapshot at fill time. Populated for watchlist BUYs via CLOB
   // /book; depthBackfilled=true if filled in after the fact from current state.
   bestAsk?: number;
@@ -104,10 +113,9 @@ export interface TraderHistory {
 }
 
 export interface TradesStore {
-  // Frozen historical record (leaderboard removed 2026-05-29). Loaded read-only:
-  // the weekly macro scan updates tracked_traders externally and
-  // /api/discovery/candidates reads falconSharpe from it. Never persisted back.
-  trackedTraders: LeaderboardTrader[];
+  // Loaded read-only: the weekly macro scan updates tracked_traders externally
+  // and /api/discovery/candidates reads falconSharpe from it. Never persisted back.
+  trackedTraders: TrackedTrader[];
   openTrades: SimulatedTrade[];
   closedTrades: SimulatedTrade[];
   processedTradeIds: string[];
@@ -118,9 +126,6 @@ export interface TradesStore {
   // full open/close lifecycle in place (status open → resolved/expired).
   // Never copied live; excluded from wallet cap and all entry gates.
   observationTrades: SimulatedTrade[];
-  // Frozen historical record (leaderboard removed 2026-05-29). Loaded read-only
-  // for /api/shadow/stats; never persisted back.
-  shadowClosedTrades?: SimulatedTrade[];
 }
 
 export interface DashboardStats {

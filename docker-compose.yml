@@ -41,6 +41,11 @@ services:
     # host-mounted bullpen creds. Running as root tripped the CLI's BULLPEN_HOME
     # ownership check ("owned by uid 1000, not current uid 0") after a CLI bump.
     user: "1000:1000"
+    # Host docker group (gid 988) — required to read /var/run/docker.sock as a
+    # non-root user; without it every dashboard container-stats call fails EACCES.
+    # Host-specific gid: `stat -c %g /var/run/docker.sock` if the host changes.
+    group_add:
+      - "988"
     # Route ALL traffic through the gluetun VPN container
     network_mode: "service:gluetun"
     depends_on:
@@ -84,7 +89,12 @@ services:
       # win over the % vars when set.
       - TRADER_DECAY_THRESHOLD_PCT_30D=5   # per-trader kill switch, 30d window
       - TRADER_DECAY_THRESHOLD_PCT_7D=3    # per-trader kill switch, 7d window (catches slow bleed under a 30d cushion)
-      - DAILY_LOSS_CIRCUIT_BREAKER_PCT=3   # account breaker: pause ALL copying 24h
+      # Account-wide daily-loss breaker INTENTIONALLY DISABLED 2026-06-11: a single
+      # bad day doesn't predict future performance; the per-trader decay kill
+      # switches cover the real risk. Re-enable: set to a number or remove the var
+      # (falls back to DAILY_LOSS_CIRCUIT_BREAKER_PCT below).
+      - DAILY_LOSS_CIRCUIT_BREAKER=off
+      - DAILY_LOSS_CIRCUIT_BREAKER_PCT=3   # only used if the breaker is re-enabled
       - DYNAMIC_SIZING=false             # OFF: flat per-trader copyAmount. ON: 1% of ask_depth_5, clamped to [MIN,MAX]_TRADE_AMOUNT
       - MIN_TRADE_AMOUNT=5               # dynamic-sizing floor ($)
       - MAX_TRADE_AMOUNT=25              # dynamic-sizing cap ($)

@@ -6,7 +6,11 @@
  *   2. Account-wide daily-loss circuit breaker — total cost-adjusted realized
  *      PnL over the last 24h; below DAILY_LOSS_CIRCUIT_BREAKER all copying
  *      pauses for 24h (cursors still advance — missed trades are NOT copied
- *      late). Auto-resumes; manual reset via dashboard.
+ *      late). Auto-resumes; manual reset via POST /api/breaker/reset.
+ *      INTENTIONALLY DISABLED 2026-06-11 (DAILY_LOSS_CIRCUIT_BREAKER=off in
+ *      docker-compose.yml): a single bad day doesn't predict future
+ *      performance; the per-trader decay kill switches cover the real risk.
+ *      Code kept for possible re-enable — see config.ts BREAKER_DISABLED.
  *
  * Window math is pure and unit-tested; side effects (disable, alert, meta
  * state) live in the two check functions called from the polling loop.
@@ -112,6 +116,7 @@ let breakerLoggedThisPause = false;
 
 /** True while the daily-loss pause is active. Logs once per pause window. */
 export function isCircuitBreakerActive(nowMs: number = Date.now()): boolean {
+  if (!CONFIG.DAILY_LOSS_BREAKER_ENABLED) return false;
   const raw = getMetaValue(BREAKER_META_KEY);
   if (raw == null) { breakerLoggedThisPause = false; return false; }
   const untilMs = new Date(raw).getTime();
@@ -133,6 +138,7 @@ export function isCircuitBreakerActive(nowMs: number = Date.now()): boolean {
  * each polling cycle (when not already paused).
  */
 export async function checkCircuitBreaker(nowMs: number = Date.now()): Promise<boolean> {
+  if (!CONFIG.DAILY_LOSS_BREAKER_ENABLED) return false;
   const store = readStore();
   const net24h = rollingNetTotal(store.closedTrades, 86_400_000, nowMs);
   const raw = getMetaValue(BREAKER_META_KEY);
@@ -159,15 +165,17 @@ export function resetCircuitBreaker(): void {
   console.log('[risk] circuit breaker manually reset — copying resumed');
 }
 
-/** Status for /api/stats + dashboard banner. */
+/** Status for /api/stats. Always reports inactive while the breaker is disabled. */
 export function getCircuitBreakerStatus(nowMs: number = Date.now()): {
-  active: boolean; until: string | null; net24h: number; threshold: number;
+  enabled: boolean; active: boolean; until: string | null; net24h: number; threshold: number;
 } {
   const store = readStore();
+  const enabled = CONFIG.DAILY_LOSS_BREAKER_ENABLED;
   const raw = getMetaValue(BREAKER_META_KEY);
   const untilMs = raw != null ? new Date(raw).getTime() : null;
-  const active = untilMs != null && !Number.isNaN(untilMs) && nowMs < untilMs;
+  const active = enabled && untilMs != null && !Number.isNaN(untilMs) && nowMs < untilMs;
   return {
+    enabled,
     active,
     until: active ? raw : null,
     net24h: rollingNetTotal(store.closedTrades, 86_400_000, nowMs),

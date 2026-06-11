@@ -102,10 +102,29 @@ export interface WatchlistEntry {
 }
 
 /**
+ * Match-style markets carry an ISO date in the slug, e.g.
+ * `fif-ksa-sen-2026-06-09-draw`, `es2-mal-lpm-2026-06-10-lpm`. These resolve
+ * once (a match has one result), so every re-entry on the same slug is a
+ * correlated bet on the same outcome — they get a LIFETIME entry cap of 1.
+ * Long-lived geo/political markets spell dates out
+ * (`us-x-iran-permanent-peace-deal-by-june-30-2026`) and don't match.
+ *
+ * Month/day ranges are validated so Polymarket's numeric dedup suffixes
+ * (`...-by-june-30-2026-837-641-896-8`) can't false-positive on a
+ * `-NNNN-NN-NN-` shaped run of id digits.
+ */
+export function isMatchStyleSlug(slug: string): boolean {
+  return /-\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(-|$)/.test(slug);
+}
+
+/**
  * Counts watchlist BUYs on a given market within a rolling window.
  * Inspects both still-open and previously-closed trades — the existing
  * MAX_POSITIONS_PER_MARKET counts only concurrent positions, so sequential
  * BUY-SELL-BUY cycles on fast sports/tennis markets slip past it.
+ *
+ * Pass `windowMs = Infinity` for a lifetime count (no time cutoff) — used by
+ * the match-style per-slug lifetime cap.
  */
 export function countWatchlistEntriesInWindow(
   openTrades: ReadonlyArray<WatchlistEntry>,
@@ -131,4 +150,20 @@ export function countWatchlistEntriesInWindow(
     if (tsMs >= cutoff) n++;
   }
   return n;
+}
+
+/**
+ * Fraction of the trader's OWN position a SELL represents (partial-sell
+ * research, 2026-06-11). `remainingSize` is their token balance AFTER the
+ * sell (data-api /positions snapshot), `soldSize` the tokens in the SELL
+ * activity item, so fraction = sold / (remaining + sold). We always close
+ * 100% of our copy, so values < 1 quantify the mismatch. Returns null when
+ * the inputs can't produce a meaningful fraction. Clamped to (0, 1] —
+ * a negative remaining (API noise) is treated as a full exit.
+ */
+export function computeSellFraction(soldSize: number, remainingSize: number): number | null {
+  if (!Number.isFinite(soldSize) || soldSize <= 0) return null;
+  if (!Number.isFinite(remainingSize)) return null;
+  const before = Math.max(remainingSize, 0) + soldSize;
+  return Math.min(soldSize / before, 1);
 }

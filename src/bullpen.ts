@@ -152,8 +152,13 @@ function httpsGet(url: string, timeoutMs = 10_000): Promise<unknown> {
 
 const GAMMA_BASE = 'https://gamma-api.polymarket.com';
 
-export async function getMarketPrice(slug: string): Promise<RawPriceResponse> {
-  const url = `${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}`;
+/**
+ * closedOnly=true appends `&closed=true` — delisted resolved markets disappear
+ * from the default query (the 404-equivalent that marks them dead) but stay
+ * retrievable with the closed filter, outcomePrices pinned to the final 0/1.
+ */
+export async function getMarketPrice(slug: string, closedOnly = false): Promise<RawPriceResponse> {
+  const url = `${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}${closedOnly ? '&closed=true' : ''}`;
   const data = await httpsGet(url) as unknown[];
 
   if (!Array.isArray(data) || data.length === 0) {
@@ -238,6 +243,41 @@ export async function getOrderbookDepth(
       else break;
     }
     return { bestAsk, bestBid, spread: bestAsk - bestBid, askDepth5, askDepth10 };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Trader's remaining token balance for one (market, outcome) via the data-api
+ * /positions endpoint, filtered server-side by conditionId (Gamma slug lookup,
+ * with a closed=true retry in case the market was just delisted). Returns the
+ * token count (same unit as activity `size`), 0 when the query succeeds but no
+ * position row exists (fully exited), or null on any failure — callers treat
+ * null as "unknown" and skip recording.
+ */
+export async function getTraderPositionSize(
+  address: string,
+  slug: string,
+  outcome: string,
+): Promise<number | null> {
+  try {
+    let markets = await httpsGet(`${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}`) as unknown[];
+    if (!Array.isArray(markets) || markets.length === 0) {
+      markets = await httpsGet(`${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}&closed=true`) as unknown[];
+    }
+    if (!Array.isArray(markets) || markets.length === 0) return null;
+    const conditionId = (markets[0] as Record<string, unknown>).conditionId;
+    if (typeof conditionId !== 'string' || !conditionId) return null;
+
+    const positions = await httpsGet(
+      `${DATA_API_BASE}/positions?user=${encodeURIComponent(address)}&market=${encodeURIComponent(conditionId)}&sizeThreshold=0`
+    ) as Array<Record<string, unknown>>;
+    if (!Array.isArray(positions)) return null;
+    const row = positions.find(p => String(p.outcome ?? '').toLowerCase() === outcome.toLowerCase());
+    if (!row) return 0;
+    const size = Number(row.size);
+    return Number.isFinite(size) && size > 0 ? size : 0;
   } catch {
     return null;
   }

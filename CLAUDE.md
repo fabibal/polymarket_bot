@@ -4,9 +4,11 @@ DRY_RUN simulation-only copy bot. Tracks a persistent watchlist of traders; simu
 
 **Watchlist-only architecture (as of 2026-05-29).** Leaderboard tracking was removed completely. The bot polls **only** `watchlist_traders`; there is no leaderboard fetch, no Falcon leaderboard refresh, and no shadow polling. `runPollingCycle()` in `src/index.ts` iterates the watchlist and calls `pollTrader(trader, { source: 'watchlist', copyEnabled, tradeAmount })` — nothing else.
 
-History: leaderboard was first demoted to shadow-only on 2026-05-28 (lifetime leaderboard real-copy PNL was -$2,451 over 9,258 closed trades — no demonstrable edge), then removed entirely on 2026-05-29. On removal: `src/leaderboard.ts` was deleted; `refreshLeaderboard` and the periodic refresh were removed from `index.ts`; auto-exclusion logic and its config (`AUTO_EXCLUDE_WIN_RATE_THRESHOLD`, `AUTO_EXCLUDE_MIN_TRADES`) plus `LEADERBOARD_LIMIT` / `LEADERBOARD_REFRESH_MS` were dropped from `config.ts`; `tests/auto_exclusion.test.ts` was deleted. DB: `tracked_traders` and `shadow_open_trades` were purged; `shadow_closed_trades` and `excluded_traders` are kept as a **historical record** (`shadow_closed_trades` still surfaced read-only via `/api/shadow/stats`; `excluded_traders` is no longer read by any endpoint — frozen table only).
+History: leaderboard was first demoted to shadow-only on 2026-05-28 (lifetime leaderboard real-copy PNL was -$2,451 over 9,258 closed trades — no demonstrable edge), then removed entirely on 2026-05-29. On removal: `src/leaderboard.ts` was deleted; `refreshLeaderboard` and the periodic refresh were removed from `index.ts`; auto-exclusion logic and its config (`AUTO_EXCLUDE_WIN_RATE_THRESHOLD`, `AUTO_EXCLUDE_MIN_TRADES`) plus `LEADERBOARD_LIMIT` / `LEADERBOARD_REFRESH_MS` were dropped from `config.ts`; `tests/auto_exclusion.test.ts` was deleted. DB: `tracked_traders` and `shadow_open_trades` were purged; `shadow_closed_trades` and `excluded_traders` are kept as a **historical record** (neither is read by any endpoint — frozen tables only).
 
 A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `!isWatchlist` real-copy branches and `hasSufficientSample` in `src/monitor.ts`; orphaned `store.ts` exports (`updateTrackedTraders`, `updateTraderLastOnLeaderboard`, `setAutoExclusion`, `setLeaderboardStats`, `updateWatchlistFalconData`, `updateTraderFalconCache`, `setTraderExclusion`, `isShadowProcessed`, `addShadowOpenTrade`, `closeShadowOpenTrade`, `markShadowProcessed`, `setShadowLastSeen`) plus the in-memory `excludedTraders`/`autoExcludedTraders` store fields; `bullpen.ts` leaderboard/Falcon fetchers (`getLeaderboard`, `getFalconLeaderboard`, `RawFalconTrader`, `RawLeaderboardItem`, `RawLeaderboardResponse`); `simulator.ts` shadow-resolution logic; and the now-inert filter config keys. `persistSnapshot` no longer rewrites `shadow_closed_trades` (read-only/frozen). Dashboard `/api/watchlist` no longer returns Falcon fields and `/api/stats` no longer returns `trackedTraders`/`lastLeaderboardUpdate`.
+
+A final cleanup pass on 2026-06-11 removed the last shadow/leaderboard remnants: `/api/shadow/stats` endpoint and the dashboard "Watchlist Edge vs Shadow Baseline" section; `shadowClosedTrades` from `TradesStore`/store loading; the `shadow_open_trades`/`shadow_closed_trades` CREATE TABLE statements, the insertion-counter scan over them, and their depth-column migration (existing DB tables remain on disk as frozen history, the bot just never touches them); the `LeaderboardTrader` type was renamed `TrackedTrader` (still live — the weekly macro scan writes `tracked_traders`, `/api/discovery/candidates` reads `falconSharpe`); `pollTrader` lost its `source: 'leaderboard' | 'watchlist'` option and `isWatchlist` flag (every poll is watchlist; entry cap / depth gate now unconditional), taking `{ address, username? }` instead of a fake `LeaderboardTrader`; `copiedTraderRank` is hardcoded 0 (legacy NOT NULL column). `copiedTraderSource: 'leaderboard'` stays in the type union — historical `closed_trades` rows still carry it.
 
 ## Stack
 - Node.js / TypeScript, vitest tests under `tests/`
@@ -34,8 +36,15 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
   **The ONLY active constraints on a watchlist BUY are:**
   1. **Wallet cap** — `SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION` (e.g. $1000 × 0.80 = $800);
      new BUYs are skipped once open `simulatedAmount` would exceed it.
-  2. **Per-market watchlist entry cap** — `MAX_WATCHLIST_ENTRIES_PER_MARKET` within
-     `MAX_WATCHLIST_ENTRY_WINDOW_MS` (closes the BUY-SELL-BUY loophole).
+  2. **Per-market watchlist entry cap** — two-tier since 2026-06-11:
+     *match-style* markets (ISO date in slug, `fif-ksa-sen-2026-06-09-draw`;
+     `isMatchStyleSlug` in `filters.ts`) get a LIFETIME cap of 1 entry per slug —
+     they resolve once, so re-entries are correlated bets on the same outcome
+     (stacking analysis 2026-06-11: entries #2+ added ~$0 net, 3x drawdown; two
+     stacked match losses -$35.70 tripped the breaker on 06-10). Non-dated
+     markets (geo/political) keep `MAX_WATCHLIST_ENTRIES_PER_MARKET` within
+     `MAX_WATCHLIST_ENTRY_WINDOW_MS` (closes the BUY-SELL-BUY loophole) — they
+     live for weeks and scale-in/out re-entries there are genuine new trades.
   3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5` (thin-book guard).
 
   As of 2026-05-29 the now-inert filter config keys above were removed from `config.ts` and
@@ -73,12 +82,18 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
   (`price-proxy resolve ... (Gamma does not show market resolved)`) — kept because Gamma
   delists resolved sports markets within ~a day, usually before ever showing
   `closed=true`, so requiring confirmation would misbook winners as 'expired' at last price.
-  **Delist snap (FIX 1, later 2026-06-10):** when a market is marked dead (Gamma delisted),
-  positions whose last price was ≥0.93/≤0.07 book the actual payout 1/0 as `resolved`
-  (`snapDelistExitPrice`) — delisting IS the resolution event, so winners are no longer
-  clipped by ~the spread and mislabeled 'expired'. Deliberately NOT applied to the 7-day
-  max-hold expiry of still-listed markets: a live market at 0.95 is not resolved (Fujimori
-  precedent) — there, last price stays the honest mark-to-market exit.
+  **Gamma-confirmed delist resolution (2026-06-11, supersedes the price-only FIX 1 snap):**
+  when a market is marked dead (Gamma delisted), the bot re-queries Gamma with
+  `?slug=<slug>&closed=true` — delisted resolved markets vanish from the default query but
+  stay retrievable with the closed filter, `outcomePrices` pinned to the final 0/1. When
+  `isMarketResolved` confirms, every position books its outcome's ACTUAL payout as
+  `resolved` (`decideDelistExit` in simulator.ts, pure + unit-tested) — correct even when
+  the last live price was mid-range (previously guessed 'expired' at last price). Only when
+  Gamma doesn't confirm does it fall back to last-price inference: ≥0.93/≤0.07 snaps to 1/0
+  as `resolved` (`snapDelistExitPrice`), mid prices exit 'expired' at last price.
+  Deliberately NOT applied to the 7-day max-hold expiry of still-listed markets: a live
+  market at 0.95 is not resolved (Fujimori precedent) — there, last price stays the honest
+  mark-to-market exit.
 - **Observation forward-test (added 2026-06-10):** copy-disabled watchlist traders are no
   longer discarded — their trades run the full simulated lifecycle in the separate
   `observation_trades` table (single table; rows mutate in place from `status='open'` to
@@ -105,24 +120,34 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
      forward-test data. Manual re-enable via dashboard clears the marker, but if still
      under threshold the next check re-disables — raise the env threshold to truly
      override.
-  2. *Daily-loss circuit breaker* — when total cost-adjusted realized PnL over the last
-     24h drops below `DAILY_LOSS_CIRCUIT_BREAKER` (default -30), ALL copying pauses for
+  2. *Daily-loss circuit breaker* — **INTENTIONALLY DISABLED 2026-06-11** via
+     `DAILY_LOSS_CIRCUIT_BREAKER=off` in docker-compose.yml. Reason: a single bad day
+     doesn't predict future performance; the per-trader decay kill switches cover the
+     real risk. The code is kept in place (`src/risk.ts`) for possible re-enable —
+     `CONFIG.DAILY_LOSS_BREAKER_ENABLED` short-circuits `checkCircuitBreaker` /
+     `isCircuitBreakerActive` to no-ops and any stale `meta.circuit_breaker_until` is
+     ignored. The dashboard banner and its "Resume now" button were removed;
+     `POST /api/breaker/reset` remains. To re-enable: set the env var to a number
+     (absolute $) or remove it (falls back to `DAILY_LOSS_CIRCUIT_BREAKER_PCT`).
+     Behavior when enabled: when total cost-adjusted realized PnL over the last
+     24h drops below `DAILY_LOSS_CIRCUIT_BREAKER`, ALL copying pauses for
      24h (`meta.circuit_breaker_until`). While paused, polling continues and cursors
      advance (missed BUYs are NOT copied late — a paused real wallet misses trades), and
      copy-SELLs still close existing positions (the breaker stops new exposure, not
      risk-reducing exits). Observation ledger unaffected. Auto-resumes on expiry; manual
-     reset: dashboard banner button → `POST /api/breaker/reset`. Note: trades that close
+     reset: `POST /api/breaker/reset`. Note: trades that close
      during the pause count in the next 24h window, so a still-bleeding book can re-trip
      immediately on resume — intended.
   **Thresholds are %-of-wallet (FIX 3):** `TRADER_DECAY_THRESHOLD_PCT_30D=5`,
-  `TRADER_DECAY_THRESHOLD_PCT_7D=3`, `DAILY_LOSS_CIRCUIT_BREAKER_PCT=3` — derived from
+  `TRADER_DECAY_THRESHOLD_PCT_7D=3`, `DAILY_LOSS_CIRCUIT_BREAKER_PCT=3` (the latter
+  inert while the breaker is disabled) — derived from
   `SIMULATED_WALLET_SIZE` (`resolveRiskThreshold` in config.ts; at $1000 → -50/-30/-30,
   identical to the old absolutes). Absolute env vars (`TRADER_DECAY_THRESHOLD_30D`/`_7D`,
   `DAILY_LOSS_CIRCUIT_BREAKER`) override the % when set; wallet sim disabled (size 0) →
   fixed absolute defaults. Because thresholds scale with the wallet, enabling
   `DYNAMIC_SIZING=true` no longer requires retuning them by hand — but sanity-check the
   derived values whenever `SIMULATED_WALLET_SIZE` or `MAX_TRADE_AMOUNT` changes.
-  Dashboard: `/api/stats` returns `circuitBreaker {active, until, net24h, threshold}` +
+  Dashboard: `/api/stats` returns `circuitBreaker {enabled, active, until, net24h, threshold}` +
   `traderDecayThreshold30d`; `/api/watchlist` items carry `pnl30d`/`pnl7d`/
   `decayDistance`/`decayDistance7d`; the watchlist table shows a "30d Net (kill switch)"
   column whose tooltip lists both windows' headroom, with a ⛔ badge when auto-disabled.
@@ -144,6 +169,14 @@ A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `
      fill-rate proxy = share of trades with gap ≤ 0/within spread; PnL improvement =
      avg(gap)*shares. Measured baseline (review 2026-06-10, 1,167 trades): avg gap 6.8%
      vs the 2% modeled slippage — taker execution would eat the whole edge.
+  4. *Partial-sell mismatch (added 2026-06-11)* — every copy-SELL close records
+     `source_sell_fraction` on `closed_trades`: the fraction of the trader's OWN position
+     their SELL represented (`soldTokens / (remaining + soldTokens)`, remaining from
+     data-api `/positions?user&market=<conditionId>` at copy time — up to one poll cycle
+     late). We always close 100% of our copy, so values < 1 quantify the mismatch (trader
+     trims 10%, we exit fully). Lookup runs only when we hold a matching position; on
+     failure the column stays NULL. Pure math: `computeSellFraction` in filters.ts.
+     Threshold/expiry/delist closes never set it — copy-SELLs only.
 - `store.ts` persistence (reworked 2026-06-10): every mutation (addOpenTrade, closeOpenTrade, resolveByPrice, markProcessed, watchlist CRUD, appendTraderHistory, addSkippedTrade) is a targeted, transactional SQL write at call time — the DB is always current and nothing needs flushing on exit. `writeStore()` bulk-rewrites ONLY cleanup state (`processed_trade_ids`, `trader_history`) and is called solely by `runDailyCleanup()` after its in-memory prunes (processedTradeIds referenced-ID trim; traderHistory 90-day entry prune). `markDirty()`/`flushIfDirty()`/`startAutoFlush()` were removed. `startWalCheckpoint()` (called from `index.ts`) runs a PASSIVE WAL checkpoint every 60 s to bound WAL growth. Hot tables are never bulk-rewritten; frozen historical tables (`tracked_traders` — updated externally by the weekly macro scan —, `excluded_traders`, `shadow_*`) are never written by the bot.
 - **`closed_trades` retention: unlimited.** As of 2026-05-27 the 7-day archival step in `runDailyCleanup()` was removed — the table holds the full history in-DB (query perf ~12 ms at 30k rows). Existing `data/archive/*.json` files are historical artifacts; the importer ran once to merge them back. Daily backups in `data/backups/` (last 30 retained) remain the disaster-recovery path. `traderHistory` and `processedTradeIds` still prune in the same daily run.
 
@@ -192,6 +225,9 @@ PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
 # Watchlist-only entry cap (open+closed within window) — closes the BUY-SELL-BUY
 # loophole. One of the THREE active constraints (see "Key rules").
+# NOTE 2026-06-11: applies only to NON-dated (geo/political) slugs; match-style
+# slugs (ISO date, e.g. fif-ksa-sen-2026-06-09-draw) use a hardcoded lifetime
+# cap of 1 entry per slug instead (no env key — see isMatchStyleSlug).
 MAX_WATCHLIST_ENTRIES_PER_MARKET=2
 MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000   # 12h
 

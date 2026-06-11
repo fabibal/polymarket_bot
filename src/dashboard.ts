@@ -349,7 +349,7 @@ function computeInlineStats(
 }
 
 // Cost-adjusted per-trade edge stats for a set of closed trades.
-// Used by the go-live readiness, shadow comparison, and risk endpoints.
+// Used by the go-live readiness and risk endpoints.
 function edgeStats(trades: import('./types').SimulatedTrade[]) {
   const vals = trades.map(t => tradeCostAdjustedPnl(t));
   const gs = groupStats(vals);
@@ -1076,18 +1076,6 @@ export function startDashboard(): void {
       ready,
       testStart: new Date(TEST_START_MS).toISOString(),
     });
-  });
-
-  // ── Shadow vs watchlist edge comparison (HISTORICAL) ─────────────────────────
-  // Shadow = former leaderboard traders. Leaderboard tracking was removed 2026-05-29,
-  // so shadow_closed_trades is frozen — no new shadow data accrues. Kept read-only so
-  // the watchlist edge can still be compared against the leaderboard baseline it
-  // replaced. Watchlist = real sim. Both cost-adjusted over full history.
-  app.get('/api/shadow/stats', (_req, res) => {
-    const store = readStore();
-    const shadow = edgeStats(store.shadowClosedTrades ?? []);
-    const watchlist = edgeStats(store.closedTrades.filter(t => t.copiedTraderSource === 'watchlist'));
-    res.json({ shadow, watchlist });
   });
 
   // ── Circuit breaker manual override ──────────────────────────────────────────

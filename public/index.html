@@ -550,11 +550,6 @@
 </div>
 
 <main>
-  <!-- Daily-loss circuit breaker banner (hidden unless tripped) -->
-  <div id="breaker-banner" style="display:none; margin:0 0 14px 0; padding:10px 14px; border:1px solid var(--red); border-radius:var(--r-sm); background:rgba(248,113,113,0.12); font-size:13px; align-items:center; gap:12px;">
-    <span>🚨 <b>Daily loss circuit breaker active</b> — all copying paused. <span id="breaker-detail"></span></span>
-    <button class="btn-toggle btn-exclude" style="margin-left:auto" onclick="resetBreaker(this)">Resume now</button>
-  </div>
 
   <!-- Watchlist stat cards -->
   <h2 style="margin:0 0 10px 0; font-size:15px; color:var(--muted); font-weight:600; letter-spacing:.04em; text-transform:uppercase;">
@@ -696,25 +691,6 @@
           <div id="gl-bar" style="height:100%;width:0%;background:var(--blue);transition:width .4s"></div>
         </div>
       </div>
-    </div>
-  </div>
-
-  <!-- Watchlist edge vs historical shadow baseline -->
-  <div class="section">
-    <div class="section-header">
-      <div class="section-header-left">
-        <span class="section-title">👥 Watchlist Edge vs Shadow Baseline <span style="text-transform:none;letter-spacing:0;color:var(--yellow)">(historical)</span></span>
-        <span style="font-size:11px;color:var(--muted)">cost-adjusted · shadow = former leaderboard traders · no new shadow data since 2026-05-29</span>
-      </div>
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr>
-          <th>Group</th><th>n</th><th>Win Rate</th><th>Exp/Trade</th>
-          <th title="One-sample t vs 0">t-stat</th><th title="Two-tailed p-value">p-value</th><th>Total PNL</th>
-        </tr></thead>
-        <tbody id="shadow-body"><tr class="empty-row"><td colspan="7">Loading…</td></tr></tbody>
-      </table>
     </div>
   </div>
 
@@ -947,7 +923,7 @@
 
   async function refresh() {
     try {
-      await Promise.all([loadWatchlistStats(), loadWatchlist(), loadWatchlistTrades(), loadDiscoveryCandidates(), loadGoLive(), loadShadowStats(), loadObservation(), loadRiskMetrics()]);
+      await Promise.all([loadWatchlistStats(), loadWatchlist(), loadWatchlistTrades(), loadDiscoveryCandidates(), loadGoLive(), loadObservation(), loadRiskMetrics()]);
     } catch (e) {
       const dot = $('status-dot'); if (dot) dot.className = 'err';
       const lu  = $('last-updated'); if (lu) lu.textContent = 'Error';
@@ -1760,29 +1736,6 @@
     } catch (e) { console.error('[golive] load failed:', e); }
   }
 
-  // ── Watchlist vs shadow edge ──────────────────────────────────────────────
-  function shadowRow(label, g) {
-    const wr = g.winRate != null ? (g.winRate * 100).toFixed(1) + '%' : '—';
-    const wrCls = g.winRate != null ? (g.winRate >= 0.5 ? 'green' : 'red') : '';
-    return `<tr>
-      <td>${label}</td>
-      <td>${(g.n ?? 0).toLocaleString()}</td>
-      <td class="${wrCls}">${wr}</td>
-      <td class="${pnlClass(g.expPerTrade)}">${fmtPnl(g.expPerTrade)}</td>
-      <td>${g.tStat != null ? Number(g.tStat).toFixed(2) : '—'}</td>
-      <td>${fmtP(g.pValue)}</td>
-      <td class="${pnlClass(g.totalPnl)}">${fmtPnl(g.totalPnl)}</td>
-    </tr>`;
-  }
-  async function loadShadowStats() {
-    try {
-      const d = await fetch('/api/shadow/stats').then(r => r.json());
-      const tb = $('shadow-body');
-      if (!tb) return;
-      tb.innerHTML = shadowRow('Watchlist (real sim)', d.watchlist || {}) + shadowRow('Shadow (ex-leaderboard, frozen)', d.shadow || {});
-    } catch (e) { console.error('[shadow] load failed:', e); }
-  }
-
   // ── Observation forward-test ──────────────────────────────────────────────
   async function loadObservation() {
     try {
@@ -1936,16 +1889,6 @@
     }
   }
 
-  async function resetBreaker(btn) {
-    if (!confirm('Resume copying now? The circuit breaker tripped on a real 24h loss.')) return;
-    if (btn) btn.disabled = true;
-    try {
-      await fetch('/api/breaker/reset', { method: 'POST' });
-      await loadWatchlistStats();
-    } catch (e) { console.error('Breaker reset failed:', e); }
-    if (btn) btn.disabled = false;
-  }
-
   async function removeWatchlistTrader(address) {
     if (!confirm(`Remove ${shortAddr(address)} from watchlist?`)) return;
     try {
@@ -1978,19 +1921,6 @@
       const totalPnl = (s.totalRealizedPnl || 0) + (s.totalUnrealizedPnl || 0);
 
       const setVal = (id, text, cls) => { const el = $(id); if (!el) return; el.textContent = text; if (cls) el.className = 'value ' + cls; };
-      // Circuit-breaker banner
-      const bb = $('breaker-banner');
-      if (bb) {
-        const cb = s.circuitBreaker || {};
-        if (cb.active) {
-          bb.style.display = 'flex';
-          const det = $('breaker-detail');
-          if (det) det.textContent = `24h net ${fmtPnl(cb.net24h ?? 0)} (threshold ${fmtPnl(cb.threshold ?? 0)}) · auto-resumes ${cb.until ? new Date(cb.until).toLocaleString() : '—'}`;
-        } else {
-          bb.style.display = 'none';
-        }
-      }
-
       setVal('wl-s-total-pnl',     fmtPnl(totalPnl),          pnlClass(totalPnl));
       const wlAdjPnl = (s.totalRealizedPnlAdjusted || 0) + (s.totalUnrealizedPnlAdjusted || 0);
       setVal('wl-s-adj-pnl', fmtPnl(wlAdjPnl), pnlClass(wlAdjPnl));

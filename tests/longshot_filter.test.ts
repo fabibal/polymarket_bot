@@ -30,6 +30,7 @@ vi.mock('../src/config', () => ({
 vi.mock('../src/bullpen', () => ({
   getTraderActivity: (...args: unknown[]) => activityFeed(...args),
   getOrderbookDepth: vi.fn(async () => null),
+  getTraderPositionSize: vi.fn(async () => null), // sell-fraction lookup → not recorded
 }));
 
 import { pollTrader } from '../src/monitor';
@@ -87,8 +88,8 @@ describe('monitor: per-trader longshot carve-out (0x12d6)', () => {
     activityFeed.mockResolvedValue([buy({ price: 0.05 })]);
 
     const n = await pollTrader(
-      { rank: 0, address: LONGSHOT_TRADER, weeklyPnl: 0 } as any,
-      { source: 'watchlist', tradeAmount: 5 },
+      { address: LONGSHOT_TRADER },
+      { tradeAmount: 5 },
     );
 
     expect(n).toBe(0); // no simulated trade created
@@ -103,8 +104,8 @@ describe('monitor: per-trader longshot carve-out (0x12d6)', () => {
     activityFeed.mockResolvedValue([buy({ price: 0.50 })]);
 
     const n = await pollTrader(
-      { rank: 0, address: LONGSHOT_TRADER, weeklyPnl: 0 } as any,
-      { source: 'watchlist', tradeAmount: 5 },
+      { address: LONGSHOT_TRADER },
+      { tradeAmount: 5 },
     );
 
     expect(n).toBe(1);
@@ -116,8 +117,8 @@ describe('monitor: per-trader longshot carve-out (0x12d6)', () => {
     activityFeed.mockResolvedValue([buy({ price: 0.05 })]);
 
     const n = await pollTrader(
-      { rank: 0, address: OTHER_TRADER, weeklyPnl: 0 } as any,
-      { source: 'watchlist', tradeAmount: 5 },
+      { address: OTHER_TRADER },
+      { tradeAmount: 5 },
     );
 
     expect(n).toBe(1);

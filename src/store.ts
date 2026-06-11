@@ -16,7 +16,7 @@ import Database from 'better-sqlite3';
 import type { Database as Db } from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
 import {
-  TradesStore, SimulatedTrade, LeaderboardTrader, WatchlistTrader,
+  TradesStore, SimulatedTrade, TrackedTrader, WatchlistTrader,
   TraderHistoryEntry,
 } from './types';
 import { CONFIG } from './config';
@@ -38,7 +38,6 @@ const EMPTY_STORE = (): TradesStore => ({
   traderHistory: {},
   watchlistTraders: [],
   observationTrades: [],
-  shadowClosedTrades: [],
 });
 
 const PROCESSED_IDS_CAP = 100_000;
@@ -145,61 +144,6 @@ CREATE TABLE IF NOT EXISTS processed_trade_ids (
   added_order  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_processed_order ON processed_trade_ids (added_order);
-
-CREATE TABLE IF NOT EXISTS shadow_open_trades (
-  id                        TEXT PRIMARY KEY,
-  source_trade_id           TEXT NOT NULL,
-  timestamp                 TEXT NOT NULL,
-  copied_trader             TEXT NOT NULL,
-  copied_trader_rank        INTEGER NOT NULL,
-  copied_trader_username    TEXT,
-  copied_trader_source      TEXT,
-  market_slug               TEXT NOT NULL,
-  market_title              TEXT NOT NULL,
-  outcome                   TEXT NOT NULL,
-  side                      TEXT NOT NULL,
-  entry_price               REAL NOT NULL,
-  simulated_amount          REAL NOT NULL,
-  simulated_shares          REAL NOT NULL,
-  current_price             REAL,
-  unrealized_pnl            REAL,
-  status                    TEXT NOT NULL,
-  entry_gas_cost            REAL,
-  entry_slippage_cost       REAL,
-  insertion_order           INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_shadow_open_fifo
-  ON shadow_open_trades (copied_trader, market_slug, outcome, insertion_order);
-
-CREATE TABLE IF NOT EXISTS shadow_closed_trades (
-  id                        TEXT PRIMARY KEY,
-  source_trade_id           TEXT NOT NULL,
-  timestamp                 TEXT NOT NULL,
-  copied_trader             TEXT NOT NULL,
-  copied_trader_rank        INTEGER NOT NULL,
-  copied_trader_username    TEXT,
-  copied_trader_source      TEXT,
-  market_slug               TEXT NOT NULL,
-  market_title              TEXT NOT NULL,
-  outcome                   TEXT NOT NULL,
-  side                      TEXT NOT NULL,
-  entry_price               REAL NOT NULL,
-  simulated_amount          REAL NOT NULL,
-  simulated_shares          REAL NOT NULL,
-  current_price             REAL,
-  unrealized_pnl            REAL,
-  status                    TEXT NOT NULL,
-  exit_price                REAL,
-  realized_pnl              REAL,
-  closed_at                 TEXT,
-  holding_period_ms         INTEGER,
-  entry_gas_cost            REAL,
-  entry_slippage_cost       REAL,
-  exit_slippage_cost        REAL,
-  cost_adjusted_pnl         REAL,
-  insertion_order           INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_shadow_closed_at ON shadow_closed_trades (closed_at);
 
 CREATE TABLE IF NOT EXISTS trader_last_seen (
   address   TEXT PRIMARY KEY,
@@ -321,8 +265,6 @@ function _initInsertionCounterFromDb(d: Db): void {
     `SELECT MAX(ord) AS m FROM (
        SELECT MAX(insertion_order) AS ord FROM open_trades
        UNION ALL SELECT MAX(insertion_order) FROM closed_trades
-       UNION ALL SELECT MAX(insertion_order) FROM shadow_open_trades
-       UNION ALL SELECT MAX(insertion_order) FROM shadow_closed_trades
        UNION ALL SELECT MAX(insertion_order) FROM observation_trades
      )`
   ).get() as { m: number | null };
@@ -351,7 +293,7 @@ const DEPTH_COLS: Array<[string, string]> = [
 ];
 
 function migrateDepthColumns(d: Db): void {
-  const tables = ['open_trades', 'closed_trades', 'shadow_open_trades', 'shadow_closed_trades'];
+  const tables = ['open_trades', 'closed_trades'];
   for (const t of tables) {
     const existing = new Set(
       (d.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map(r => r.name)
@@ -363,7 +305,7 @@ function migrateDepthColumns(d: Db): void {
 }
 
 // GROUP D research columns (2026-06-10): trader's own bet notional + taker
-// entry-price gap on the live copy tables (shadow tables are frozen).
+// entry-price gap on the live copy tables.
 // observation_trades gets source_notional only (FIX 4) — conviction analysis
 // applies to candidates too, but there's no depth fetch there, so no gap.
 function migrateResearchColumns(d: Db): void {
@@ -373,6 +315,11 @@ function migrateResearchColumns(d: Db): void {
     );
     if (!existing.has('source_notional'))  d.exec(`ALTER TABLE ${t} ADD COLUMN source_notional REAL`);
     if (!existing.has('entry_price_gap')) d.exec(`ALTER TABLE ${t} ADD COLUMN entry_price_gap REAL`);
+    // Partial-sell research (2026-06-11): set at copy-SELL close time, so the
+    // column exists on closed_trades only.
+    if (t === 'closed_trades' && !existing.has('source_sell_fraction')) {
+      d.exec(`ALTER TABLE ${t} ADD COLUMN source_sell_fraction REAL`);
+    }
   }
   const obsExisting = new Set(
     (d.prepare(`PRAGMA table_info(observation_trades)`).all() as Array<{ name: string }>).map(r => r.name)
@@ -443,6 +390,7 @@ type TradeRow = {
   ask_depth_5?: number | null; ask_depth_10?: number | null;
   spread_at_entry?: number | null; depth_backfilled?: number | null;
   source_notional?: number | null; entry_price_gap?: number | null;
+  source_sell_fraction?: number | null;
   insertion_order: number;
 };
 
@@ -482,6 +430,7 @@ function rowToTrade(r: TradeRow): SimulatedTrade {
   if (r.depth_backfilled       != null) t.depthBackfilled      = !!r.depth_backfilled;
   if (r.source_notional        != null) t.sourceNotional       = r.source_notional;
   if (r.entry_price_gap        != null) t.entryPriceGap        = r.entry_price_gap;
+  if (r.source_sell_fraction   != null) t.sourceSellFraction   = r.source_sell_fraction;
   return t;
 }
 
@@ -523,6 +472,7 @@ function closedTradeRowParams(t: SimulatedTrade, order: number): any[] {
     t.exitSlippageCost ?? null, t.costAdjustedPnl ?? null,
     ...DEPTH_VALS(t),
     ...RESEARCH_VALS(t),
+    t.sourceSellFraction ?? null,
     order,
   ];
 }
@@ -540,19 +490,20 @@ const CLOSED_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copi
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
   exit_price, realized_pnl, closed_at, holding_period_ms,
-  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES}, insertion_order)`;
-const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(34).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES},
+  source_sell_fraction, insertion_order)`;
+const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(35).fill('?').join(',') + ')';
 
 // ── Snapshot load ───────────────────────────────────────────────────────────
 function loadSnapshot(): TradesStore {
   const d = getDb();
   const s = EMPTY_STORE();
 
-  // Read-only: tracked_traders is frozen runtime-side (leaderboard removed
-  // 2026-05-29) but still updated externally by the weekly macro scan; loaded
-  // so /api/discovery/candidates can enrich candidates with falconSharpe.
+  // Read-only: tracked_traders is never written by the bot — the weekly macro
+  // scan updates it externally; loaded so /api/discovery/candidates can enrich
+  // candidates with falconSharpe.
   s.trackedTraders = (d.prepare('SELECT * FROM tracked_traders ORDER BY rank ASC').all() as any[]).map(r => {
-    const t: LeaderboardTrader = {
+    const t: TrackedTrader = {
       rank: r.rank, address: r.address,
       weeklyPnl: r.weekly_pnl,
     };
@@ -584,8 +535,6 @@ function loadSnapshot(): TradesStore {
   s.openTrades     = (d.prepare('SELECT * FROM open_trades     ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
   s.closedTrades   = (d.prepare('SELECT * FROM closed_trades   ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
   s.observationTrades = (d.prepare('SELECT * FROM observation_trades ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
-  // Read-only: frozen historical record for /api/shadow/stats.
-  s.shadowClosedTrades = (d.prepare('SELECT * FROM shadow_closed_trades ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
 
   s.processedTradeIds  = (d.prepare('SELECT id FROM processed_trade_ids  ORDER BY added_order ASC').all() as Array<{ id: string }>).map(r => r.id);
 
@@ -627,7 +576,7 @@ function loadSnapshot(): TradesStore {
 // the old full delete+reinsert of every table (30k+ closed_trades rows) on
 // each 60s flush was the main driver of unbounded WAL growth. Frozen
 // historical tables (tracked_traders — externally updated by the weekly macro
-// scan —, excluded_traders, excluded_categories, shadow_*) are never written.
+// scan —, excluded_traders, excluded_categories) are never written.
 function persistSnapshot(store: TradesStore): void {
   const d = getDb();
   const tx = d.transaction(() => {
@@ -780,6 +729,7 @@ function applyExitCosts(trade: SimulatedTrade, exitPrice: number): void {
 
 export function closeOpenTrade(
   copiedTrader: string, marketSlug: string, outcome: string, sellPrice: number,
+  sourceSellFraction?: number,
 ): boolean {
   const store = readStore();
   const idx = store.openTrades.findIndex(
@@ -789,6 +739,7 @@ export function closeOpenTrade(
 
   const trade = store.openTrades[idx];
   const closedAt = new Date().toISOString();
+  if (sourceSellFraction != null) trade.sourceSellFraction = sourceSellFraction;
   trade.status = 'resolved';
   trade.exitPrice = sellPrice;
   trade.realizedPnl = (sellPrice - trade.entryPrice) * trade.simulatedShares;

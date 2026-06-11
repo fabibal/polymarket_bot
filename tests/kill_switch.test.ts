@@ -8,6 +8,7 @@ vi.mock('../src/config', () => ({
     RESOLVED_THRESHOLD: 0.93,
     TRADER_DECAY_THRESHOLD_30D: -50,
     TRADER_DECAY_THRESHOLD_7D: -30,
+    DAILY_LOSS_BREAKER_ENABLED: true,
     DAILY_LOSS_CIRCUIT_BREAKER: -30,
   },
 }));
@@ -139,5 +140,24 @@ describe('risk: daily-loss circuit breaker', () => {
     store.setMetaValue(BREAKER_META_KEY, new Date(Date.now() - 1000).toISOString());
     expect(isCircuitBreakerActive()).toBe(false);            // expired → cleared
     expect(store.getMetaValue(BREAKER_META_KEY)).toBeNull(); // meta cleaned up
+  });
+
+  it('DAILY_LOSS_BREAKER_ENABLED=false: never trips, ignores a stale active pause', async () => {
+    const { CONFIG } = await import('../src/config');
+    (CONFIG as any).DAILY_LOSS_BREAKER_ENABLED = false;
+    try {
+      for (let i = 0; i < 7; i++) bookLoss(); // ≈ -$35 < -$30 — would trip if enabled
+      expect(await checkCircuitBreaker()).toBe(false);
+      expect(store.getMetaValue(BREAKER_META_KEY)).toBeNull();
+
+      // A pause left over from before disabling must not suspend copying.
+      store.setMetaValue(BREAKER_META_KEY, new Date(Date.now() + 3_600_000).toISOString());
+      expect(isCircuitBreakerActive()).toBe(false);
+      const st = getCircuitBreakerStatus();
+      expect(st.enabled).toBe(false);
+      expect(st.active).toBe(false);
+    } finally {
+      (CONFIG as any).DAILY_LOSS_BREAKER_ENABLED = true;
+    }
   });
 });

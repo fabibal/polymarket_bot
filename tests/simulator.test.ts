@@ -13,7 +13,7 @@ vi.mock('../src/config', () => ({
 
 import {
   computeEntryCosts, tradeCostAdjustedPnl, tradeTotalCosts,
-  decideThresholdResolution, isMarketResolved, snapDelistExitPrice,
+  decideThresholdResolution, isMarketResolved, snapDelistExitPrice, decideDelistExit,
 } from '../src/simulator';
 import { SimulatedTrade } from '../src/types';
 import { RawPriceResponse } from '../src/bullpen';
@@ -205,6 +205,41 @@ describe('snapDelistExitPrice', () => {
     expect(snapDelistExitPrice(0.5)).toBe(0.5);
     expect(snapDelistExitPrice(0.929)).toBe(0.929);
     expect(snapDelistExitPrice(0.071)).toBe(0.071);
+  });
+});
+
+describe('decideDelistExit', () => {
+  const resolvedMarket: RawPriceResponse = {
+    slug: 'foo', closed: true,
+    outcomes: [
+      { outcome: 'Yes', midpoint: 1, last_trade: null },
+      { outcome: 'No',  midpoint: 0, last_trade: null },
+    ],
+  };
+
+  it('books the Gamma-confirmed payout per outcome, regardless of last price', () => {
+    // Winner whose last live price was mid-range — previously expired at 0.55.
+    expect(decideDelistExit(resolvedMarket, 'Yes', 0.55))
+      .toEqual({ exitPrice: 1, status: 'resolved', confirmed: true });
+    expect(decideDelistExit(resolvedMarket, 'No', 0.45))
+      .toEqual({ exitPrice: 0, status: 'resolved', confirmed: true });
+    // Case-insensitive outcome match.
+    expect(decideDelistExit(resolvedMarket, 'yes', 0.10))
+      .toEqual({ exitPrice: 1, status: 'resolved', confirmed: true });
+  });
+
+  it('falls back to price snap when Gamma did not confirm', () => {
+    expect(decideDelistExit(null, 'Yes', 0.97))
+      .toEqual({ exitPrice: 1, status: 'resolved', confirmed: false });
+    expect(decideDelistExit(null, 'Yes', 0.03))
+      .toEqual({ exitPrice: 0, status: 'resolved', confirmed: false });
+    expect(decideDelistExit(null, 'Yes', 0.5))
+      .toEqual({ exitPrice: 0.5, status: 'expired', confirmed: false });
+  });
+
+  it('falls back to price snap when the position outcome is missing from the Gamma payload', () => {
+    expect(decideDelistExit(resolvedMarket, 'Draw', 0.5))
+      .toEqual({ exitPrice: 0.5, status: 'expired', confirmed: false });
   });
 });
 
