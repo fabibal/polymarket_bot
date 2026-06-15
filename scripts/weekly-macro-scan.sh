@@ -136,8 +136,12 @@ else
         hold_d="$(echo "${row}" | awk '{print $6}')"
         wr="$(echo "${row}" | awk '{print $9}')"
         pnl="$(echo "${row}" | awk '{print $10}')"
-        sharpe="$(docker exec "${CONTAINER}" sqlite3 /app/data/store.db \
-            "SELECT printf('%.2f', COALESCE(falcon_sharpe, 0)) FROM tracked_traders WHERE lower(address)='${addr}' LIMIT 1;" 2>/dev/null)"
+        # Container has no sqlite3 CLI; query via the better-sqlite3 module instead.
+        sharpe="$(docker exec "${CONTAINER}" node -e '
+            const db = require("better-sqlite3")("/app/data/store.db", { readonly: true });
+            const r = db.prepare("SELECT COALESCE(falcon_sharpe,0) s FROM tracked_traders WHERE lower(address)=? LIMIT 1").get(process.argv[1]);
+            process.stdout.write(r ? r.s.toFixed(2) : "");
+        ' "${addr}" 2>/dev/null)"
         [ -z "${sharpe}" ] && sharpe="n/a"
         short="${addr:0:10}...${addr: -4}"
         LINES="${LINES}
