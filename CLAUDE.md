@@ -1,14 +1,26 @@
 # Polymarket Copy Trading Bot
 
-DRY_RUN simulation-only copy bot. Tracks a persistent watchlist of traders; simulates each BUY as a $5 position (watchlist entries can override via `copyAmount`) and closes FIFO on matching SELL.
+DRY_RUN simulation-only copy bot. **Watchlist-only** (leaderboard removed
+2026-05-29): polls `watchlist_traders`, simulates each BUY as a $5 position
+(`copyAmount` override per entry), closes FIFO on matching SELL.
 
-**Watchlist-only architecture (as of 2026-05-29).** Leaderboard tracking was removed completely. The bot polls **only** `watchlist_traders`; there is no leaderboard fetch, no Falcon leaderboard refresh, and no shadow polling. `runPollingCycle()` in `src/index.ts` iterates the watchlist and calls `pollTrader(trader, { source: 'watchlist', copyEnabled, tradeAmount })` — nothing else.
+## CLAUDE.md maintenance rules
 
-History: leaderboard was first demoted to shadow-only on 2026-05-28 (lifetime leaderboard real-copy PNL was -$2,451 over 9,258 closed trades — no demonstrable edge), then removed entirely on 2026-05-29. On removal: `src/leaderboard.ts` was deleted; `refreshLeaderboard` and the periodic refresh were removed from `index.ts`; auto-exclusion logic and its config (`AUTO_EXCLUDE_WIN_RATE_THRESHOLD`, `AUTO_EXCLUDE_MIN_TRADES`) plus `LEADERBOARD_LIMIT` / `LEADERBOARD_REFRESH_MS` were dropped from `config.ts`; `tests/auto_exclusion.test.ts` was deleted. DB: `tracked_traders` and `shadow_open_trades` were purged; `shadow_closed_trades` and `excluded_traders` are kept as a **historical record** (neither is read by any endpoint — frozen tables only).
+- This file is a **TOC + current-state reference** — max ~80 lines.
+- **No decision narratives here.** The *why* behind a choice → `docs/decisions.md`
+  (dated, append-only ADRs). Accepted quirks → `docs/KNOWN_ISSUES.md`.
+- **No info inferable from the code.** Strategy/constants live in code — when in
+  doubt, grep. If a doc drifts, the code wins; fix the doc.
+- Doc-routing table (what changed → what to update): `.claude/hooks/pre_edit.md`.
 
-A second cleanup pass on 2026-05-29 removed the dead code itself: the shadow + `!isWatchlist` real-copy branches and `hasSufficientSample` in `src/monitor.ts`; orphaned `store.ts` exports (`updateTrackedTraders`, `updateTraderLastOnLeaderboard`, `setAutoExclusion`, `setLeaderboardStats`, `updateWatchlistFalconData`, `updateTraderFalconCache`, `setTraderExclusion`, `isShadowProcessed`, `addShadowOpenTrade`, `closeShadowOpenTrade`, `markShadowProcessed`, `setShadowLastSeen`) plus the in-memory `excludedTraders`/`autoExcludedTraders` store fields; `bullpen.ts` leaderboard/Falcon fetchers (`getLeaderboard`, `getFalconLeaderboard`, `RawFalconTrader`, `RawLeaderboardItem`, `RawLeaderboardResponse`); `simulator.ts` shadow-resolution logic; and the now-inert filter config keys. `persistSnapshot` no longer rewrites `shadow_closed_trades` (read-only/frozen). Dashboard `/api/watchlist` no longer returns Falcon fields and `/api/stats` no longer returns `trackedTraders`/`lastLeaderboardUpdate`.
+## Read when relevant
 
-A final cleanup pass on 2026-06-11 removed the last shadow/leaderboard remnants: `/api/shadow/stats` endpoint and the dashboard "Watchlist Edge vs Shadow Baseline" section; `shadowClosedTrades` from `TradesStore`/store loading; the `shadow_open_trades`/`shadow_closed_trades` CREATE TABLE statements, the insertion-counter scan over them, and their depth-column migration (existing DB tables remain on disk as frozen history, the bot just never touches them); the `LeaderboardTrader` type was renamed `TrackedTrader` (still live — the weekly macro scan writes `tracked_traders`, `/api/discovery/candidates` reads `falconSharpe`); `pollTrader` lost its `source: 'leaderboard' | 'watchlist'` option and `isWatchlist` flag (every poll is watchlist; entry cap / depth gate now unconditional), taking `{ address, username? }` instead of a fake `LeaderboardTrader`; `copiedTraderRank` is hardcoded 0 (legacy NOT NULL column). `copiedTraderSource: 'leaderboard'` stays in the type union — historical `closed_trades` rows still carry it.
+| Task / question                       | Read first                          |
+|---------------------------------------|-------------------------------------|
+| Why a decision was made               | `docs/decisions.md`                 |
+| Accepted quirk / standing issue       | `docs/KNOWN_ISSUES.md`              |
+| Deploy / rebuild / push               | `.claude/skills/deploy.md`          |
+| Guardrails before editing             | `.claude/hooks/pre_edit.md`         |
 
 ## Stack
 - Node.js / TypeScript, vitest tests under `tests/`
@@ -19,188 +31,22 @@ A final cleanup pass on 2026-06-11 removed the last shadow/leaderboard remnants:
 ## Key rules
 - **Never flip `DRY_RUN=false`** without an explicit instruction in the current conversation.
 - Ask before guessing — use AskUserQuestion for anything ambiguous.
-- **🚨 WATCHLIST TRADERS BYPASS ALL ENTRY FILTERS — BY DESIGN, INTENTIONAL. 🚨**
-  Since the bot is **watchlist-only** (leaderboard removed 2026-05-29), **every** trade is a
-  watchlist trade, so these filters apply to **nothing** and are inert no-ops:
-  - price floor/ceiling (`MIN_PRICE`, `MIN_PRICE_SPORTS`, `MAX_PRICE`)
-  - spread cap (`MAX_SPREAD`)
-  - category exclusions (`FORCE_EXCLUDE_CATEGORIES`, dashboard exclusions)
-  - per-market caps (`MAX_POSITIONS_PER_MARKET`, `MAX_POSITIONS_PER_MARKET_SPORTS`)
-  - global open-position cap (`MAX_TOTAL_OPEN_POSITIONS`) — **NOT enforced for watchlist**
-  - per-trader sample gates (`MIN_TRADER_SAMPLE`, `MIN_TRADER_SHADOW_SAMPLE`)
+- **🚨 WATCHLIST TRADERS BYPASS ALL ENTRY FILTERS — BY DESIGN. 🚨** A watchlist
+  entry is an explicit, manual trust decision; the bot copies unconditionally.
+  Price/spread/category/sample filters are inert no-ops (removed 2026-05-29).
+  Rationale + removal scope: `docs/decisions.md` "Watchlist-only architecture".
 
-  **Rationale:** a watchlist entry is an explicit, manual trust decision by the operator.
-  The operator vouches for the trader, so the bot copies them unconditionally — no
-  algorithmic second-guessing on price, liquidity category, or sample size.
+### Active constraints (the ONLY things that gate a watchlist BUY)
+1. **Wallet cap** — `SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION` (e.g. $1000 × 0.80 = $800); over-cap BUYs skipped.
+2. **Per-market entry cap** — two-tier: match-style slugs (ISO date,
+   `isMatchStyleSlug` in `filters.ts`) → LIFETIME cap of 1/slug; non-dated
+   slugs → `MAX_WATCHLIST_ENTRIES_PER_MARKET` within `MAX_WATCHLIST_ENTRY_WINDOW_MS`.
+3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5`.
 
-  **The ONLY active constraints on a watchlist BUY are:**
-  1. **Wallet cap** — `SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION` (e.g. $1000 × 0.80 = $800);
-     new BUYs are skipped once open `simulatedAmount` would exceed it.
-  2. **Per-market watchlist entry cap** — two-tier since 2026-06-11:
-     *match-style* markets (ISO date in slug, `fif-ksa-sen-2026-06-09-draw`;
-     `isMatchStyleSlug` in `filters.ts`) get a LIFETIME cap of 1 entry per slug —
-     they resolve once, so re-entries are correlated bets on the same outcome
-     (stacking analysis 2026-06-11: entries #2+ added ~$0 net, 3x drawdown; two
-     stacked match losses -$35.70 tripped the breaker on 06-10). Non-dated
-     markets (geo/political) keep `MAX_WATCHLIST_ENTRIES_PER_MARKET` within
-     `MAX_WATCHLIST_ENTRY_WINDOW_MS` (closes the BUY-SELL-BUY loophole) — they
-     live for weeks and scale-in/out re-entries there are genuine new trades.
-  3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5` (thin-book guard).
-
-  As of 2026-05-29 the now-inert filter config keys above were removed from `config.ts` and
-  `docker-compose.yml`; the dead `!isWatchlist` / shadow branches in `monitor.ts` that read
-  them were deleted.
-
-  **Per-trader carve-out exception (added 2026-06-09):** a single, NARROW exception to the
-  "bypass all filters" rule, scoped to ONE trader by full address. When a BUY comes from
-  `LONGSHOT_FILTER_TRADER` (`0x12d6cccfc7470a3f4bafc53599a4779cbf2cf2a8`, label
-  *Geopolitics-Macro*) at `entryPrice < LONGSHOT_FILTER_MAX_PRICE` (default `0.10`), the bot
-  **skips the copy** and instead records the would-be entry in the `skipped_trades` table with
-  `skip_reason='longshot_filter_0x12d6'`. Record-only — no PnL lifecycle. Logged as
-  `skip <slug> entry=<price> trader=0x12d6 reason=longshot_filter`. The check lives at the top
-  of the BUY branch in `monitor.ts` (before wallet/entry-cap/depth gates). Rationale
-  (re-verified 2026-06-10 on Gamma-corrected data after the threshold-resolution fix): the
-  original justification used stats contaminated by the insta-resolution artifact, but the
-  conclusion survives clean accounting — all-time 89 sub-$0.10 trades, corrected net ≈ -$196;
-  0 of 57 ride-to-resolution longshots won (~2 expected at fair pricing); the trader's own
-  later activity (0 REDEEMs, 1 SELL at a loss) confirms the booked outcomes. The carve-out
-  stays; `skipped_trades` preserves count + cumulative would-be notional so the pattern can be
-  monitored for change over time. Dashboard surfaces it via `/api/stats`
-  (`longshotSkipCount`, `longshotSkipNotional`) and the "🚫 Longshot Skips" card. This is the
-  ONLY per-trader filter override; to retire it, drop the `monitor.ts` block and the two config
-  keys. Other watchlist traders are unaffected.
-- **Threshold resolution (reworked 2026-06-10, `src/simulator.ts`):** positions at price
-  ≥0.93 / ≤0.07 are no longer blindly proxy-booked at $1/$0. Three-way decision
-  (`decideThresholdResolution`, pure + unit-tested): (1) Gamma-confirmed resolution
-  (market `closed` AND all `outcomePrices` pinned to 0/1, `isMarketResolved`) → book actual
-  final outcome immediately, no age gate; (2) entry price already beyond the threshold
-  (longshots ≤0.07, favorites ≥0.93) → NEVER proxy-resolved — held until Gamma confirms,
-  a copy-SELL closes, or max-hold expiry (pre-fix these were insta-booked as total
-  wins/losses while still live, corrupting all sub-$0.10 / >$0.93 bucket stats before
-  2026-06-10); (3) entry crossed the threshold after open → legacy price-proxy fallback
-  after one price-update interval, each one logged
-  (`price-proxy resolve ... (Gamma does not show market resolved)`) — kept because Gamma
-  delists resolved sports markets within ~a day, usually before ever showing
-  `closed=true`, so requiring confirmation would misbook winners as 'expired' at last price.
-  **Gamma-confirmed delist resolution (2026-06-11, supersedes the price-only FIX 1 snap):**
-  when a market is marked dead (Gamma delisted), the bot re-queries Gamma with
-  `?slug=<slug>&closed=true` — delisted resolved markets vanish from the default query but
-  stay retrievable with the closed filter, `outcomePrices` pinned to the final 0/1. When
-  `isMarketResolved` confirms, every position books its outcome's ACTUAL payout as
-  `resolved` (`decideDelistExit` in simulator.ts, pure + unit-tested) — correct even when
-  the last live price was mid-range (previously guessed 'expired' at last price). Only when
-  Gamma doesn't confirm does it fall back to last-price inference: ≥0.93/≤0.07 snaps to 1/0
-  as `resolved` (`snapDelistExitPrice`), mid prices exit 'expired' at last price.
-  Deliberately NOT applied to the 7-day max-hold expiry of still-listed markets: a live
-  market at 0.95 is not resolved (Fujimori precedent) — there, last price stays the honest
-  mark-to-market exit.
-- **Observation forward-test (added 2026-06-10):** copy-disabled watchlist traders are no
-  longer discarded — their trades run the full simulated lifecycle in the separate
-  `observation_trades` table (single table; rows mutate in place from `status='open'` to
-  `resolved`/`expired`). Same cost model and same threshold-resolution decision as real
-  copies, but deliberately RAW: no wallet cap, no entry cap, no depth gate, no longshot
-  filter — the ledger measures the trader, not our execution constraints — and observation
-  rows never enter `open_trades`, so the wallet cap is unaffected. Store API:
-  `addObservationTrade`, `closeObservationTrade` (FIFO), `updateObservationTradePrices`,
-  `resolveObservationByPrice`. The 5-min price sweep covers observation positions in the
-  same pass (shared slug fetches). Observation BUYs also persist `source_notional` (FIX 4)
-  so conviction analysis covers candidates, not just live copies. Dashboard:
-  `/api/observation` (per-trader n/WR/PF/net, cost-adjusted) + "👁 Observation
-  Forward-Test" section. Logs: `[OBS] BUY/SELL`. Purpose: macro-scan candidates can be
-  added copy-disabled and build a real forward-test record before copying is enabled.
-- **Risk controls (added 2026-06-10, `src/risk.ts`):** two automatic guards, both alerting
-  via Telegram (`src/alerts.ts`, creds injected from `~/.env.shared` via `env_file` in
-  docker-compose — the `[polymarket_bot]` prefix groups messages):
-  1. *Per-trader decay kill switch* — after each poll cycle, any copy-enabled watchlist
-     trader whose rolling 30d cost-adjusted net drops below threshold is
-     auto-disabled (`watchlist_traders.auto_disabled_at/_reason`). The trader keeps
-     accruing observation forward-test data. Manual re-enable via dashboard clears the
-     marker, but if still under threshold the next check re-disables — raise the env
-     threshold to truly override.
-     **(7d window REMOVED 2026-06-15.)** The 7d window (the old "FIX 2") was a -$30 /
-     3%-of-wallet gate meant to catch sustained bleeding hidden by a big 30d cushion.
-     It proved too tight for sports traders: a single bad weekend during a seasonal
-     trough tripped it. It false-disabled Shadow-Top4 on 2026-06-13 (7d net -$33.80,
-     $3.80 past threshold) while he was +$702/30d and about to re-activate for the
-     FIFA World Cup — the club season had just ended, so his volume cratered and normal
-     weekend variance dominated. Only the 30d window remains.
-  2. *Daily-loss circuit breaker* — **INTENTIONALLY DISABLED 2026-06-11** via
-     `DAILY_LOSS_CIRCUIT_BREAKER=off` in docker-compose.yml. Reason: a single bad day
-     doesn't predict future performance; the per-trader decay kill switches cover the
-     real risk. The code is kept in place (`src/risk.ts`) for possible re-enable —
-     `CONFIG.DAILY_LOSS_BREAKER_ENABLED` short-circuits `checkCircuitBreaker` /
-     `isCircuitBreakerActive` to no-ops and any stale `meta.circuit_breaker_until` is
-     ignored. The dashboard banner and its "Resume now" button were removed;
-     `POST /api/breaker/reset` remains. To re-enable: set the env var to a number
-     (absolute $) or remove it (falls back to `DAILY_LOSS_CIRCUIT_BREAKER_PCT`).
-     Behavior when enabled: when total cost-adjusted realized PnL over the last
-     24h drops below `DAILY_LOSS_CIRCUIT_BREAKER`, ALL copying pauses for
-     24h (`meta.circuit_breaker_until`). While paused, polling continues and cursors
-     advance (missed BUYs are NOT copied late — a paused real wallet misses trades), and
-     copy-SELLs still close existing positions (the breaker stops new exposure, not
-     risk-reducing exits). Observation ledger unaffected. Auto-resumes on expiry; manual
-     reset: `POST /api/breaker/reset`. Note: trades that close
-     during the pause count in the next 24h window, so a still-bleeding book can re-trip
-     immediately on resume — intended.
-  **Thresholds are %-of-wallet (FIX 3):** `TRADER_DECAY_THRESHOLD_PCT_30D=5` and
-  `DAILY_LOSS_CIRCUIT_BREAKER_PCT=3` (the latter inert while the breaker is disabled) —
-  derived from `SIMULATED_WALLET_SIZE` (`resolveRiskThreshold` in config.ts; at $1000 →
-  -50/-30). Absolute env vars (`TRADER_DECAY_THRESHOLD_30D`, `DAILY_LOSS_CIRCUIT_BREAKER`)
-  override the % when set; wallet sim disabled (size 0) → fixed absolute defaults.
-  Because thresholds scale with the wallet, enabling `DYNAMIC_SIZING=true` no longer
-  requires retuning them by hand — but sanity-check the derived values whenever
-  `SIMULATED_WALLET_SIZE` or `MAX_TRADE_AMOUNT` changes.
-  Dashboard: `/api/stats` returns `circuitBreaker {enabled, active, until, net24h, threshold}` +
-  `traderDecayThreshold30d`; `/api/watchlist` items carry `pnl30d`/`decayDistance`;
-  the watchlist table shows a "30d Net (kill switch)" column whose tooltip lists the
-  30d headroom, with a ⛔ badge when auto-disabled.
-  Window math is pure (`rollingNetForTrader`, `rollingNetTotal`, `evaluateCircuitBreaker`)
-  and unit-tested (`tests/risk.test.ts` host-runnable, `tests/kill_switch.test.ts` DB-backed).
-- **Sizing + maker-execution research (added 2026-06-10, GROUP D):**
-  1. *Source notional* — every watchlist BUY persists the trader's OWN bet size
-     (`source_notional` = activity `usdc_size`, falling back to `price*size`) on
-     `open_trades`/`closed_trades` for conviction-weighted sizing analysis (~3-4 weeks of
-     data needed; the old `trader_history` join only matched 40 trades).
-  2. *Dynamic sizing* — `DYNAMIC_SIZING=false` (OFF; flip env to test): when on, BUY size
-     = 1% of `ask_depth_5`, clamped to `[MIN_TRADE_AMOUNT=5, MAX_TRADE_AMOUNT=25]`;
-     falls back to per-trader `copyAmount` when depth is unavailable. Pure helper
-     `computeDynamicTradeAmount` in `filters.ts`. NOTE: the wallet-cap check moved AFTER
-     the depth fetch (it needs the final amount), so wallet-capped skips now cost two
-     Gamma/CLOB calls — rare, accepted.
-  3. *Maker study* — `entry_price_gap` = `best_ask - entry_price` at copy time, persisted
-     per BUY (a maker limit at the trader's price vs taker at the ask). After ~2 weeks:
-     fill-rate proxy = share of trades with gap ≤ 0/within spread; PnL improvement =
-     avg(gap)*shares. Measured baseline (review 2026-06-10, 1,167 trades): avg gap 6.8%
-     vs the 2% modeled slippage — taker execution would eat the whole edge.
-  4. *Partial-sell mismatch (added 2026-06-11)* — every copy-SELL close records
-     `source_sell_fraction` on `closed_trades`: the fraction of the trader's OWN position
-     their SELL represented (`soldTokens / (remaining + soldTokens)`, remaining from
-     data-api `/positions?user&market=<conditionId>` at copy time — up to one poll cycle
-     late). We always close 100% of our copy, so values < 1 quantify the mismatch (trader
-     trims 10%, we exit fully). Lookup runs only when we hold a matching position; on
-     failure the column stays NULL. Pure math: `computeSellFraction` in filters.ts.
-     Threshold/expiry/delist closes never set it — copy-SELLs only.
-- `store.ts` persistence (reworked 2026-06-10): every mutation (addOpenTrade, closeOpenTrade, resolveByPrice, markProcessed, watchlist CRUD, appendTraderHistory, addSkippedTrade) is a targeted, transactional SQL write at call time — the DB is always current and nothing needs flushing on exit. `writeStore()` bulk-rewrites ONLY cleanup state (`processed_trade_ids`, `trader_history`) and is called solely by `runDailyCleanup()` after its in-memory prunes (processedTradeIds referenced-ID trim; traderHistory 90-day entry prune). `markDirty()`/`flushIfDirty()`/`startAutoFlush()` were removed. `startWalCheckpoint()` (called from `index.ts`) runs a PASSIVE WAL checkpoint every 60 s to bound WAL growth. Hot tables are never bulk-rewritten; frozen historical tables (`tracked_traders` — updated externally by the weekly macro scan —, `excluded_traders`, `shadow_*`) are never written by the bot.
-- **`closed_trades` retention: unlimited.** As of 2026-05-27 the 7-day archival step in `runDailyCleanup()` was removed — the table holds the full history in-DB (query perf ~12 ms at 30k rows). Existing `data/archive/*.json` files are historical artifacts; the importer ran once to merge them back. Daily backups in `data/backups/` (last 30 retained) remain the disaster-recovery path. `traderHistory` and `processedTradeIds` still prune in the same daily run.
-
-## Orderbook depth at fill time (watchlist only)
-Every watchlist BUY snapshots CLOB orderbook state via `getOrderbookDepth(slug, outcome)`
-(src/bullpen.ts) before `addOpenTrade`. Two HTTPS calls: Gamma (slug → `clobTokenIds`)
-+ CLOB `/book`. Failures fall through with null — depth is never blocking.
-
-Fields persisted on `open_trades` + `closed_trades` (and shadow tables, schema-symmetric):
-- `best_ask`, `best_bid` — top of book at fill time
-- `spread_at_entry` — `best_ask - best_bid`
-- `ask_depth_5`, `ask_depth_10` — $ available within 5% / 10% of best_ask
-  (sum of `price * size` over asks at `price <= best_ask * 1.0X`)
-- `depth_backfilled` — 1 if filled in at startup from current book (stale), 0 if captured at fill time
-
-Backfill: `backfillOpenTradeDepth()` runs once at startup for open watchlist trades
-where `bestAsk` is null. Best-effort, fire-and-forget; throttled 100ms per fetch.
-Backfilled depth reflects current book, not the original fill moment — coarse proxy only.
-
-Dashboard `/api/watchlist` exposes per-trader `avgAskDepth5`, `avgSpread`, `liqSampleCount`
-across the trader's open + closed sim trades. Leaderboard copies are not instrumented.
+Plus ONE per-trader carve-out (longshot filter, trader `0x12d6…`) and the
+per-trader decay kill switch. All four constraints + the threshold-resolution,
+observation-ledger, risk-control, persistence, and sizing-research designs are
+documented in `docs/decisions.md`.
 
 ## Bullpen API gotchas
 - `data leaderboard` and `activity` return direct JSON arrays, **not** `{items: []}`.
@@ -210,149 +56,89 @@ across the trader's open + closed sim trades. Leaderboard copies are not instrum
 - Only process items where `type === 'TRADE'` and `side` is `BUY` or `SELL`.
 - `data leaderboard` ignores `--period` / `--limit`; slice in JS.
 
+## Orderbook depth at fill time (watchlist only)
+Every watchlist BUY snapshots CLOB state via `getOrderbookDepth(slug, outcome)`
+(`src/bullpen.ts`) before `addOpenTrade`: two HTTPS calls (Gamma slug →
+`clobTokenIds`, then CLOB `/book`). Failures fall through null — never blocking.
+Persisted on `open_trades`/`closed_trades`: `best_ask`, `best_bid`,
+`spread_at_entry`, `ask_depth_5`, `ask_depth_10`, `depth_backfilled`. Dashboard
+`/api/watchlist` exposes per-trader `avgAskDepth5`, `avgSpread`, `liqSampleCount`.
+Backfill caveat (coarse proxy): `docs/KNOWN_ISSUES.md`.
+
 ## Environment (docker-compose.yml)
 ```
 NODE_OPTIONS=--max-old-space-size=450   # Node heap cap; container limit 512MB
 DRY_RUN=true
 PORT=8080
-
 POLL_INTERVAL_MS=30000                  # 30 s per cycle
 PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
-# REMOVED 2026-05-29 (watchlist-only; these were inert no-ops — see "Key rules").
-# Deleted from config.ts AND docker-compose.yml:
-#   LEADERBOARD_REFRESH_MS, AUTO_EXCLUDE_WIN_RATE_THRESHOLD,
-#   MIN_PRICE, MIN_PRICE_SPORTS, MAX_PRICE, MAX_SPREAD, FORCE_EXCLUDE_CATEGORIES,
-#   MAX_POSITIONS_PER_MARKET, MAX_POSITIONS_PER_MARKET_SPORTS, MAX_TOTAL_OPEN_POSITIONS,
-#   MIN_TRADER_SAMPLE, MIN_TRADER_SHADOW_SAMPLE
-
-# Watchlist-only entry cap (open+closed within window) — closes the BUY-SELL-BUY
-# loophole. One of the THREE active constraints (see "Key rules").
-# NOTE 2026-06-11: applies only to NON-dated (geo/political) slugs; match-style
-# slugs (ISO date, e.g. fif-ksa-sen-2026-06-09-draw) use a hardcoded lifetime
-# cap of 1 entry per slug instead (no env key — see isMatchStyleSlug).
-MAX_WATCHLIST_ENTRIES_PER_MARKET=2
-MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000   # 12h
-
+MAX_WATCHLIST_ENTRIES_PER_MARKET=2      # non-dated slugs only (match-style → lifetime 1)
+MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000  # 12h
 GAS_COST_PER_BUY=0                      # Polymarket charges no fees on sports markets
 SLIPPAGE_RATE=0.02                      # 2% each side (entry at ask, exit at bid)
-
-# Watchlist depth gate (added 2026-05-27) — skip BUY when CLOB ask_depth_5 < $500.
-# Protects against thin books where a $5-15 copy would itself move the market;
-# also improves statistical validity of the watchlist edge by trimming low-liquidity
-# tail trades. Non-blocking on depth-fetch failure (copy proceeds).
-DEPTH_GATE_MIN_DEPTH_5=500
-
-# Simulated wallet cap (added 2026-05-28) — models a fixed-size real wallet.
-# When SIMULATED_WALLET_SIZE>0, sum(simulatedAmount) over open trades is compared
-# against SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION before each BUY; over-cap
-# BUYs are skipped (applies to BOTH watchlist and leaderboard — wallet is a hard
-# real-money constraint regardless of trust override). Logs `wallet_cap: $X/$1000 in use`.
-# Dashboard /api/stats returns simulatedWalletSize, walletInUse, walletCapUtilization.
-SIMULATED_WALLET_SIZE=1000
+DEPTH_GATE_MIN_DEPTH_5=500              # thin-book guard (added 2026-05-27)
+SIMULATED_WALLET_SIZE=1000              # models a fixed real wallet (added 2026-05-28)
 WALLET_CAP_UTILIZATION=0.80
-
+TRADER_DECAY_THRESHOLD_PCT_30D=5        # %-of-wallet kill switch (7d window removed 2026-06-15)
+DAILY_LOSS_CIRCUIT_BREAKER=off          # breaker disabled 2026-06-11 (code retained)
+DYNAMIC_SIZING=false                    # GROUP D research toggle (OFF)
 FALCON_API_KEY=${POLYMARKET_ANALYTICS_API_KEY:-}
 ```
+Removed 2026-05-29 (inert no-ops): `LEADERBOARD_REFRESH_MS`,
+`AUTO_EXCLUDE_*`, `MIN_PRICE*`, `MAX_PRICE`, `MAX_SPREAD`,
+`FORCE_EXCLUDE_CATEGORIES`, `MAX_POSITIONS_PER_MARKET*`,
+`MAX_TOTAL_OPEN_POSITIONS`, `MIN_TRADER_*SAMPLE`. See `docs/decisions.md`.
 
 ## Server Environment
-- Host: `<server-host>` (fallback IP `<server-ip>`), port `<ssh-port>`, user `user`
-- Key: `~/.ssh/id_ed25519` (server local key)
+- Host: `<server-host>` (fallback `<server-ip>`), port `<ssh-port>`, user `user`
+- Key: `~/.ssh/id_ed25519`
 - Runtime dir: `/home/user/polymarket_bot/` — **source of truth filesystem**
 - Bullpen CLI on server: `/home/user/.npm-global/lib/node_modules/@bullpenfi/cli/bin/bullpen`
-- Dashboard: http://localhost:8082
-- Claude Code runs directly on the server — no Windows dependency
+- Dashboard: http://localhost:8082 — Claude Code runs directly on the server
 
-## Secrets (`.env` on server)
-WireGuard creds (`WIREGUARD_PRIVATE_KEY`, `WIREGUARD_PUBLIC_KEY`, `WIREGUARD_ENDPOINT_IP`, `WIREGUARD_ADDRESSES`) live in `/home/user/polymarket_bot/.env` and are referenced from `docker-compose.yml` as `${…}`. The port stays hardcoded at `51820`. Do not hardcode the creds in compose — that caused VPN drift previously (compose froze while `.env` was rotated). `.env` is gitignored; to rotate, edit on the server and `docker compose up -d gluetun bot`.
-
-## Shared alerting infrastructure (`~/.env.shared`)
-Telegram bot credentials are **not** in `~/polymarket_bot/.env`. They live at `~/.env.shared` (chmod 600, server-only) and are reused by `paper_trader` on the same host. Format:
-```
-TELEGRAM_BOT_TOKEN=<...>
-TELEGRAM_CHAT_ID=<...>
-```
-Host shell scripts source `~/.env.shared` directly. Future Docker services that need Telegram should add `env_file: [/home/user/.env.shared]` (see `paper_trader/docker-compose.yml` for the pattern).
+## Secrets
+- WireGuard creds (`WIREGUARD_*`) live in `/home/user/polymarket_bot/.env`,
+  referenced from `docker-compose.yml` as `${…}`; port hardcoded `51820`. Do not
+  hardcode creds in compose (caused VPN drift). To rotate: edit `.env`,
+  `docker compose up -d gluetun bot`.
+- Telegram creds (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) live at
+  `~/.env.shared` (chmod 600, server-only, shared with `paper_trader`), injected
+  via `env_file` in docker-compose. Use `[polymarket_bot]` prefix on messages.
 
 ### Alerts
-Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/logs/`. **Neither directory is in the git repo** (server runtime only).
+Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/logs/`
+— **neither is in the git repo** (server runtime only). Each script: app log
+`<name>.log` + cron stdout/stderr `<name>.cron.log`; expiry scripts alert at
+≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=1` for test runs.
 
-Cron lines redirect both stdout and stderr to a `.cron.log` file (no host MTA configured, so unredirected stderr would be lost). The script's own `.log` file is for application-level entries; the `.cron.log` is for cron-side surface (anything printed to stdout/stderr). Two tokens are monitored: Bullpen refresh token (auto-refreshed by CLI as long as the refresh token itself is alive) and Falcon JWT (manual rotation only).
+| Script | Cron | Purpose |
+|---|---|---|
+| `check-bullpen-expiry.sh` | `0 9 * * *` | `bullpen --output json status` → `account.session_expires`. Refresh: `bullpen login`. |
+| `check-falcon-expiry.sh` | `0 9 * * *` | `POLYMARKET_ANALYTICS_API_KEY` raw JWT, ~60d TTL, no auto-refresh. Refresh: new JWT at polymarketanalytics.com → `.env` → `docker compose up -d --no-deps bot`. |
+| `git-sync.sh` | `0 3 * * *` | Auto-commits tracked changes (`src/ tests/ scripts/ public/` + root configs) as `chore(sync): daily auto-sync <date>`, pushes `origin/main`. Untracked files NOT auto-added. |
+| `watchdog.sh` | `*/5 * * * *` | Probes `http://localhost:8082/`; ≥2 consecutive non-200 → `docker compose restart bot` + alert. Recovers the gluetun-restart orphan-namespace failure. |
+| `weekly-macro-scan.sh` | `0 4 * * 1` | Falcon enrichment of `tracked_traders` + 90d on-chain scan; Telegram top-5 candidates (>0 only). Does NOT auto-add to watchlist. |
 
-Both scripts: alert at ≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=1` for test runs, app log `<name>-expiry.log` + cron stdout/stderr log `<name>-expiry.cron.log`.
+New alerts: copy `send_telegram()` from `check-bullpen-expiry.sh`. Always log one
+line per run so a quiet log proves the cron ran.
 
-| Script | Cron | Token source | Refresh |
-|---|---|---|---|
-| `check-bullpen-expiry.sh` | `0 9 * * *` | `bullpen --output json status` → `account.session_expires` (CLI ≥0.1.98 stores creds encrypted as `credentials.json.enc`, so JWT is no longer decodable from disk; script shells out to the CLI instead) | `bullpen login` on server |
-| `check-falcon-expiry.sh` | `0 9 * * *` | `POLYMARKET_ANALYTICS_API_KEY` (= `FALCON_API_KEY`) in `~/polymarket_bot/.env`, raw JWT, no auto-refresh, ~60 day TTL | Generate new JWT at https://polymarketanalytics.com → update `.env` → `docker compose up -d --no-deps bot` |
-| `git-sync.sh` | `0 3 * * *` | Tracked changes under `src/`, `tests/`, `scripts/`, `public/`, plus `CLAUDE.md`, `Dockerfile`, `docker-compose.yml`, `package*.json`, `tsconfig.json`, `.gitignore`, `.env.example` | Auto: stages `git add -u` on those paths, commits as `chore(sync): daily auto-sync <date>`, pushes to `origin/main` via `~/.ssh/deploy-key`. Skips silently when no diff. Untracked files are NOT auto-added — add them manually if they belong in git. Log: `logs/git-sync.log` (rotated to last 100 lines) + `logs/git-sync.cron.log` |
-| `watchdog.sh` | `*/5 * * * *` | Probes `http://localhost:8082/`. State file `logs/watchdog.state` tracks consecutive failures; ≥2 consecutive non-200 results (~10 min unreachable) triggers `docker compose restart bot` + Telegram alert. Recovers from the gluetun-restart orphan-namespace failure: bot uses `network_mode: container:gluetun`, so a gluetun restart detaches the bot's netns and Express becomes unreachable from outside even though the process is healthy. `FORCE_RESTART=1` simulates a failure for testing. Log: `logs/watchdog.log` (rotated to last 100 lines) + `logs/watchdog.cron.log`. |
-| `weekly-macro-scan.sh` | `0 4 * * 1` (Mon) | `docker cp` latest `macro_scan.js` + `macro_scan_90d.js` into the container, then `docker exec` Falcon enrichment (updates `tracked_traders.falcon_sharpe/roi/win_rate`) + 90d on-chain scan. Parses MACRO CANDIDATES (avg_hold≥48h, t/wk<20, WR>60%, closed≥10, pnl>0; excludes watchlist + excluded_traders), enriches with Sharpe from `tracked_traders`, sends Telegram top-5 summary only when candidates>0 (zero-candidate runs log `SILENT` to the app log and send no message). **Does NOT auto-add to watchlist — manual review only.** Log: `logs/weekly-macro-scan.log` (last 200 lines) + per-run raw outputs under `logs/weekly-macro-scan-runs/` (pruned after 30d) + `logs/weekly-macro-scan.cron.log` |
-
-New alerts: copy `send_telegram()` from `check-bullpen-expiry.sh` (self-contained, sources `~/.env.shared`). Use `[polymarket_bot]` prefix so messages group separately from `paper_trader`. Always log one line per run so a quiet log proves the cron ran.
-
-## Deploy Process (container rebuild)
-Code changes are made directly on the server filesystem. Source of truth is `/home/user/polymarket_bot/`.
-
-```bash
-# After editing files on server
-cd ~/polymarket_bot 
-docker compose up -d --build
-docker logs polymarket_bot --tail 20
-```
-
-## GitHub Repository Sync
-- Repo: `git@github.com:fabibal/polymarket_bot.git` (private, default branch `main`)
-- Server has GitHub SSH key configured: `~/.ssh/deploy-key` wired via `Host github.com` in `~/.ssh/config`
-- Commit author: `Balazs <fabibal@users.noreply.github.com>` (pass with `-c user.name= -c user.email=`)
-
-To push changes to GitHub (run from server):
-```bash
-cd ~/polymarket_bot
-git status --porcelain
-git add <files>
-git -c user.name="Balazs" -c user.email="fabibal@users.noreply.github.com" commit -m "<subject>"
-git push origin HEAD:main
-git ls-remote git@github.com:fabibal/polymarket_bot.git HEAD
-```
-
-Note: GitHub push is separate from container deployment. Both are manual operations.
-
-<!-- code-review-graph MCP tools -->
 ## MCP Tools: code-review-graph
 
-**IMPORTANT: This project has a knowledge graph. ALWAYS use the
-code-review-graph MCP tools BEFORE using Grep/Glob/Read to explore
-the codebase.** The graph is faster, cheaper (fewer tokens), and gives
-you structural context (callers, dependents, test coverage) that file
-scanning cannot.
-
-### When to use graph tools FIRST
-
-- **Exploring code**: `semantic_search_nodes` or `query_graph` instead of Grep
-- **Understanding impact**: `get_impact_radius` instead of manually tracing imports
-- **Code review**: `detect_changes` + `get_review_context` instead of reading entire files
-- **Finding relationships**: `query_graph` with callers_of/callees_of/imports_of/tests_for
-- **Architecture questions**: `get_architecture_overview` + `list_communities`
-
-Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
-
-### Key Tools
+**This project has a knowledge graph. ALWAYS use the code-review-graph MCP tools
+BEFORE Grep/Glob/Read to explore the codebase** — faster, cheaper, gives
+structural context (callers, dependents, test coverage). Fall back to
+Grep/Glob/Read only when the graph doesn't cover what you need.
 
 | Tool | Use when |
 |------|----------|
-| `detect_changes` | Reviewing code changes — gives risk-scored analysis |
-| `get_review_context` | Need source snippets for review — token-efficient |
-| `get_impact_radius` | Understanding blast radius of a change |
-| `get_affected_flows` | Finding which execution paths are impacted |
-| `query_graph` | Tracing callers, callees, imports, tests, dependencies |
+| `detect_changes` | Reviewing code changes — risk-scored analysis |
+| `get_review_context` | Source snippets for review — token-efficient |
+| `get_impact_radius` | Blast radius of a change |
+| `get_affected_flows` | Which execution paths are impacted |
+| `query_graph` | Tracing callers/callees/imports/tests/dependencies |
 | `semantic_search_nodes` | Finding functions/classes by name or keyword |
-| `get_architecture_overview` | Understanding high-level codebase structure |
+| `get_architecture_overview` | High-level codebase structure |
 | `refactor_tool` | Planning renames, finding dead code |
 
-### Workflow
-
-1. The graph auto-updates on file changes (via hooks).
-2. Use `detect_changes` for code review.
-3. Use `get_affected_flows` to understand impact.
-4. Use `query_graph` pattern="tests_for" to check coverage.
+The graph auto-updates on file changes (via hooks).

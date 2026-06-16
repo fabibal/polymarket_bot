@@ -1,0 +1,65 @@
+# Known Issues
+
+Standing issues and accepted non-obvious quirks. Resolved bugs live in git
+history and, where they changed behaviour, in `docs/decisions.md`.
+
+## Accepted by design (no action planned)
+
+- **Frozen shadow / leaderboard tables.** `shadow_open_trades`,
+  `shadow_closed_trades`, `tracked_traders` (excl. the macro-scan writes),
+  `excluded_traders` remain on disk as a historical record. The bot never reads
+  or writes them as part of the live loop (exception: the weekly macro scan
+  writes `tracked_traders.falcon_*` columns externally; `/api/discovery/candidates`
+  reads `falconSharpe`). Do NOT re-add CREATE TABLE / migration logic for the
+  shadow tables — they were deliberately dropped from startup. Context:
+  `docs/decisions.md` "Watchlist-only architecture" + "Final shadow/leaderboard
+  cleanup".
+
+- **`copiedTraderRank` is hardcoded 0.** Legacy NOT NULL column on
+  `closed_trades` left over from the leaderboard era. Every row written since
+  2026-06-11 carries 0. Not meaningful — do not read it. Context:
+  `docs/decisions.md` "Final shadow/leaderboard cleanup".
+
+- **`copiedTraderSource: 'leaderboard'` still in the type union.** Historical
+  `closed_trades` rows predating the watchlist-only switch carry it. New rows are
+  always `'watchlist'`. The union member stays so old rows still type-check.
+
+- **Depth-backfill is a coarse proxy, not the fill-moment book.**
+  `backfillOpenTradeDepth()` runs once at startup for open watchlist trades where
+  `bestAsk` is null. Backfilled depth reflects the *current* book, not the
+  original fill moment. Rows carry `depth_backfilled=1` to flag this; treat their
+  `ask_depth_5`/`spread_at_entry` as approximate. Fire-and-forget, throttled
+  100ms/fetch, non-blocking.
+
+- **Observation ledger has no entry cap, wallet cap, depth gate, or longshot
+  filter.** Deliberately RAW — the `observation_trades` lifecycle measures the
+  trader's edge, not our execution constraints, so it can run unbounded re-entries
+  the live copy path would block. Observation rows never enter `open_trades`, so
+  the wallet cap is unaffected. Context: `docs/decisions.md` "Observation
+  forward-test ledger".
+
+- **Daily-loss circuit breaker code is inert but retained.** `src/risk.ts` keeps
+  `checkCircuitBreaker`/`isCircuitBreakerActive`; `CONFIG.DAILY_LOSS_BREAKER_ENABLED`
+  short-circuits them to no-ops and any stale `meta.circuit_breaker_until` is
+  ignored while `DAILY_LOSS_CIRCUIT_BREAKER=off`. Not dead code — kept for a
+  one-line re-enable. Context: `docs/decisions.md` "Daily-loss circuit breaker
+  disabled".
+
+- **Maker execution would erase the edge.** Measured avg `entry_price_gap` is
+  6.8% vs the 2% modeled slippage (1,167-trade review 2026-06-10). Taker
+  execution is assumed for all PnL; do not model maker fills as free improvement.
+  Context: `docs/decisions.md` "Sizing + maker-execution research".
+
+## Operational notes
+
+- **`scripts/` and `logs/` are NOT in the git repo** — server runtime only. The
+  daily `git-sync.sh` does add tracked changes under `scripts/`, but untracked
+  files there are never auto-added; add them manually if they belong in git.
+
+- **`source_sell_fraction` can be NULL.** Only set on copy-SELL closes when we
+  hold a matching position and the data-api positions lookup succeeds.
+  Threshold/expiry/delist closes never set it. NULL is expected, not a bug.
+
+- **`source_notional` / dynamic-sizing data needs ~3-4 weeks** before
+  conviction-weighted sizing analysis is statistically usable. Until then the
+  columns are populated but under-sampled.
