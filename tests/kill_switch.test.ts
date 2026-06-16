@@ -7,7 +7,6 @@ vi.mock('../src/config', () => ({
     SLIPPAGE_RATE: 0,
     RESOLVED_THRESHOLD: 0.93,
     TRADER_DECAY_THRESHOLD_30D: -50,
-    TRADER_DECAY_THRESHOLD_7D: -30,
     DAILY_LOSS_BREAKER_ENABLED: true,
     DAILY_LOSS_CIRCUIT_BREAKER: -30,
   },
@@ -84,9 +83,9 @@ describe('store: auto-disable + meta helpers', () => {
   });
 });
 
-describe('risk: trader decay kill switch (30d OR 7d window)', () => {
-  it('disables via the 30d window when net is below -50 (30d takes precedence in the reason)', async () => {
-    for (let i = 0; i < 11; i++) bookLoss(); // ≈ -$55 < -$50 (and < -$30 in 7d)
+describe('risk: trader decay kill switch (30d window)', () => {
+  it('disables via the 30d window when net is below -50', async () => {
+    for (let i = 0; i < 11; i++) bookLoss(); // ≈ -$55 < -$50
     const disabled = await checkTraderDecay();
     expect(disabled).toEqual([TRADER]);
     const w = store.readStore().watchlistTraders.find(x => x.address === TRADER)!;
@@ -95,18 +94,10 @@ describe('risk: trader decay kill switch (30d OR 7d window)', () => {
     expect(w.autoDisabledReason).toContain('below decay threshold');
   });
 
-  it('disables via the 7d window when recent bleed crosses -30 but 30d is still above -50', async () => {
-    for (let i = 0; i < 7; i++) bookLoss(); // ≈ -$35: 30d fine (-35 > -50), 7d trips (-35 < -30)
-    const disabled = await checkTraderDecay();
-    expect(disabled).toEqual([TRADER]);
-    const w = store.readStore().watchlistTraders.find(x => x.address === TRADER)!;
-    expect(w.autoDisabledReason).toContain('7d net');
-  });
-
-  it('does not fire above both thresholds and never re-fires on already-disabled traders', async () => {
-    for (let i = 0; i < 5; i++) bookLoss(); // ≈ -$25: above -30 (7d) and -50 (30d)
+  it('does not fire above the threshold and never re-fires on already-disabled traders', async () => {
+    for (let i = 0; i < 7; i++) bookLoss(); // ≈ -$35: above -50, no fire
     expect(await checkTraderDecay()).toEqual([]);
-    for (let i = 0; i < 2; i++) bookLoss(); // now ≈ -$35 → 7d trigger
+    for (let i = 0; i < 4; i++) bookLoss(); // now ≈ -$55 → 30d trigger
     expect(await checkTraderDecay()).toEqual([TRADER]);
     expect(await checkTraderDecay()).toEqual([]); // disabled traders are skipped
   });

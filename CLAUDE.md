@@ -112,14 +112,18 @@ A final cleanup pass on 2026-06-11 removed the last shadow/leaderboard remnants:
   via Telegram (`src/alerts.ts`, creds injected from `~/.env.shared` via `env_file` in
   docker-compose — the `[polymarket_bot]` prefix groups messages):
   1. *Per-trader decay kill switch* — after each poll cycle, any copy-enabled watchlist
-     trader whose rolling cost-adjusted net drops below threshold in EITHER window is
-     auto-disabled (`watchlist_traders.auto_disabled_at/_reason`): 30d (slow decay) or
-     7d (FIX 2 — catches sustained bleeding hidden by a big 30d win cushion; e.g.
-     Shadow-Top4's +$1.3k 30d cushion made the 30d switch decorative). The alert and
-     reason name the window that fired. The trader keeps accruing observation
-     forward-test data. Manual re-enable via dashboard clears the marker, but if still
-     under threshold the next check re-disables — raise the env threshold to truly
-     override.
+     trader whose rolling 30d cost-adjusted net drops below threshold is
+     auto-disabled (`watchlist_traders.auto_disabled_at/_reason`). The trader keeps
+     accruing observation forward-test data. Manual re-enable via dashboard clears the
+     marker, but if still under threshold the next check re-disables — raise the env
+     threshold to truly override.
+     **(7d window REMOVED 2026-06-15.)** The 7d window (the old "FIX 2") was a -$30 /
+     3%-of-wallet gate meant to catch sustained bleeding hidden by a big 30d cushion.
+     It proved too tight for sports traders: a single bad weekend during a seasonal
+     trough tripped it. It false-disabled Shadow-Top4 on 2026-06-13 (7d net -$33.80,
+     $3.80 past threshold) while he was +$702/30d and about to re-activate for the
+     FIFA World Cup — the club season had just ended, so his volume cratered and normal
+     weekend variance dominated. Only the 30d window remains.
   2. *Daily-loss circuit breaker* — **INTENTIONALLY DISABLED 2026-06-11** via
      `DAILY_LOSS_CIRCUIT_BREAKER=off` in docker-compose.yml. Reason: a single bad day
      doesn't predict future performance; the per-trader decay kill switches cover the
@@ -138,19 +142,18 @@ A final cleanup pass on 2026-06-11 removed the last shadow/leaderboard remnants:
      reset: `POST /api/breaker/reset`. Note: trades that close
      during the pause count in the next 24h window, so a still-bleeding book can re-trip
      immediately on resume — intended.
-  **Thresholds are %-of-wallet (FIX 3):** `TRADER_DECAY_THRESHOLD_PCT_30D=5`,
-  `TRADER_DECAY_THRESHOLD_PCT_7D=3`, `DAILY_LOSS_CIRCUIT_BREAKER_PCT=3` (the latter
-  inert while the breaker is disabled) — derived from
-  `SIMULATED_WALLET_SIZE` (`resolveRiskThreshold` in config.ts; at $1000 → -50/-30/-30,
-  identical to the old absolutes). Absolute env vars (`TRADER_DECAY_THRESHOLD_30D`/`_7D`,
-  `DAILY_LOSS_CIRCUIT_BREAKER`) override the % when set; wallet sim disabled (size 0) →
-  fixed absolute defaults. Because thresholds scale with the wallet, enabling
-  `DYNAMIC_SIZING=true` no longer requires retuning them by hand — but sanity-check the
-  derived values whenever `SIMULATED_WALLET_SIZE` or `MAX_TRADE_AMOUNT` changes.
+  **Thresholds are %-of-wallet (FIX 3):** `TRADER_DECAY_THRESHOLD_PCT_30D=5` and
+  `DAILY_LOSS_CIRCUIT_BREAKER_PCT=3` (the latter inert while the breaker is disabled) —
+  derived from `SIMULATED_WALLET_SIZE` (`resolveRiskThreshold` in config.ts; at $1000 →
+  -50/-30). Absolute env vars (`TRADER_DECAY_THRESHOLD_30D`, `DAILY_LOSS_CIRCUIT_BREAKER`)
+  override the % when set; wallet sim disabled (size 0) → fixed absolute defaults.
+  Because thresholds scale with the wallet, enabling `DYNAMIC_SIZING=true` no longer
+  requires retuning them by hand — but sanity-check the derived values whenever
+  `SIMULATED_WALLET_SIZE` or `MAX_TRADE_AMOUNT` changes.
   Dashboard: `/api/stats` returns `circuitBreaker {enabled, active, until, net24h, threshold}` +
-  `traderDecayThreshold30d`; `/api/watchlist` items carry `pnl30d`/`pnl7d`/
-  `decayDistance`/`decayDistance7d`; the watchlist table shows a "30d Net (kill switch)"
-  column whose tooltip lists both windows' headroom, with a ⛔ badge when auto-disabled.
+  `traderDecayThreshold30d`; `/api/watchlist` items carry `pnl30d`/`decayDistance`;
+  the watchlist table shows a "30d Net (kill switch)" column whose tooltip lists the
+  30d headroom, with a ⛔ badge when auto-disabled.
   Window math is pure (`rollingNetForTrader`, `rollingNetTotal`, `evaluateCircuitBreaker`)
   and unit-tested (`tests/risk.test.ts` host-runnable, `tests/kill_switch.test.ts` DB-backed).
 - **Sizing + maker-execution research (added 2026-06-10, GROUP D):**

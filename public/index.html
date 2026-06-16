@@ -1378,23 +1378,17 @@
     return w.liqSampleCount > 0 ? String(w.liqSampleCount) : '<span style="color:var(--muted)">—</span>';
   }
 
-  // Rolling 30d/7d net + headroom to the per-trader decay kill switch (either
-  // window triggering auto-disables). Cell shows 30d; tooltip shows both.
+  // Rolling 30d net + headroom to the per-trader decay kill switch.
   function decayCell(w) {
     if (w.pnl30d == null) return '—';
     const v = Number(w.pnl30d);
     const thr = Number(w.decayThreshold ?? -50);
     const dist = Number(w.decayDistance ?? (v - thr));
-    const v7 = w.pnl7d != null ? Number(w.pnl7d) : null;
-    const thr7 = Number(w.decayThreshold7d ?? -30);
-    const dist7 = w.decayDistance7d != null ? Number(w.decayDistance7d) : (v7 != null ? v7 - thr7 : null);
-    const minDist = dist7 != null ? Math.min(dist, dist7) : dist;
-    const cls = minDist <= 0 ? 'red' : minDist < 20 ? 'yellow' : (v >= 0 ? 'green' : '');
+    const cls = dist <= 0 ? 'red' : dist < 20 ? 'yellow' : (v >= 0 ? 'green' : '');
     const badge = w.autoDisabledAt
       ? ` <span title="Auto-disabled ${w.autoDisabledAt}: ${w.autoDisabledReason || ''}" style="cursor:help">⛔</span>`
       : '';
-    const tip = `30d ${fmtPnl(v)} (headroom ${fmtPnl(dist)} to ${fmtPnl(thr)})` +
-      (v7 != null ? ` · 7d ${fmtPnl(v7)} (headroom ${fmtPnl(dist7)} to ${fmtPnl(thr7)})` : '');
+    const tip = `30d ${fmtPnl(v)} (headroom ${fmtPnl(dist)} to ${fmtPnl(thr)})`;
     return `<span class="${cls}" title="${tip}">${fmtPnl(v)}</span>${badge}`;
   }
 

@@ -84,11 +84,11 @@ services:
       - GAS_COST_PER_BUY=0  # Polymarket has NO fees on sports markets (only 15-min crypto). Polygon gas negligible.
       - SLIPPAGE_RATE=0.02   # 2% slippage each side (entry at ask, exit at bid)
       # Risk thresholds as % of SIMULATED_WALLET_SIZE (scale automatically with wallet
-      # and stay sane if DYNAMIC_SIZING multiplies trade sizes). At $1000: -50 / -30 / -30.
-      # Absolute overrides (TRADER_DECAY_THRESHOLD_30D / _7D, DAILY_LOSS_CIRCUIT_BREAKER)
+      # and stay sane if DYNAMIC_SIZING multiplies trade sizes). At $1000: -50 / -30.
+      # Absolute overrides (TRADER_DECAY_THRESHOLD_30D, DAILY_LOSS_CIRCUIT_BREAKER)
       # win over the % vars when set.
+      # (7d kill-switch window removed 2026-06-15 — too tight for sports traders.)
       - TRADER_DECAY_THRESHOLD_PCT_30D=5   # per-trader kill switch, 30d window
-      - TRADER_DECAY_THRESHOLD_PCT_7D=3    # per-trader kill switch, 7d window (catches slow bleed under a 30d cushion)
       # Account-wide daily-loss breaker INTENTIONALLY DISABLED 2026-06-11: a single
       # bad day doesn't predict future performance; the per-trader decay kill
       # switches cover the real risk. Re-enable: set to a number or remove the var

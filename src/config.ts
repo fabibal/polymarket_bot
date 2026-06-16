@@ -83,17 +83,15 @@ export const CONFIG = {
   MIN_TRADE_AMOUNT: parseFloat(process.env.MIN_TRADE_AMOUNT ?? '5'),
   MAX_TRADE_AMOUNT: parseFloat(process.env.MAX_TRADE_AMOUNT ?? '25'),
   // Per-trader kill switch (added 2026-06-10): when a copy-enabled watchlist trader's
-  // rolling cost-adjusted net PnL drops below either window's threshold, copying is
+  // rolling 30d cost-adjusted net PnL drops below the threshold, copying is
   // auto-disabled (the trader keeps accruing observation forward-test data) and a
-  // Telegram alert fires. The 7d window (FIX 2) catches sustained bleeding that a big
-  // 30d win cushion would otherwise hide. Thresholds: absolute env var wins; otherwise
-  // % of SIMULATED_WALLET_SIZE (TRADER_DECAY_THRESHOLD_PCT_30D=5, _PCT_7D=3).
+  // Telegram alert fires. (The 7d window was removed 2026-06-15 — too tight for
+  // sports traders, false-tripped on a single bad weekend during a seasonal trough.)
+  // Threshold: absolute env var wins; otherwise % of SIMULATED_WALLET_SIZE
+  // (TRADER_DECAY_THRESHOLD_PCT_30D=5).
   TRADER_DECAY_THRESHOLD_30D: resolveRiskThreshold(
     process.env.TRADER_DECAY_THRESHOLD_30D, process.env.TRADER_DECAY_THRESHOLD_PCT_30D,
     WALLET_SIZE, 5, -50),
-  TRADER_DECAY_THRESHOLD_7D: resolveRiskThreshold(
-    process.env.TRADER_DECAY_THRESHOLD_7D, process.env.TRADER_DECAY_THRESHOLD_PCT_7D,
-    WALLET_SIZE, 3, -30),
   // Account-wide circuit breaker (added 2026-06-10): when total cost-adjusted realized
   // PnL over the last 24h drops below this, ALL copying pauses for 24h (cursors still
   // advance; missed trades are NOT copied late on resume). Auto-resumes after 24h;
