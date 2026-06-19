@@ -374,3 +374,30 @@ a seasonal trough tripped it. It false-disabled Shadow-Top4 on 2026-06-13 (7d
 net -$33.80, $3.80 past threshold) while he was +$702/30d and about to
 re-activate for the FIFA World Cup: the club season had just ended, so his
 volume cratered and normal weekend variance dominated.
+
+---
+
+## Entry slippage switched flat-2% → gap-based (2026-06-19, `src/simulator.ts`)
+
+**Decision:** when a watchlist BUY carries an orderbook snapshot, charge entry
+slippage = `max(0, best_ask - trader_price) × shares` (the recorded
+`entry_price_gap`) instead of the flat `SLIPPAGE_RATE × notional`. Flat 2% stays
+as the fallback when no snapshot exists (depth fetch failed, or the raw
+observation ledger, which takes no snapshot). `computeEntryCosts` gained an
+optional `gap` arg; `monitor.ts` passes `watchlistDepth.bestAsk - activity.price`.
+
+**Alternative considered:** keep the flat 2% model; or recalibrate the flat rate
+to a higher constant.
+
+**Reason:** the 06-19 gap analysis (n=230 with gap / 160 closed since 06-10)
+showed the flat 2% model charged $16 of entry slippage while the *real* taker
+cost (gap×shares) was $29.32 — understated ~83%. Cause is dimensional: the gap is
+absolute (a 1-cent tick is the modal gap), while 2% is relative, so on cheap
+longshot outcomes ($0.10) a 1-cent gap is ~10% but the model only booked 2%.
+Gap-based uses the per-trade measured cost we already persist, removing the
+miscalibration. Floor at 0 because a negative gap (stale snapshot, ask below the
+trader's booked price) must not credit phantom profit. A flat recalibration was
+rejected — it would fix the average but not the price-dependent dispersion.
+Clean-window closed PnL under each model: flat-2% +$40.80, gap-based (real ask)
++$27.48. This is an execution-cost realism fix, **not** an edge/sizing decision —
+n=160 is far below the n≥5k/p<0.01 bar and nothing about DRY_RUN changes.

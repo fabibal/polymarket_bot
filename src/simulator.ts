@@ -33,11 +33,23 @@ import { SimulatedTrade } from './types';
 //   - exit slippage:   SLIPPAGE_RATE × exitPrice × shares (fills at bid, not mid)
 // The raw realizedPnl field stays mid-to-mid so historical records are intact;
 // costAdjustedPnl is the net figure after fees.
-export function computeEntryCosts(entryPrice: number, shares: number): { gas: number; slippage: number } {
-  return {
-    gas:      CONFIG.GAS_COST_PER_BUY,
-    slippage: CONFIG.SLIPPAGE_RATE * entryPrice * shares,
-  };
+export function computeEntryCosts(
+  entryPrice: number,
+  shares: number,
+  gap?: number | null,
+): { gas: number; slippage: number } {
+  // Gap-based entry slippage when the real ask/trader-price gap is known
+  // (watchlist BUYs carrying an orderbook snapshot): models the actual taker
+  // cost of lifting the ask = (best_ask - trader_price) × shares. Floor at 0 —
+  // a negative gap (stale snapshot, ask below the trader's booked price) must
+  // not credit phantom profit. Falls back to flat SLIPPAGE_RATE × notional when
+  // no snapshot exists (depth fetch failed, or the raw observation ledger).
+  // The flat 2% model understated real cost ~2x on cheap outcomes (gap is
+  // absolute cents; 2% is relative) — see docs/decisions.md 2026-06-19.
+  const slippage = gap != null
+    ? Math.max(0, gap) * shares
+    : CONFIG.SLIPPAGE_RATE * entryPrice * shares;
+  return { gas: CONFIG.GAS_COST_PER_BUY, slippage };
 }
 
 /**

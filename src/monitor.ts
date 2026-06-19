@@ -295,7 +295,8 @@ export async function pollTrader(
       }
 
       const shares = amount / activity.price;
-      const entryCosts = computeEntryCosts(activity.price, shares);
+      const entryGap = watchlistDepth ? watchlistDepth.bestAsk - activity.price : null;
+      const entryCosts = computeEntryCosts(activity.price, shares, entryGap);
       const trade: SimulatedTrade = {
         id: uuidv4(),
         sourceTradeId: activity.id,
@@ -321,7 +322,7 @@ export async function pollTrader(
       // signal) and the taker entry-price gap (maker-execution study).
       const notional = activity.usdcSize ?? (activity.size > 0 ? activity.price * activity.size : undefined);
       if (notional != null && Number.isFinite(notional)) trade.sourceNotional = notional;
-      if (watchlistDepth) trade.entryPriceGap = watchlistDepth.bestAsk - activity.price;
+      if (entryGap != null) trade.entryPriceGap = entryGap;
       // Persist the depth snapshot fetched above for the gate check.
       if (watchlistDepth) {
         trade.bestAsk = watchlistDepth.bestAsk;

@@ -66,6 +66,21 @@ describe('computeEntryCosts', () => {
     const b = computeEntryCosts(0.50, 40).slippage;
     expect(b).toBeCloseTo(a * 2, 10);
   });
+
+  it('uses gap × shares when a gap is supplied (gap-based taker cost)', () => {
+    const { slippage } = computeEntryCosts(0.10, 50, 0.01); // 1-cent gap
+    expect(slippage).toBeCloseTo(0.01 * 50, 10); // 0.50, vs flat-2% would be 0.10
+  });
+
+  it('floors negative gap at 0 (no phantom credit from stale snapshot)', () => {
+    const { slippage } = computeEntryCosts(0.10, 50, -0.02);
+    expect(slippage).toBe(0);
+  });
+
+  it('falls back to flat SLIPPAGE_RATE when gap is null/undefined', () => {
+    expect(computeEntryCosts(0.70, 10, null).slippage).toBeCloseTo(0.02 * 0.70 * 10, 10);
+    expect(computeEntryCosts(0.70, 10).slippage).toBeCloseTo(0.02 * 0.70 * 10, 10);
+  });
 });
 
 describe('tradeCostAdjustedPnl', () => {
