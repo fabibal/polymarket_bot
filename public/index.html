@@ -1862,12 +1862,19 @@
   }
 
   async function addDiscoveryToWatchlist(address, btn) {
+    // Discovery adds used to post no label -> nameless, last-sorted watchlist row.
+    // Prompt for one (default Disc-<MMDD>, matching the -0610 convention). Cancel aborts.
+    const now = new Date();
+    const def = `Disc-${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+    const raw = prompt(`Label for ${shortAddr(address)} (blank = ${def}):`, def);
+    if (raw === null) return;
+    const label = raw.trim() || def;
     btn.disabled = true; btn.textContent = '…';
     try {
       const res = await fetch('/api/watchlist', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address }),
+        body: JSON.stringify({ address, label }),
       });
       if (!res.ok && res.status !== 409) {
         const d = await res.json();
