@@ -401,3 +401,24 @@ rejected — it would fix the average but not the price-dependent dispersion.
 Clean-window closed PnL under each model: flat-2% +$40.80, gap-based (real ask)
 +$27.48. This is an execution-cost realism fix, **not** an edge/sizing decision —
 n=160 is far below the n≥5k/p<0.01 bar and nothing about DRY_RUN changes.
+
+## Macro-scan exclusion: whale `0xc8ec...8f1` (2026-06-29)
+
+**Decision:** added `0xc8ec6d4cef5c5fe8409ef69303c37f05b678e8f1` to the
+`excluded_traders` table (`auto=0`, manual) so the weekly macro scan stops
+re-surfacing it. The two scan scripts filter their candidate universe against
+this table (`scripts/macro_scan.js:253`, `scripts/macro_scan_90d.js:167`); the
+live copy loop never reads it (watchlist-only, see "Frozen tables" in
+KNOWN_ISSUES.md), so this affects discovery only, not trading.
+
+**Reason:** the whale was vetted and rejected on 2026-06-22 but kept reappearing
+in the scan (WR 65%, +$781,714 90d). It is NOT a market maker (maker fraction
+6.1%, 1 MAKER_REBATE) so the MM auto-reject rule did not catch it. The reported
+PnL is high-variance whale gambling, not a copyable edge: ~$476k of REDEEM
+payouts = ~3 NBA mega-wins staked at $33k-$147k notional, offset by ~$433k of
+held-to-resolution losers parked at curPrice~0. 70% of distinct slugs he buys are
+never sold, so the 65% FIFO win-rate is the FIFO-hides-held-losers artifact. A
+whale's size/variance edge is structurally non-replicable at a flat $5 clip
+(local sim was net -$11.26 over 7 closes). Full analysis in memory
+`project_candidate_0xc8ec_whale`; same artifact as the `0xef27`/`0x8a3ab8`
+rejections.
