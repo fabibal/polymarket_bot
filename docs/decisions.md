@@ -422,3 +422,39 @@ whale's size/variance edge is structurally non-replicable at a flat $5 clip
 (local sim was net -$11.26 over 7 closes). Full analysis in memory
 `project_candidate_0xc8ec_whale`; same artifact as the `0xef27`/`0x8a3ab8`
 rejections.
+
+---
+
+## Tape scanner: two-tier gate + all-category universe (2026-07-21)
+
+**Decision:** loosen `tape_scan.js`'s observation-bench gate (WR 55%→50%, pnl
+$500→$200, roi 10%→5%) while leaving `GATE_MAX_FILLS_PER_MARKET` (10) and
+`GATE_MIN_AVG_HOLD_HOURS` (4) unchanged. A `highConfidence` flag marks rows
+that also clear the original thresholds — a subset of the loosened list, not
+a second scan. Also expanded the market universe: union of the existing
+closed_trades-sourced slugs with a broad, uncategorized sweep of every market
+Gamma closed in the last `UNIVERSE_DAYS` days.
+
+**Alternative considered:** filter the broad sweep by category/tag (e.g.
+`tag=crypto`) to scope "expand to crypto, political, etc." literally.
+
+**Reason:** the universe was previously limited to markets our own current
+or former watchlist traders happened to trade — sports + Iran-geopolitics
+only. Rejected the tag-filter alternative because Gamma's `tag` param is a
+silent no-op (empirically verified: `tag=crypto` returns the identical
+unfiltered page as no tag at all) — not filtering at all is the only way to
+actually cover every category. Result: +2,100 additional distinct slugs
+beyond the 351 from closed_trades (2,451 total; `MAX_MARKETS=1200` is now
+the binding cap, previously never reached). The WR/PnL/ROI loosening is safe
+specifically because the fills/market and hold-time gates (added the same
+day after 0x7ea571c4/0x84ad9c5c) are the ones actually doing the
+bot-vs-discretionary discrimination — confirmed on rerun: several new
+high-PnL candidates surfaced by the broader universe (e.g. one at $73,318
+pnl/44 markets) still fail on fills/market or WR and don't reach the bench.
+
+**Gotcha found building this:** Gamma's `/markets` listing silently caps
+`limit` at 100 regardless of what's requested (unlike `/trades` and
+`/activity`, which cap at 1000 — see `project_tape_scanner` memory). First
+implementation requested 500, got 100, and its "short page = last page"
+stop check misread that as end-of-data after a single page — undercounted
+the broad universe by ~20x (100 vs the true +2,100) until caught.

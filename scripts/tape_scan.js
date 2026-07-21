@@ -3,8 +3,11 @@
  * sourcing that does NOT rely on the Falcon leaderboard. Design 2026-06-10.
  *
  * Pipeline:
- *   1. Universe: slugs of resolved watchlist-habitat markets from our own
- *      closed_trades (last UNIVERSE_DAYS days, booked 0/1 exits).
+ *   1. Universe (2026-07-21: expanded beyond our own trading history): union
+ *      of (a) resolved watchlist-habitat slugs from our own closed_trades and
+ *      (b) a broad, all-category sweep of every market Gamma closed in the
+ *      last UNIVERSE_DAYS days (no category/tag filter -- Gamma's tag param
+ *      is a silent no-op; "all categories" means not filtering at all).
  *   2. Per slug: Gamma ?closed=true → conditionId + authoritative final
  *      outcomePrices (ground truth — independent of our booked exits).
  *   3. Walk the public trade tape (data-api /trades?market=<conditionId>
@@ -34,16 +37,30 @@ const CONCURRENCY     = 6;     // parallel markets (≈10-14 req/s total, proven
 const PAGE_LIMIT      = 1000;  // API silently caps limit at 1000
 const MAX_OFFSET      = 3000;  // API hard cap (400 beyond) → max 4000 rows/market
 const MIN_NOTIONAL    = 100;   // $ net invested per market to count that market
-// Candidate gate (loose-ish on purpose — survivors go to the observation bench)
+const GAMMA_PAGE_LIMIT = 100;  // /markets listing hard-caps limit at 100 regardless of
+                                // what's requested (empirically verified 2026-07-21 --
+                                // unlike /trades and /activity, which cap at 1000). Must
+                                // match reality: the "short page = last page" pagination
+                                // stop check compares the returned count against this.
+// Observation-bench gate (loosened 2026-07-21 -- see docs/decisions.md
+// "Tape scanner gate loosened for observation bench"). Survivors go to the
+// observation bench, NOT straight to the live watchlist.
 const GATE_MIN_MARKETS = 5;
-const GATE_MIN_WR      = 0.55;
-const GATE_MIN_PNL     = 500;
-const GATE_MIN_ROI     = 0.10;
+const GATE_MIN_WR      = 0.50;   // was 0.55
+const GATE_MIN_PNL     = 200;    // was 500
+const GATE_MIN_ROI     = 0.05;   // was 0.10
 // Added 2026-07-21 after 0x7ea571c4/0x84ad9c5c (22.8 and 59.4 fills/market,
-// in-game scalpers) cleared the gate above on cash-flow PnL alone. See
-// project_candidate_tapescan_0721_livebots memory.
+// in-game scalpers) cleared the PnL/WR/ROI gate on cash-flow alone. See
+// project_candidate_tapescan_0721_livebots memory. NOT loosened alongside
+// the thresholds above -- these are the ones that actually caught them.
 const GATE_MAX_FILLS_PER_MARKET = 10;  // genuine discretionary traders are <5
 const GATE_MIN_AVG_HOLD_HOURS   = 4;   // real macro/sports traders hold hours-to-days
+// High-confidence tier: the original (pre-2026-07-21) thresholds, applied on
+// top of the same GATE_MAX_FILLS_PER_MARKET / GATE_MIN_AVG_HOLD_HOURS gates.
+// A subset flag on the observation-bench list, not a separate scan.
+const HICONF_MIN_WR  = 0.55;
+const HICONF_MIN_PNL = 500;
+const HICONF_MIN_ROI = 0.10;
 
 const GAMMA = 'https://gamma-api.polymarket.com';
 const DATA  = 'https://data-api.polymarket.com';
@@ -93,6 +110,34 @@ async function fetchTape(conditionId) {
     if (offset === MAX_OFFSET) return { truncated: true }; // full page at the cap → deeper tape unreachable
   }
   return { prints };
+}
+
+// Broad, all-category resolved-market discovery via Gamma (added 2026-07-21).
+// Independent of our own trade history -- unioned with the closed_trades-
+// sourced slugs so the universe isn't limited to categories our current/
+// former watchlist traders happened to touch (was: sports + geopolitics
+// only). No category/tag param is used: `tag=crypto` was tested and Gamma
+// silently ignores it (returns the same unfiltered page as no tag at all),
+// so "all major categories" is covered by NOT filtering at all, sorted by
+// recency and cut off client-side -- same early-stop pattern as
+// macro_scan_90d.js's fetch90dActivity. `order=closedTime&ascending=false`
+// verified empirically: default (unordered) order returns markets from
+// 2020-2021 first, this param actually sorts newest-first.
+async function fetchBroadUniverse(days) {
+  const cutoffMs = Date.now() - days * 86400000;
+  const slugs = [];
+  for (let offset = 0; ; offset += GAMMA_PAGE_LIMIT) {
+    const r = await getJson(`${GAMMA}/markets?closed=true&order=closedTime&ascending=false&limit=${GAMMA_PAGE_LIMIT}&offset=${offset}`);
+    if (r.error || !Array.isArray(r.data) || r.data.length === 0) break;
+    let hitCutoff = false;
+    for (const m of r.data) {
+      const ct = m.closedTime ? new Date(m.closedTime).getTime() : null;
+      if (ct == null || ct < cutoffMs) { hitCutoff = true; continue; }
+      if (m.slug) slugs.push(m.slug);
+    }
+    if (hitCutoff || r.data.length < GAMMA_PAGE_LIMIT) break;
+  }
+  return slugs;
 }
 
 // Score one market's tape. Returns Map(addr → {pnl, invested, entryVwapNum/Den, fills, holdHours}).
@@ -150,16 +195,24 @@ async function pool(items, fn, n) {
 (async () => {
   const t0 = Date.now();
   const db = new Database('/app/data/store.db', { readonly: true });
-  const slugs = db.prepare(`
+  const dbSlugs = db.prepare(`
     SELECT DISTINCT market_slug FROM closed_trades
     WHERE copied_trader_source='watchlist'
       AND exit_price IN (0.0, 1.0)
       AND closed_at >= datetime('now', ?)
-    ORDER BY market_slug`).all(`-${UNIVERSE_DAYS} days`).map(r => r.market_slug).slice(0, MAX_MARKETS);
+    ORDER BY market_slug`).all(`-${UNIVERSE_DAYS} days`).map(r => r.market_slug);
   const watchlist = new Set(db.prepare('SELECT lower(address) AS a FROM watchlist_traders').all().map(r => r.a));
   const excluded  = new Set(db.prepare('SELECT lower(address) AS a FROM excluded_traders').all().map(r => r.a));
   db.close();
-  console.log(`[tape] universe: ${slugs.length} resolved slugs (last ${UNIVERSE_DAYS}d), watchlist=${watchlist.size}, excluded=${excluded.size}`);
+  console.log(`[tape] closed_trades-sourced universe: ${dbSlugs.length} slugs (last ${UNIVERSE_DAYS}d)`);
+
+  const broadSlugs = await fetchBroadUniverse(UNIVERSE_DAYS);
+  const dbSlugSet = new Set(dbSlugs);
+  const addedByBroad = broadSlugs.filter(s => !dbSlugSet.has(s)).length;
+  console.log(`[tape] broad all-category Gamma universe: ${broadSlugs.length} slugs (+${addedByBroad} beyond closed_trades)`);
+
+  const slugs = [...new Set([...dbSlugs, ...broadSlugs])].sort().slice(0, MAX_MARKETS);
+  console.log(`[tape] universe: ${slugs.length} resolved slugs scanned (cap ${MAX_MARKETS}), watchlist=${watchlist.size}, excluded=${excluded.size}`);
 
   const agg = new Map(); // addr → aggregate
   const stats = { scored: 0, gammaMiss: 0, truncated: 0, tapeErr: 0, prints: 0 };
@@ -203,28 +256,36 @@ async function pool(items, fn, n) {
     avgEntryVwap: g.winBuyShares > 0 ? g.winBuyCost / g.winBuyShares : null,
     fillsPerMarket: g.markets ? g.fills / g.markets : 0,
     avgHoldHours: g.holdHoursCount ? g.holdHoursSum / g.holdHoursCount : null,
+    highConfidence: g.wins / Math.max(1, g.markets) > HICONF_MIN_WR && g.pnl > HICONF_MIN_PNL && (g.invested > 0 ? g.pnl / g.invested : 0) > HICONF_MIN_ROI,
   }));
 
-  const fmt = r => `${r.addr}  ${String(r.markets).padStart(4)}  ${(r.wr * 100).toFixed(0).padStart(3)}%  ${('$' + r.pnl.toFixed(0)).padStart(9)}  ${('$' + r.invested.toFixed(0)).padStart(10)}  ${(r.roi * 100).toFixed(1).padStart(6)}%  ${r.avgEntryVwap != null ? r.avgEntryVwap.toFixed(2) : '   —'}  ${r.avgEntryVwap != null ? '+' + ((r.wr - r.avgEntryVwap) * 100).toFixed(0) + 'pp' : ''}  ${r.fillsPerMarket.toFixed(1).padStart(7)}  ${r.avgHoldHours != null ? r.avgHoldHours.toFixed(1).padStart(6) + 'h' : '     —'}`;
-  const header = 'addr                                        mkts   WR        pnl    invested     roi  vwap  calib  fills/m  hold_h';
+  const fmt = r => `${r.highConfidence ? 'HC ' : '   '}${r.addr}  ${String(r.markets).padStart(4)}  ${(r.wr * 100).toFixed(0).padStart(3)}%  ${('$' + r.pnl.toFixed(0)).padStart(9)}  ${('$' + r.invested.toFixed(0)).padStart(10)}  ${(r.roi * 100).toFixed(1).padStart(6)}%  ${r.avgEntryVwap != null ? r.avgEntryVwap.toFixed(2) : '   —'}  ${r.avgEntryVwap != null ? '+' + ((r.wr - r.avgEntryVwap) * 100).toFixed(0) + 'pp' : ''}  ${r.fillsPerMarket.toFixed(1).padStart(7)}  ${r.avgHoldHours != null ? r.avgHoldHours.toFixed(1).padStart(6) + 'h' : '     —'}`;
+  const header = '    addr                                        mkts   WR        pnl    invested     roi  vwap  calib  fills/m  hold_h';
 
   console.log(`\n========== TOP 30 BY PNL (n_markets >= 3, scored on tape cash flows) ==========`);
   console.log(header);
   for (const r of rows.filter(r => r.markets >= 3).sort((a, b) => b.pnl - a.pnl).slice(0, 30)) console.log(fmt(r));
 
+  // Observation-bench tier: loosened WR/PnL/ROI, same fills/hold gates as
+  // before. High-confidence is a flag WITHIN this list (original thresholds),
+  // not a separate scan -- every high-confidence row is by construction also
+  // an observation-bench row, since 0.55>0.50, $500>$200, 10%>5%.
   const cands = rows
     .filter(r => r.markets >= GATE_MIN_MARKETS && r.wr > GATE_MIN_WR && r.pnl > GATE_MIN_PNL && r.roi > GATE_MIN_ROI)
     .filter(r => r.fillsPerMarket <= GATE_MAX_FILLS_PER_MARKET)
     .filter(r => r.avgHoldHours != null && r.avgHoldHours >= GATE_MIN_AVG_HOLD_HOURS)
-    .sort((a, b) => b.pnl - a.pnl);
-  console.log(`\n========== CANDIDATES (mkts>=${GATE_MIN_MARKETS}, WR>${GATE_MIN_WR * 100}%, pnl>$${GATE_MIN_PNL}, roi>${GATE_MIN_ROI * 100}%, fills/mkt<=${GATE_MAX_FILLS_PER_MARKET}, hold>=${GATE_MIN_AVG_HOLD_HOURS}h) ==========`);
+    .sort((a, b) => (b.highConfidence - a.highConfidence) || (b.pnl - a.pnl));
+  const hiConfCount = cands.filter(r => r.highConfidence).length;
+  console.log(`\n========== OBSERVATION-BENCH CANDIDATES (mkts>=${GATE_MIN_MARKETS}, WR>${GATE_MIN_WR * 100}%, pnl>$${GATE_MIN_PNL}, roi>${GATE_MIN_ROI * 100}%, fills/mkt<=${GATE_MAX_FILLS_PER_MARKET}, hold>=${GATE_MIN_AVG_HOLD_HOURS}h) ==========`);
+  console.log(`${cands.length} total, ${hiConfCount} marked HC = also clear high-confidence (WR>${HICONF_MIN_WR * 100}%, pnl>$${HICONF_MIN_PNL}, roi>${HICONF_MIN_ROI * 100}%)`);
   console.log(header);
-  for (const r of cands.slice(0, 20)) console.log(fmt(r));
-  console.log('\nCANDIDATES_JSON ' + JSON.stringify(cands.slice(0, 20).map(r => ({
+  for (const r of cands.slice(0, 30)) console.log(fmt(r));
+  console.log('\nCANDIDATES_JSON ' + JSON.stringify(cands.slice(0, 30).map(r => ({
     address: r.addr, markets: r.markets, winRate: +(r.wr * 100).toFixed(1),
     pnl: +r.pnl.toFixed(0), invested: +r.invested.toFixed(0), roi: +(r.roi * 100).toFixed(1),
     avgEntryVwap: r.avgEntryVwap != null ? +r.avgEntryVwap.toFixed(3) : null,
     fillsPerMarket: +r.fillsPerMarket.toFixed(1),
     avgHoldHours: r.avgHoldHours != null ? +r.avgHoldHours.toFixed(1) : null,
+    highConfidence: r.highConfidence,
   }))));
 })();
