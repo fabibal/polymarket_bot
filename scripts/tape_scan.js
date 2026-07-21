@@ -39,6 +39,11 @@ const GATE_MIN_MARKETS = 5;
 const GATE_MIN_WR      = 0.55;
 const GATE_MIN_PNL     = 500;
 const GATE_MIN_ROI     = 0.10;
+// Added 2026-07-21 after 0x7ea571c4/0x84ad9c5c (22.8 and 59.4 fills/market,
+// in-game scalpers) cleared the gate above on cash-flow PnL alone. See
+// project_candidate_tapescan_0721_livebots memory.
+const GATE_MAX_FILLS_PER_MARKET = 10;  // genuine discretionary traders are <5
+const GATE_MIN_AVG_HOLD_HOURS   = 4;   // real macro/sports traders hold hours-to-days
 
 const GAMMA = 'https://gamma-api.polymarket.com';
 const DATA  = 'https://data-api.polymarket.com';
@@ -67,7 +72,13 @@ async function resolveMarket(slug) {
   let prices = [];
   try { prices = JSON.parse(m.outcomePrices ?? '[]').map(Number); } catch { return null; }
   if (prices.length === 0 || !prices.every(p => p <= 0.005 || p >= 0.995)) return null; // not pinned → unresolved/voided
-  return { conditionId: m.conditionId, payouts: prices.map(p => (p >= 0.995 ? 1 : 0)) };
+  // closedTime: when Gamma actually marked the market resolved -- used as the
+  // implicit exit for positions never sold (hold-to-resolution), since it
+  // tracks close to the real-world event end, unlike an individual trader's
+  // own REDEEM timestamp (which lags settlement by days and is not visible
+  // in this endpoint's tape anyway -- REDEEM is not a /trades event).
+  const closedMs = m.closedTime ? new Date(m.closedTime).getTime() : null;
+  return { conditionId: m.conditionId, payouts: prices.map(p => (p >= 0.995 ? 1 : 0)), closedMs: Number.isFinite(closedMs) ? closedMs : null };
 }
 
 // Walk the tape. Returns { prints } or { truncated: true } or { error }.
@@ -84,20 +95,29 @@ async function fetchTape(conditionId) {
   return { prints };
 }
 
-// Score one market's tape. Returns Map(addr → {pnl, invested, entryVwapNum/Den}).
-function scoreMarket(prints, payouts) {
+// Score one market's tape. Returns Map(addr → {pnl, invested, entryVwapNum/Den, fills, holdHours}).
+// marketClosedMs: Gamma closedTime for this market (see resolveMarket), used
+// as the exit for positions that were never sold within the tape.
+function scoreMarket(prints, payouts, marketClosedMs) {
   const perAddr = new Map();
   for (const p of prints) {
     const w = String(p.proxyWallet || '').toLowerCase();
     const idx = Number(p.outcomeIndex);
     const price = Number(p.price), size = Number(p.size);
+    const ts = Number(p.timestamp) * 1000;
     if (!w || !Number.isFinite(idx) || !Number.isFinite(price) || !Number.isFinite(size) || size <= 0) continue;
     let e = perAddr.get(w);
-    if (!e) { e = { byIdx: new Map() }; perAddr.set(w, e); }
+    if (!e) { e = { byIdx: new Map(), fills: 0, firstBuyMs: null, lastSellMs: null }; perAddr.set(w, e); }
     let t = e.byIdx.get(idx);
     if (!t) { t = { cost: 0, proceeds: 0, net: 0, buyCost: 0, buyShares: 0 }; e.byIdx.set(idx, t); }
-    if (p.side === 'BUY') { t.cost += price * size; t.net += size; t.buyCost += price * size; t.buyShares += size; }
-    else { t.proceeds += price * size; t.net -= size; }
+    if (p.side === 'BUY') {
+      t.cost += price * size; t.net += size; t.buyCost += price * size; t.buyShares += size;
+      if (Number.isFinite(ts) && (e.firstBuyMs === null || ts < e.firstBuyMs)) e.firstBuyMs = ts;
+    } else {
+      t.proceeds += price * size; t.net -= size;
+      if (Number.isFinite(ts) && (e.lastSellMs === null || ts > e.lastSellMs)) e.lastSellMs = ts;
+    }
+    e.fills++;
   }
   const out = new Map();
   for (const [w, e] of perAddr) {
@@ -109,7 +129,14 @@ function scoreMarket(prints, payouts) {
       if (payout === 1) { winBuyCost += t.buyCost; winBuyShares += t.buyShares; }
     }
     if (invested < MIN_NOTIONAL) continue;
-    out.set(w, { pnl, invested, winBuyCost, winBuyShares });
+    // Hold time: first BUY to last SELL; if never sold, first BUY to market
+    // close (hold-to-resolution). NOT first-buy-to-REDEEM -- that lags the
+    // real event by days and is invisible to this tape anyway (see
+    // resolveMarket comment / project_tape_scanner memory).
+    const exitMs = e.lastSellMs ?? marketClosedMs ?? null;
+    const holdHours = (e.firstBuyMs != null && exitMs != null && exitMs >= e.firstBuyMs)
+      ? (exitMs - e.firstBuyMs) / 3600000 : null;
+    out.set(w, { pnl, invested, winBuyCost, winBuyShares, fills: e.fills, holdHours });
   }
   return out;
 }
@@ -147,17 +174,19 @@ async function pool(items, fn, n) {
     if (tape.error) { stats.tapeErr++; return; }
     if (tape.truncated) { stats.truncated++; return; }
     stats.prints += tape.prints.length;
-    const scores = scoreMarket(tape.prints, mk.payouts);
+    const scores = scoreMarket(tape.prints, mk.payouts, mk.closedMs);
     for (const [w, s] of scores) {
       if (watchlist.has(w) || excluded.has(w)) continue;
       let g = agg.get(w);
-      if (!g) { g = { markets: 0, wins: 0, pnl: 0, invested: 0, winBuyCost: 0, winBuyShares: 0 }; agg.set(w, g); }
+      if (!g) { g = { markets: 0, wins: 0, pnl: 0, invested: 0, winBuyCost: 0, winBuyShares: 0, fills: 0, holdHoursSum: 0, holdHoursCount: 0 }; agg.set(w, g); }
       g.markets++;
       if (s.pnl > 0) g.wins++;
       g.pnl += s.pnl;
       g.invested += s.invested;
       g.winBuyCost += s.winBuyCost;
       g.winBuyShares += s.winBuyShares;
+      g.fills += s.fills;
+      if (s.holdHours != null) { g.holdHoursSum += s.holdHours; g.holdHoursCount++; }
     }
     stats.scored++;
   }, CONCURRENCY);
@@ -172,10 +201,12 @@ async function pool(items, fn, n) {
     invested: g.invested,
     roi: g.invested > 0 ? g.pnl / g.invested : 0,
     avgEntryVwap: g.winBuyShares > 0 ? g.winBuyCost / g.winBuyShares : null,
+    fillsPerMarket: g.markets ? g.fills / g.markets : 0,
+    avgHoldHours: g.holdHoursCount ? g.holdHoursSum / g.holdHoursCount : null,
   }));
 
-  const fmt = r => `${r.addr}  ${String(r.markets).padStart(4)}  ${(r.wr * 100).toFixed(0).padStart(3)}%  ${('$' + r.pnl.toFixed(0)).padStart(9)}  ${('$' + r.invested.toFixed(0)).padStart(10)}  ${(r.roi * 100).toFixed(1).padStart(6)}%  ${r.avgEntryVwap != null ? r.avgEntryVwap.toFixed(2) : '   —'}  ${r.avgEntryVwap != null ? '+' + ((r.wr - r.avgEntryVwap) * 100).toFixed(0) + 'pp' : ''}`;
-  const header = 'addr                                        mkts   WR        pnl    invested     roi  vwap  calib';
+  const fmt = r => `${r.addr}  ${String(r.markets).padStart(4)}  ${(r.wr * 100).toFixed(0).padStart(3)}%  ${('$' + r.pnl.toFixed(0)).padStart(9)}  ${('$' + r.invested.toFixed(0)).padStart(10)}  ${(r.roi * 100).toFixed(1).padStart(6)}%  ${r.avgEntryVwap != null ? r.avgEntryVwap.toFixed(2) : '   —'}  ${r.avgEntryVwap != null ? '+' + ((r.wr - r.avgEntryVwap) * 100).toFixed(0) + 'pp' : ''}  ${r.fillsPerMarket.toFixed(1).padStart(7)}  ${r.avgHoldHours != null ? r.avgHoldHours.toFixed(1).padStart(6) + 'h' : '     —'}`;
+  const header = 'addr                                        mkts   WR        pnl    invested     roi  vwap  calib  fills/m  hold_h';
 
   console.log(`\n========== TOP 30 BY PNL (n_markets >= 3, scored on tape cash flows) ==========`);
   console.log(header);
@@ -183,13 +214,17 @@ async function pool(items, fn, n) {
 
   const cands = rows
     .filter(r => r.markets >= GATE_MIN_MARKETS && r.wr > GATE_MIN_WR && r.pnl > GATE_MIN_PNL && r.roi > GATE_MIN_ROI)
+    .filter(r => r.fillsPerMarket <= GATE_MAX_FILLS_PER_MARKET)
+    .filter(r => r.avgHoldHours != null && r.avgHoldHours >= GATE_MIN_AVG_HOLD_HOURS)
     .sort((a, b) => b.pnl - a.pnl);
-  console.log(`\n========== CANDIDATES (mkts>=${GATE_MIN_MARKETS}, WR>${GATE_MIN_WR * 100}%, pnl>$${GATE_MIN_PNL}, roi>${GATE_MIN_ROI * 100}%) ==========`);
+  console.log(`\n========== CANDIDATES (mkts>=${GATE_MIN_MARKETS}, WR>${GATE_MIN_WR * 100}%, pnl>$${GATE_MIN_PNL}, roi>${GATE_MIN_ROI * 100}%, fills/mkt<=${GATE_MAX_FILLS_PER_MARKET}, hold>=${GATE_MIN_AVG_HOLD_HOURS}h) ==========`);
   console.log(header);
   for (const r of cands.slice(0, 20)) console.log(fmt(r));
   console.log('\nCANDIDATES_JSON ' + JSON.stringify(cands.slice(0, 20).map(r => ({
     address: r.addr, markets: r.markets, winRate: +(r.wr * 100).toFixed(1),
     pnl: +r.pnl.toFixed(0), invested: +r.invested.toFixed(0), roi: +(r.roi * 100).toFixed(1),
     avgEntryVwap: r.avgEntryVwap != null ? +r.avgEntryVwap.toFixed(3) : null,
+    fillsPerMarket: +r.fillsPerMarket.toFixed(1),
+    avgHoldHours: r.avgHoldHours != null ? +r.avgHoldHours.toFixed(1) : null,
   }))));
 })();
