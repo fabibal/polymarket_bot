@@ -52,9 +52,10 @@ history and, where they changed behaviour, in `docs/decisions.md`.
 
 ## Operational notes
 
-- **`scripts/` and `logs/` are NOT in the git repo** — server runtime only. The
-  daily `git-sync.sh` does add tracked changes under `scripts/`, but untracked
-  files there are never auto-added; add them manually if they belong in git.
+- **`logs/` is NOT in the git repo** — server runtime only. `scripts/` files ARE
+  tracked, but the daily `git-sync.sh` only commits changes to already-tracked
+  files there; new/untracked files under `scripts/` are never auto-added — add
+  them manually if they belong in git.
 
 - **`source_sell_fraction` can be NULL.** Only set on copy-SELL closes when we
   hold a matching position and the data-api positions lookup succeeds.
