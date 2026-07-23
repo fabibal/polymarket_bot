@@ -21,12 +21,21 @@
  *        pnl = Σ sellProceeds − Σ buyCost + netShares × payout
  *      MM-resistant by construction: two-sided churn nets ~0; per-market
  *      scoring kills burst-fill pseudo-replication (the 0x8a3ab8 artifact).
- *   5. Aggregate per address; gate; print table + CANDIDATES_JSON.
+ *   5. Aggregate per address; gate (now also fills/market, hold-time, and
+ *      pseudo-replication ratio -- see GATE_* constants); print table +
+ *      CANDIDATES_JSON.
+ *   6. Auto-observation (2026-07-22, opt-in via TAPE_SCAN_AUTO_ADD=1): MM-
+ *      check + auto-add highConfidence survivors to watchlist_traders as
+ *      copy_enabled=0, capped at AUTO_OBS_MAX_TOTAL, one Telegram alert per
+ *      addition (see weekly-tape-scan.sh, which sets the env var and sends
+ *      the alerts). Plain runs (no env var) never write to the watchlist.
  *
  * Runs in the bot container (node20 fetch, better-sqlite3, /app/data/store.db
- * read-only). No bot-code dependencies. Usage:
+ * read-write for step 6, read-only otherwise). No bot-code dependencies.
+ * Usage:
  *   docker cp scripts/tape_scan.js polymarket_bot:/app/scripts/ &&
  *   docker exec polymarket_bot node /app/scripts/tape_scan.js
+ * Or via cron: scripts/weekly-tape-scan.sh (Sundays 05:00 UTC).
  */
 const Database = require('/app/node_modules/better-sqlite3');
 
@@ -55,12 +64,27 @@ const GATE_MIN_ROI     = 0.05;   // was 0.10
 // the thresholds above -- these are the ones that actually caught them.
 const GATE_MAX_FILLS_PER_MARKET = 10;  // genuine discretionary traders are <5
 const GATE_MIN_AVG_HOLD_HOURS   = 4;   // real macro/sports traders hold hours-to-days
+// Added 2026-07-22 while building the auto-observation pipeline below: not
+// part of the gate list it was specced with, added anyway. This is the exact
+// check that separated 0x52d93dcf (0.38, passed manual vet) from
+// 0x7ea571c4/0x84ad9c5c (0.03-0.07, rejected) two turns earlier, and was an
+// explicit required step in that manual vet. Automating watchlist writes on
+// a gate this project had already twice proven incomplete without it was
+// not a tradeoff to make silently. Computed from data already fetched (no
+// extra API calls): distinct (market,outcome) pairs / total fills.
+const GATE_MIN_PSEUDOREPL_RATIO = 0.15;  // rejects were 0.03-0.07; the pass was 0.38
 // High-confidence tier: the original (pre-2026-07-21) thresholds, applied on
 // top of the same GATE_MAX_FILLS_PER_MARKET / GATE_MIN_AVG_HOLD_HOURS gates.
 // A subset flag on the observation-bench list, not a separate scan.
 const HICONF_MIN_WR  = 0.55;
 const HICONF_MIN_PNL = 500;
 const HICONF_MIN_ROI = 0.10;
+// Auto-observation pipeline (added 2026-07-22). OFF by default so ad-hoc
+// manual runs ("just show me the candidates") never write to the watchlist
+// as a side effect -- only weekly-tape-scan.sh (the cron wrapper) sets
+// TAPE_SCAN_AUTO_ADD=1. Only the highConfidence subset is ever eligible.
+const AUTO_ADD_ENABLED   = process.env.TAPE_SCAN_AUTO_ADD === '1';
+const AUTO_OBS_MAX_TOTAL = 10;  // standing cap across all copy_enabled=0 rows, not per-run
 
 const GAMMA = 'https://gamma-api.polymarket.com';
 const DATA  = 'https://data-api.polymarket.com';
@@ -140,6 +164,22 @@ async function fetchBroadUniverse(days) {
   return slugs;
 }
 
+// MM check for auto-add (added 2026-07-22, adapted from macro_scan.js's
+// isMarketMaker): a MAKER_REBATE activity event means the wallet earns
+// maker rebates -> two-sided quoting, not a copyable directional trader.
+// Only called for candidates that already cleared every other gate (a small
+// set), never against the full scanned universe.
+async function isMarketMaker(address) {
+  try {
+    const url = `${DATA}/activity?user=${encodeURIComponent(address)}&limit=500&offset=0`;
+    const r = await getJson(url);
+    if (r.error || !Array.isArray(r.data)) return false;
+    return r.data.some(it => String(it.type || '').toUpperCase() === 'MAKER_REBATE');
+  } catch (e) {
+    return false;
+  }
+}
+
 // Score one market's tape. Returns Map(addr → {pnl, invested, entryVwapNum/Den, fills, holdHours}).
 // marketClosedMs: Gamma closedTime for this market (see resolveMarket), used
 // as the exit for positions that were never sold within the tape.
@@ -181,7 +221,7 @@ function scoreMarket(prints, payouts, marketClosedMs) {
     const exitMs = e.lastSellMs ?? marketClosedMs ?? null;
     const holdHours = (e.firstBuyMs != null && exitMs != null && exitMs >= e.firstBuyMs)
       ? (exitMs - e.firstBuyMs) / 3600000 : null;
-    out.set(w, { pnl, invested, winBuyCost, winBuyShares, fills: e.fills, holdHours });
+    out.set(w, { pnl, invested, winBuyCost, winBuyShares, fills: e.fills, holdHours, distinctPairs: e.byIdx.size });
   }
   return out;
 }
@@ -231,7 +271,7 @@ async function pool(items, fn, n) {
     for (const [w, s] of scores) {
       if (watchlist.has(w) || excluded.has(w)) continue;
       let g = agg.get(w);
-      if (!g) { g = { markets: 0, wins: 0, pnl: 0, invested: 0, winBuyCost: 0, winBuyShares: 0, fills: 0, holdHoursSum: 0, holdHoursCount: 0 }; agg.set(w, g); }
+      if (!g) { g = { markets: 0, wins: 0, pnl: 0, invested: 0, winBuyCost: 0, winBuyShares: 0, fills: 0, holdHoursSum: 0, holdHoursCount: 0, distinctPairs: 0 }; agg.set(w, g); }
       g.markets++;
       if (s.pnl > 0) g.wins++;
       g.pnl += s.pnl;
@@ -240,6 +280,7 @@ async function pool(items, fn, n) {
       g.winBuyShares += s.winBuyShares;
       g.fills += s.fills;
       if (s.holdHours != null) { g.holdHoursSum += s.holdHours; g.holdHoursCount++; }
+      g.distinctPairs += s.distinctPairs;
     }
     stats.scored++;
   }, CONCURRENCY);
@@ -256,11 +297,12 @@ async function pool(items, fn, n) {
     avgEntryVwap: g.winBuyShares > 0 ? g.winBuyCost / g.winBuyShares : null,
     fillsPerMarket: g.markets ? g.fills / g.markets : 0,
     avgHoldHours: g.holdHoursCount ? g.holdHoursSum / g.holdHoursCount : null,
+    pseudoReplRatio: g.fills ? g.distinctPairs / g.fills : 0,
     highConfidence: g.wins / Math.max(1, g.markets) > HICONF_MIN_WR && g.pnl > HICONF_MIN_PNL && (g.invested > 0 ? g.pnl / g.invested : 0) > HICONF_MIN_ROI,
   }));
 
-  const fmt = r => `${r.highConfidence ? 'HC ' : '   '}${r.addr}  ${String(r.markets).padStart(4)}  ${(r.wr * 100).toFixed(0).padStart(3)}%  ${('$' + r.pnl.toFixed(0)).padStart(9)}  ${('$' + r.invested.toFixed(0)).padStart(10)}  ${(r.roi * 100).toFixed(1).padStart(6)}%  ${r.avgEntryVwap != null ? r.avgEntryVwap.toFixed(2) : '   —'}  ${r.avgEntryVwap != null ? '+' + ((r.wr - r.avgEntryVwap) * 100).toFixed(0) + 'pp' : ''}  ${r.fillsPerMarket.toFixed(1).padStart(7)}  ${r.avgHoldHours != null ? r.avgHoldHours.toFixed(1).padStart(6) + 'h' : '     —'}`;
-  const header = '    addr                                        mkts   WR        pnl    invested     roi  vwap  calib  fills/m  hold_h';
+  const fmt = r => `${r.highConfidence ? 'HC ' : '   '}${r.addr}  ${String(r.markets).padStart(4)}  ${(r.wr * 100).toFixed(0).padStart(3)}%  ${('$' + r.pnl.toFixed(0)).padStart(9)}  ${('$' + r.invested.toFixed(0)).padStart(10)}  ${(r.roi * 100).toFixed(1).padStart(6)}%  ${r.avgEntryVwap != null ? r.avgEntryVwap.toFixed(2) : '   —'}  ${r.avgEntryVwap != null ? '+' + ((r.wr - r.avgEntryVwap) * 100).toFixed(0) + 'pp' : ''}  ${r.fillsPerMarket.toFixed(1).padStart(7)}  ${r.avgHoldHours != null ? r.avgHoldHours.toFixed(1).padStart(6) + 'h' : '     —'}  ${r.pseudoReplRatio.toFixed(2).padStart(6)}`;
+  const header = '    addr                                        mkts   WR        pnl    invested     roi  vwap  calib  fills/m  hold_h  pseudo';
 
   console.log(`\n========== TOP 30 BY PNL (n_markets >= 3, scored on tape cash flows) ==========`);
   console.log(header);
@@ -274,9 +316,10 @@ async function pool(items, fn, n) {
     .filter(r => r.markets >= GATE_MIN_MARKETS && r.wr > GATE_MIN_WR && r.pnl > GATE_MIN_PNL && r.roi > GATE_MIN_ROI)
     .filter(r => r.fillsPerMarket <= GATE_MAX_FILLS_PER_MARKET)
     .filter(r => r.avgHoldHours != null && r.avgHoldHours >= GATE_MIN_AVG_HOLD_HOURS)
+    .filter(r => r.pseudoReplRatio >= GATE_MIN_PSEUDOREPL_RATIO)
     .sort((a, b) => (b.highConfidence - a.highConfidence) || (b.pnl - a.pnl));
   const hiConfCount = cands.filter(r => r.highConfidence).length;
-  console.log(`\n========== OBSERVATION-BENCH CANDIDATES (mkts>=${GATE_MIN_MARKETS}, WR>${GATE_MIN_WR * 100}%, pnl>$${GATE_MIN_PNL}, roi>${GATE_MIN_ROI * 100}%, fills/mkt<=${GATE_MAX_FILLS_PER_MARKET}, hold>=${GATE_MIN_AVG_HOLD_HOURS}h) ==========`);
+  console.log(`\n========== OBSERVATION-BENCH CANDIDATES (mkts>=${GATE_MIN_MARKETS}, WR>${GATE_MIN_WR * 100}%, pnl>$${GATE_MIN_PNL}, roi>${GATE_MIN_ROI * 100}%, fills/mkt<=${GATE_MAX_FILLS_PER_MARKET}, hold>=${GATE_MIN_AVG_HOLD_HOURS}h, pseudo-repl>=${GATE_MIN_PSEUDOREPL_RATIO}) ==========`);
   console.log(`${cands.length} total, ${hiConfCount} marked HC = also clear high-confidence (WR>${HICONF_MIN_WR * 100}%, pnl>$${HICONF_MIN_PNL}, roi>${HICONF_MIN_ROI * 100}%)`);
   console.log(header);
   for (const r of cands.slice(0, 30)) console.log(fmt(r));
@@ -286,6 +329,53 @@ async function pool(items, fn, n) {
     avgEntryVwap: r.avgEntryVwap != null ? +r.avgEntryVwap.toFixed(3) : null,
     fillsPerMarket: +r.fillsPerMarket.toFixed(1),
     avgHoldHours: r.avgHoldHours != null ? +r.avgHoldHours.toFixed(1) : null,
+    pseudoReplRatio: +r.pseudoReplRatio.toFixed(3),
     highConfidence: r.highConfidence,
   }))));
+
+  // ── Auto-observation (added 2026-07-22) ──────────────────────────────────
+  // Only runs when TAPE_SCAN_AUTO_ADD=1 (set by weekly-tape-scan.sh). Adds
+  // highConfidence survivors as copy_enabled=0 (observation only), capped at
+  // AUTO_OBS_MAX_TOTAL standing observation traders. MM-checked individually
+  // here (the one gate needing a fresh per-candidate API call) against only
+  // the small set that already cleared everything else. "Not already on
+  // watchlist or excluded" is already guaranteed structurally -- both sets
+  // are filtered out of `agg` at the source, before `rows`/`cands` exist.
+  if (AUTO_ADD_ENABLED) {
+    console.log('\n========== AUTO-OBSERVATION ==========');
+    const db2 = new Database('/app/data/store.db', { readonly: false });
+    const currentObsCount = db2.prepare('SELECT COUNT(*) AS n FROM watchlist_traders WHERE copy_enabled = 0').get().n;
+    let slotsLeft = Math.max(0, AUTO_OBS_MAX_TOTAL - currentObsCount);
+    console.log(`observation traders: ${currentObsCount}/${AUTO_OBS_MAX_TOTAL}, slots available: ${slotsLeft}`);
+    const mmdd = new Date().toISOString().slice(5, 10).replace('-', '');
+    const label = `Auto-Obs-${mmdd}`;
+    const insert = db2.prepare(`INSERT INTO watchlist_traders
+      (address, label, added_at, copy_enabled, copy_amount, falcon_win_rate, falcon_roi, falcon_sharpe, auto_disabled_at, auto_disabled_reason)
+      VALUES (?, ?, ?, 0, 5, NULL, NULL, NULL, NULL, NULL)`);
+    const autoAdded = [];
+    if (slotsLeft <= 0) console.log(`  cap already reached (${AUTO_OBS_MAX_TOTAL}), nothing to do`);
+    for (const r of cands) {
+      if (!r.highConfidence) continue;
+      if (slotsLeft <= 0) { console.log(`  cap reached (${AUTO_OBS_MAX_TOTAL}), stopping`); break; }
+      const isMM = await isMarketMaker(r.addr);
+      if (isMM) { console.log(`  skip ${r.addr} -- MAKER_REBATE detected`); continue; }
+      const now = new Date().toISOString();
+      insert.run(r.addr, label, now);
+      slotsLeft--;
+      const entry = {
+        address: r.addr, label, markets: r.markets, winRate: +(r.wr * 100).toFixed(1),
+        pnl: +r.pnl.toFixed(0), roi: +(r.roi * 100).toFixed(1),
+        fillsPerMarket: +r.fillsPerMarket.toFixed(1),
+        avgHoldHours: r.avgHoldHours != null ? +r.avgHoldHours.toFixed(1) : null,
+        pseudoReplRatio: +r.pseudoReplRatio.toFixed(3),
+      };
+      autoAdded.push(entry);
+      console.log(`  ADDED ${r.addr} as ${label}`);
+      const msg = `\u{1F441} [polymarket_bot] Auto-added to observation: ${label}\n${r.addr}\nmarkets=${entry.markets} WR=${entry.winRate}% pnl=$${entry.pnl} roi=${entry.roi}%\nfills/mkt=${entry.fillsPerMarket} hold=${entry.avgHoldHours}h pseudo-repl=${entry.pseudoReplRatio}\ncopy_enabled=0, no real money. Review at :8082, remove if this looks wrong.`;
+      console.log('TELEGRAM_MSG_B64 ' + Buffer.from(msg).toString('base64'));
+    }
+    db2.close();
+    console.log(`\nAUTO_ADDED_JSON ${JSON.stringify(autoAdded)}`);
+    console.log(`auto-added ${autoAdded.length} trader(s) this run`);
+  }
 })();

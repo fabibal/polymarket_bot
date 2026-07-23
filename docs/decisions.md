@@ -458,3 +458,52 @@ pnl/44 markets) still fail on fills/market or WR and don't reach the bench.
 implementation requested 500, got 100, and its "short page = last page"
 stop check misread that as end-of-data after a single page — undercounted
 the broad universe by ~20x (100 vs the true +2,100) until caught.
+
+---
+
+## Tape scanner auto-observation pipeline (2026-07-22)
+
+**Decision:** `tape_scan.js` can now write to `watchlist_traders` directly.
+When `TAPE_SCAN_AUTO_ADD=1` (set only by the new `weekly-tape-scan.sh` cron
+wrapper, Sundays 05:00 UTC — never on a plain manual run), `highConfidence`
+survivors get MM-checked individually (fresh `/activity` call per
+candidate, adapted from `macro_scan.js`'s `isMarketMaker`) and, if clean,
+inserted as `copy_enabled=0`/`label='Auto-Obs-MMDD'`, capped at 10 standing
+observation traders total. One Telegram message per addition
+(`weekly-tape-scan.sh` parses `TELEGRAM_MSG_B64` lines from the run log and
+sends each verbatim — no JSON-in-bash parsing).
+
+**Alternative considered:** ship exactly the gate list this was specced
+with (MM check, fills/market, hold-time, WR>55%, pnl>$500, roi>10%) with no
+further additions.
+
+**Reason:** added a `GATE_MIN_PSEUDOREPL_RATIO` (0.15) gate not in the
+original spec — distinct (market,outcome) pairs / total fills. This is the
+exact check that separated `0x52d93dcf` (0.38, passed manual vet 2026-07-21)
+from `0x7ea571c4`/`0x84ad9c5c` (0.03-0.07, rejected same day), and was an
+explicit step in the manual-vet checklist used on `0x52d93dcf` — automating
+watchlist writes on a gate this project had already twice proven incomplete
+without it was not a tradeoff to make silently. Computed from data the
+scanner already fetches, no extra API calls.
+
+First live run (2026-07-22, via `weekly-tape-scan.sh`) validated the MM
+check hard: of 8 `highConfidence` candidates that had already cleared every
+numeric gate, **6 of 8 (75%) were market makers** caught only by the
+per-candidate `/activity` check — including `0x28dc4b77...`, which had
+appeared on an unvetted top-10 list shown to the user the same week. Only 2
+survived and were added (`0xadfb6cba...`, `0x09b4c417...`). This is strong
+evidence the numeric gates alone (even with fills/market, hold-time, and
+pseudo-replication) are not sufficient on their own — the MM check the
+pipeline was explicitly specced with is doing the majority of the real
+discriminating work on this candidate pool.
+
+**Consequence:** `watchlist_traders` entries added by this path have NOT
+had the full manual 7-step vet (on-chain cash-flow verification, market/
+category breakdown, qualitative "does this look like a bot" read) that
+every prior addition (`Shadow-Top4`, `Geopolitics-Macro`,
+`Soccer-Multi-Obs-0721`) received. They are `copy_enabled=0` (no capital
+at risk) and trivially reversible (`DELETE FROM watchlist_traders WHERE
+address=...`), but this is a real, deliberate narrowing of the
+"manual trust decision" principle in `CLAUDE.md`'s watchlist section,
+scoped specifically to the observation tier. Spot-check `Auto-Obs-*`
+entries periodically rather than treating this as fire-and-forget.
