@@ -3,7 +3,7 @@ import https from 'https';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
-import { readStore, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount, getSkippedTradeStats } from './store';
+import { readStore, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount, getSkippedTradeStats, iterateObservationTrades } from './store';
 import { DashboardStats } from './types';
 import { CONFIG } from './config';
 import { checkVpnConnectivity, RawActivityItem } from './bullpen';
@@ -1087,40 +1087,56 @@ export function startDashboard(): void {
   // lifecycle but never copied. Same cost-adjusted basis as the active watchlist.
   app.get('/api/observation', (_req, res) => {
     const store = readStore();
-    const byTrader = new Map<string, typeof store.observationTrades>();
-    for (const t of store.observationTrades ?? []) {
-      const arr = byTrader.get(t.copiedTrader) ?? [];
-      arr.push(t);
-      byTrader.set(t.copiedTrader, arr);
-    }
-    const items = [...byTrader.entries()].map(([address, trades]) => {
-      const w = store.watchlistTraders.find(x => x.address === address);
-      const closed = trades.filter(t => t.status !== 'open');
-      const open   = trades.filter(t => t.status === 'open');
-      let netPnl = 0, grossWin = 0, grossLoss = 0, winners = 0;
-      for (const t of closed) {
-        const v = tradeCostAdjustedPnl(t);
-        netPnl += v;
-        if (v > 0) { winners++; grossWin += v; } else grossLoss += -v;
+    // The ledger is far too large to materialise (300k+ rows), so accumulate
+    // per-trader totals while streaming it out of SQLite. Memory here is
+    // O(traders), not O(trades).
+    type Acc = {
+      openCount: number; closedCount: number; winners: number;
+      netPnl: number; grossWin: number; grossLoss: number;
+      unrealizedPnl: number; entryPriceSum: number;
+      firstTrade: string | null; lastTrade: string | null;
+    };
+    const byTrader = new Map<string, Acc>();
+    for (const t of iterateObservationTrades()) {
+      let a = byTrader.get(t.copiedTrader);
+      if (!a) {
+        a = {
+          openCount: 0, closedCount: 0, winners: 0,
+          netPnl: 0, grossWin: 0, grossLoss: 0,
+          unrealizedPnl: 0, entryPriceSum: 0,
+          firstTrade: null, lastTrade: null,
+        };
+        byTrader.set(t.copiedTrader, a);
       }
-      const unrealizedPnl = open.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
-      const avgEntryPrice = closed.length > 0
-        ? closed.reduce((s, t) => s + (Number(t.entryPrice) || 0), 0) / closed.length
-        : null;
-      const timestamps = trades.map(t => t.timestamp).sort();
+      const v = tradeCostAdjustedPnl(t);
+      if (t.status === 'open') {
+        a.openCount++;
+        a.unrealizedPnl += v;
+      } else {
+        a.closedCount++;
+        a.netPnl += v;
+        if (v > 0) { a.winners++; a.grossWin += v; } else a.grossLoss += -v;
+        a.entryPriceSum += Number(t.entryPrice) || 0;
+      }
+      // ISO-8601 strings sort lexicographically, so min/max need no parsing.
+      if (a.firstTrade === null || t.timestamp < a.firstTrade) a.firstTrade = t.timestamp;
+      if (a.lastTrade  === null || t.timestamp > a.lastTrade)  a.lastTrade  = t.timestamp;
+    }
+    const items = [...byTrader.entries()].map(([address, a]) => {
+      const w = store.watchlistTraders.find(x => x.address === address);
       return {
         address,
         label: w?.label ?? null,
         copyEnabled: w?.copyEnabled ?? null,   // null = no longer on watchlist
-        openCount: open.length,
-        closedCount: closed.length,
-        winRate: closed.length >= 3 ? winners / closed.length : null,
-        profitFactor: (closed.length >= 3 && grossLoss > 0) ? grossWin / grossLoss : null,
-        netPnl,
-        unrealizedPnl,
-        avgEntryPrice,
-        firstTrade: timestamps[0] ?? null,
-        lastTrade: timestamps[timestamps.length - 1] ?? null,
+        openCount: a.openCount,
+        closedCount: a.closedCount,
+        winRate: a.closedCount >= 3 ? a.winners / a.closedCount : null,
+        profitFactor: (a.closedCount >= 3 && a.grossLoss > 0) ? a.grossWin / a.grossLoss : null,
+        netPnl: a.netPnl,
+        unrealizedPnl: a.unrealizedPnl,
+        avgEntryPrice: a.closedCount > 0 ? a.entryPriceSum / a.closedCount : null,
+        firstTrade: a.firstTrade,
+        lastTrade: a.lastTrade,
       };
     }).sort((a, b) => b.netPnl - a.netPnl);
     res.json({ count: items.length, items });

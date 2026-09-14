@@ -37,7 +37,7 @@ const EMPTY_STORE = (): TradesStore => ({
   traderLastSeen: {},
   traderHistory: {},
   watchlistTraders: [],
-  observationTrades: [],
+  observationOpenTrades: [],
 });
 
 const PROCESSED_IDS_CAP = 100_000;
@@ -534,7 +534,11 @@ function loadSnapshot(): TradesStore {
 
   s.openTrades     = (d.prepare('SELECT * FROM open_trades     ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
   s.closedTrades   = (d.prepare('SELECT * FROM closed_trades   ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
-  s.observationTrades = (d.prepare('SELECT * FROM observation_trades ORDER BY insertion_order ASC').all() as TradeRow[]).map(rowToTrade);
+  // Open rows only — see TradesStore.observationOpenTrades. The closed tail is
+  // read on demand via iterateObservationTrades().
+  s.observationOpenTrades = (d.prepare(
+    "SELECT * FROM observation_trades WHERE status = 'open' ORDER BY insertion_order ASC",
+  ).all() as TradeRow[]).map(rowToTrade);
 
   s.processedTradeIds  = (d.prepare('SELECT id FROM processed_trade_ids  ORDER BY added_order ASC').all() as Array<{ id: string }>).map(r => r.id);
 
@@ -875,9 +879,21 @@ function obsCloseRowParams(t: SimulatedTrade): any[] {
 
 export function addObservationTrade(trade: SimulatedTrade): void {
   const store = readStore();
-  store.observationTrades.push(trade);
+  // New observation rows are always open, so the open-only cache takes them.
+  store.observationOpenTrades.push(trade);
   getDb().prepare(`INSERT INTO observation_trades ${OBS_INSERT_COLS} VALUES ${OBS_INSERT_PLACEHOLDERS}`)
     .run(...obsTradeRowParams(trade, insertionCounter++));
+}
+
+/** Stream the FULL observation ledger (open + closed) from SQLite, one row at
+ *  a time. The in-memory cache holds open rows only, so any consumer that needs
+ *  the closed tail (per-trader stats, dedup sets) must use this instead of
+ *  store.observationOpenTrades — materialising the table costs ~450MB of heap. */
+export function* iterateObservationTrades(): Generator<SimulatedTrade> {
+  const rows = getDb()
+    .prepare('SELECT * FROM observation_trades ORDER BY insertion_order ASC')
+    .iterate() as Iterable<TradeRow>;
+  for (const r of rows) yield rowToTrade(r);
 }
 
 /** FIFO-close the oldest open observation position matching (trader, slug, outcome). */
@@ -885,12 +901,13 @@ export function closeObservationTrade(
   copiedTrader: string, marketSlug: string, outcome: string, sellPrice: number,
 ): boolean {
   const store = readStore();
-  // Array is insertion-ordered, so find() returns the oldest open match.
-  const trade = store.observationTrades.find(
-    t => t.status === 'open' && t.copiedTrader === copiedTrader
+  // Array is insertion-ordered and open-only, so the first match is the oldest.
+  const idx = store.observationOpenTrades.findIndex(
+    t => t.copiedTrader === copiedTrader
       && t.marketSlug === marketSlug && t.outcome === outcome,
   );
-  if (!trade) return false;
+  if (idx === -1) return false;
+  const trade = store.observationOpenTrades[idx]!;
 
   const closedAt = new Date().toISOString();
   trade.status = 'resolved';
@@ -903,6 +920,9 @@ export function closeObservationTrade(
   applyExitCosts(trade, sellPrice);
 
   getDb().prepare(OBS_CLOSE_SQL).run(...obsCloseRowParams(trade));
+  // Row stays in the table (status mutates in place); drop it from the
+  // open-only cache so the closed tail never accumulates in heap.
+  store.observationOpenTrades.splice(idx, 1);
   return true;
 }
 
@@ -911,8 +931,9 @@ export function updateObservationTradePrices(
 ): void {
   if (updates.length === 0) return;
   const store = readStore();
+  const byId = new Map(store.observationOpenTrades.map(t => [t.id, t]));
   for (const u of updates) {
-    const t = store.observationTrades.find(x => x.id === u.id && x.status === 'open');
+    const t = byId.get(u.id);
     if (t) { t.currentPrice = u.currentPrice; t.unrealizedPnl = u.unrealizedPnl; }
   }
   const d = getDb();
@@ -930,10 +951,11 @@ export function resolveObservationByPrice(
   const closedAt = new Date().toISOString();
   const closedMs = new Date(closedAt).getTime();
   const resolved: SimulatedTrade[] = [];
-  for (const t of store.observationTrades) {
-    if (t.status !== 'open') continue;
-    const r = toResolve.find(x => x.id === t.id);
-    if (!r) continue;
+  const remaining: SimulatedTrade[] = [];
+  const byId = new Map(toResolve.map(r => [r.id, r]));
+  for (const t of store.observationOpenTrades) {
+    const r = byId.get(t.id);
+    if (!r) { remaining.push(t); continue; }
     t.status = status;
     t.exitPrice = r.exitPrice;
     t.realizedPnl = (r.exitPrice - t.entryPrice) * t.simulatedShares;
@@ -947,6 +969,8 @@ export function resolveObservationByPrice(
   const stmt = d.prepare(OBS_CLOSE_SQL);
   const tx = d.transaction(() => { for (const t of resolved) stmt.run(...obsCloseRowParams(t)); });
   tx();
+  // Rows stay in the table; drop them from the open-only cache.
+  store.observationOpenTrades = remaining;
 }
 
 export function markProcessed(id: string): void {
@@ -1177,7 +1201,15 @@ export function runDailyCleanup(): void {
   const refIds = new Set<string>();
   for (const t of store.openTrades)   refIds.add(t.sourceTradeId);
   for (const t of store.closedTrades) refIds.add(t.sourceTradeId);
-  for (const t of store.observationTrades ?? []) refIds.add(t.sourceTradeId);
+  // Observation ledger is not held in memory past its open rows, and it is the
+  // largest table by far — pull just the one column we need, streamed, rather
+  // than materialising every row.
+  {
+    const rows = getDb()
+      .prepare('SELECT source_trade_id FROM observation_trades')
+      .iterate() as Iterable<{ source_trade_id: string }>;
+    for (const r of rows) refIds.add(r.source_trade_id);
+  }
   for (const hist of Object.values(store.traderHistory ?? {})) {
     for (const b of hist.buys  ?? []) if (b.transaction_hash) refIds.add(b.transaction_hash);
     for (const s of hist.sells ?? []) if (s.transaction_hash) refIds.add(s.transaction_hash);

@@ -213,7 +213,8 @@ export async function updatePrices(): Promise<void> {
   try {
     const store = readStore();
     // Observation positions (copy-disabled forward test) ride the same sweep.
-    const obsOpen = (store.observationTrades ?? []).filter(t => t.status === 'open');
+    // Cache is open-only by invariant, so no status filter is needed here.
+    const obsOpen = store.observationOpenTrades ?? [];
     if (store.openTrades.length === 0 && obsOpen.length === 0) return;
 
     const startMs = Date.now();

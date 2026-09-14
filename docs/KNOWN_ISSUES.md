@@ -64,3 +64,13 @@ history and, where they changed behaviour, in `docs/decisions.md`.
 - **`source_notional` / dynamic-sizing data needs ~3-4 weeks** before
   conviction-weighted sizing analysis is statistically usable. Until then the
   columns are populated but under-sampled.
+
+- **~64k observation rows sit in `status='open'`, many stale.** Measured
+  2026-09-14: 64,426 open vs 155,966 resolved + 107,684 expired. These are the
+  rows `readStore()` still loads on boot after the open-only cache change
+  (`docs/decisions.md`, 2026-09-14), so they are the dominant term in the bot's
+  heap. Headroom is fine today (137 MiB / 512 MiB) but this grows with every
+  observation trader added. The price sweep only retires a position it can still
+  price, so positions in delisted/unresolvable markets appear to accumulate
+  open forever. Not yet diagnosed — needs an age/staleness sweep for
+  observation rows before the open count becomes the next OOM.

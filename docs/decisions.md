@@ -507,3 +507,40 @@ address=...`), but this is a real, deliberate narrowing of the
 "manual trust decision" principle in `CLAUDE.md`'s watchlist section,
 scoped specifically to the observation tier. Spot-check `Auto-Obs-*`
 entries periodically rather than treating this as fire-and-forget.
+
+## Observation ledger: in-memory cache narrowed to open rows (2026-09-14, `src/store.ts`)
+
+**Decision:** `TradesStore.observationTrades` (every row of `observation_trades`,
+loaded eagerly on boot) became `observationOpenTrades` — `status='open'` rows
+only. Consumers that need the closed tail stream it from SQLite via the new
+`store.iterateObservationTrades()` generator instead of reading the cache.
+
+**Reason:** the bot was in a boot-loop OOM. `readStore()` materialised the whole
+table as JS objects on every start; by 2026-09-14 that was 328,076 rows × 27
+columns, which blew past `--max-old-space-size=450` about 28 s into startup —
+before the first poll cycle ever ran. 67 crash-restarts in the 6 h window that
+was still in the container log. The table is 146 MB + 38 MB index, ~78% of the
+237 MB DB, and it only grows: the tape-scan auto-observation pipeline
+(2026-07-22) took the watchlist from 4 to 11 traders, all writing ledger rows.
+
+Open rows are the only ones with live work to do — the price sweep marks them
+and FIFO/threshold closes retire them. Everything else was either an aggregate
+(`/api/observation`) or a set-membership test (the cleanup `refIds` dedup set),
+and both work fine streamed. Eviction on close is the half that matters as much
+as the narrowed load: `closeObservationTrade` and `resolveObservationByPrice`
+now splice the row out of the cache, so the closed tail cannot re-accumulate
+between restarts.
+
+Renamed rather than silently redefined, so the compiler forced every one of the
+seven call sites to be revisited — a field named `observationTrades` that
+holds only open rows is exactly the kind of trap that produces wrong dashboard
+stats months later.
+
+**Measured:** heap at steady state 137 MiB / 512 MiB, 147 MiB after streaming
+the full 328k-row ledger through `/api/observation`; 0 OOM, 0 restarts.
+Endpoint output shape unchanged (verified against the live dashboard).
+
+**Not addressed:** 64,426 rows were sitting in `status='open'`, many of them
+long stale — the cache is bounded now but that number is still the dominant
+term in it, and it should be pruned or aged out separately. See
+`docs/KNOWN_ISSUES.md`.

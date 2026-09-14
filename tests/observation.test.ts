@@ -42,9 +42,9 @@ describe('observation ledger: lifecycle', () => {
     store.addObservationTrade(makeObsTrade());
     store._resetStoreCache();
     const s = store.readStore();
-    expect(s.observationTrades.length).toBe(1);
-    expect(s.observationTrades[0].copiedTraderSource).toBe('observation');
-    expect(s.observationTrades[0].status).toBe('open');
+    expect(s.observationOpenTrades.length).toBe(1);
+    expect(s.observationOpenTrades[0].copiedTraderSource).toBe('observation');
+    expect(s.observationOpenTrades[0].status).toBe('open');
   });
 
   it('closeObservationTrade closes FIFO-oldest match with cost-adjusted PnL, in place', () => {
@@ -56,14 +56,35 @@ describe('observation ledger: lifecycle', () => {
 
     store._resetStoreCache();
     const s = store.readStore();
-    expect(s.observationTrades.length).toBe(2); // single table — row mutates, no move
-    const closed = s.observationTrades.find(t => t.id === 'o-old')!;
+    // Single table — the row mutates in place, so both rows are still on disk.
+    const all = [...store.iterateObservationTrades()];
+    expect(all.length).toBe(2);
+    // ...but the in-memory cache keeps open rows only.
+    expect(s.observationOpenTrades.map(t => t.id)).toEqual(['o-new']);
+
+    const closed = all.find(t => t.id === 'o-old')!;
     expect(closed.status).toBe('resolved');
     expect(closed.exitPrice).toBe(0.80);
     expect(closed.realizedPnl).toBeCloseTo((0.80 - 0.50) * 10, 10);
     // costAdjustedPnl = realized - gas - entrySlip - exitSlip(0.02 * 0.80 * 10)
     expect(closed.costAdjustedPnl).toBeCloseTo(3 - 0 - 0.02 * 0.50 * 10 - 0.02 * 0.80 * 10, 10);
-    expect(s.observationTrades.find(t => t.id === 'o-new')!.status).toBe('open');
+    expect(all.find(t => t.id === 'o-new')!.status).toBe('open');
+  });
+
+  it('closing drops the row from the open cache without a reload (no closed-tail growth)', () => {
+    store.addObservationTrade(makeObsTrade({ id: 'o-1', sourceTradeId: 's-1' }));
+    store.addObservationTrade(makeObsTrade({ id: 'o-2', sourceTradeId: 's-2', outcome: 'No' }));
+    const s = store.readStore();
+    expect(s.observationOpenTrades.length).toBe(2);
+
+    // FIFO close and price-driven resolve must both evict from the live cache,
+    // not just on the next reload — the cache is what the OOM fix bounds.
+    store.closeObservationTrade('0xobs', 'obs-market', 'Yes', 0.80);
+    expect(s.observationOpenTrades.map(t => t.id)).toEqual(['o-2']);
+
+    store.resolveObservationByPrice([{ id: 'o-2', exitPrice: 0.9 }]);
+    expect(store.readStore().observationOpenTrades).toEqual([]);
+    expect([...store.iterateObservationTrades()].length).toBe(2);
   });
 
   it('closeObservationTrade returns false with no open match (already closed or wrong outcome)', () => {
@@ -82,9 +103,9 @@ describe('observation ledger: lifecycle', () => {
     store.resolveObservationByPrice([{ id: 'o-b', exitPrice: 0.60 }], 'expired');
 
     store._resetStoreCache();
-    const s = store.readStore();
-    const a = s.observationTrades.find(t => t.id === 'o-a')!;
-    const b = s.observationTrades.find(t => t.id === 'o-b')!;
+    const all = [...store.iterateObservationTrades()];
+    const a = all.find(t => t.id === 'o-a')!;
+    const b = all.find(t => t.id === 'o-b')!;
     expect(a.status).toBe('resolved');
     expect(a.realizedPnl).toBeCloseTo((1 - 0.50) * 10, 10);
     expect(b.status).toBe('expired');
@@ -95,7 +116,7 @@ describe('observation ledger: lifecycle', () => {
     store.addObservationTrade(makeObsTrade());
     const s = store.readStore();
     expect(s.openTrades.length).toBe(0);
-    expect(s.observationTrades.length).toBe(1);
+    expect(s.observationOpenTrades.length).toBe(1);
   });
 
   it('sourceNotional persists and reloads on observation trades (FIX 4)', () => {
@@ -103,7 +124,7 @@ describe('observation ledger: lifecycle', () => {
     store.addObservationTrade(makeObsTrade({ id: 'o-no', sourceTradeId: 's-no' }));
     store._resetStoreCache();
     const s = store.readStore();
-    expect(s.observationTrades.find(t => t.id === 'o-n')!.sourceNotional).toBeCloseTo(789.12, 10);
-    expect(s.observationTrades.find(t => t.id === 'o-no')!.sourceNotional).toBeUndefined();
+    expect(s.observationOpenTrades.find(t => t.id === 'o-n')!.sourceNotional).toBeCloseTo(789.12, 10);
+    expect(s.observationOpenTrades.find(t => t.id === 'o-no')!.sourceNotional).toBeUndefined();
   });
 });

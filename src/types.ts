@@ -125,7 +125,12 @@ export interface TradesStore {
   // Forward-test ledger for copy-disabled watchlist traders. Single table,
   // full open/close lifecycle in place (status open → resolved/expired).
   // Never copied live; excluded from wallet cap and all entry gates.
-  observationTrades: SimulatedTrade[];
+  //
+  // IN-MEMORY: open rows ONLY. The closed tail (resolved/expired) grows
+  // without bound and loading it all cost ~450MB of heap — the bot OOM-looped
+  // on boot once it passed ~300k rows. Consumers that need closed rows must
+  // stream them from SQLite via store.iterateObservationTrades().
+  observationOpenTrades: SimulatedTrade[];
 }
 
 export interface DashboardStats {
