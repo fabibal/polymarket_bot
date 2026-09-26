@@ -1063,11 +1063,11 @@ export function appendTraderHistory(address: string, items: TraderHistoryEntry[]
 
 // Watchlist ---------------------------------------------------------------
 
-export function addWatchlistTrader(address: string, label?: string): boolean {
+export function addWatchlistTrader(address: string, label?: string, copyEnabled = true): boolean {
   const store = readStore();
   const addr = address.toLowerCase();
   if (store.watchlistTraders.find(w => w.address === addr)) return false;
-  const entry: WatchlistTrader = { address: addr, label, addedAt: new Date().toISOString(), copyEnabled: true, copyAmount: 5 };
+  const entry: WatchlistTrader = { address: addr, label, addedAt: new Date().toISOString(), copyEnabled, copyAmount: 5 };
   store.watchlistTraders.push(entry);
   getDb().prepare(
     `INSERT INTO watchlist_traders (address, label, added_at, copy_enabled, copy_amount) VALUES (?,?,?,?,?)`

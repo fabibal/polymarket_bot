@@ -106,6 +106,13 @@ describe('store: watchlist CRUD persists through reload', () => {
     const s2 = store.readStore();
     expect(s2.watchlistTraders.find(x => x.address === '0xdeadbeef000000000000000000000000000dead1')).toBeUndefined();
   });
+
+  it('can add straight to observation (copy disabled from the first moment)', () => {
+    store.addWatchlistTrader('0xDEADBEEF000000000000000000000000000DEAD2', 'ObsGuy', false);
+    expect(store.readStore().watchlistTraders.find(x => x.address === '0xdeadbeef000000000000000000000000000dead2')?.copyEnabled).toBe(false);
+    store._resetStoreCache();
+    expect(store.readStore().watchlistTraders.find(x => x.address === '0xdeadbeef000000000000000000000000000dead2')?.copyEnabled).toBe(false);
+  });
 });
 
 describe('store: writeStore persists cleanup-state prunes', () => {

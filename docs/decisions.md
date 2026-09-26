@@ -607,3 +607,31 @@ and retried next sweep, never counted as a failure (`isRateLimitError`), and
 concurrency dropped to 2 (~10 req/s; Gamma accepted ~15). First sweep after:
 470 slugs in 36s, zero 429s, zero dead markings. Observation rows already
 expired this way are left as they are.
+
+## Weekly discovery: tape scan replaced by the low-frequency scan (2026-09-26, `scripts/lowfreq_scan.js`, `scripts/weekly-lowfreq-scan.sh`)
+
+All eight traders `weekly-tape-scan.sh` auto-added since 2026-07-22 were bots
+trading 50-1500 markets a day; seven lost heavily as copies (clustered t -5 to
+-11, negative even before costs). The tape scan ranked by the trader's own
+cash-flow PnL, which rewards exactly the high-turnover, maker/arb styles a
+~30s-late $5 taker copy can't reproduce. It also inserted straight into the DB,
+which the bot (cached store) only picked up after a restart.
+
+The Sunday 05:00 UTC cron now runs `weekly-lowfreq-scan.sh`, which repeats the
+manual search that found LowFreq-*-0926: Bullpen + data-api leaderboards ->
+PnL per volume -> copyability from recent activity (<= 10 orders/day, taker,
+no merge/split/conversion, no maker rebates) -> closed + open positions netted
+-> backtest gate on our own copy rules with real costs and fees (90% CI above
+zero, positive at double cost, >= 40 markets over >= 4 months, positive in both
+halves of its history, not carried by one market). Survivors are added as
+observation through the dashboard API (`POST /api/watchlist` now accepts
+`copyEnabled: false`), capped at 10 standing observation traders. The gate
+passes all three LowFreq traders and rejects 0x12d6 on both backtest windows.
+First report-only run: 1295 -> 31 -> 10 backtested -> 0 passed, 6.8 minutes.
+`tape_scan.js` stays in the repo but is no longer scheduled.
+
+Same day: the seven losing auto-observation traders were removed from the
+watchlist (their observation rows stay in the DB), and 0x12d6 was switched to
+observation: its 30d copy PnL was significantly negative (t -2.4) and it fails
+the gate with fees. Its 35 open copies stay open until resolution or the 7-day
+max hold, since its SELLs now go to the observation ledger.

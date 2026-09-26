@@ -772,7 +772,7 @@ export function startDashboard(): void {
   });
 
   app.post('/api/watchlist', (req, res) => {
-    const { address, label } = req.body as { address?: unknown; label?: unknown };
+    const { address, label, copyEnabled } = req.body as { address?: unknown; label?: unknown; copyEnabled?: unknown };
     if (typeof address !== 'string' || !address.trim()) {
       res.status(400).json({ error: 'address must be a non-empty string' });
       return;
@@ -783,7 +783,9 @@ export function startDashboard(): void {
       return;
     }
     const labelStr = typeof label === 'string' ? label.trim() || undefined : undefined;
-    const added = addWatchlistTrader(addr, labelStr);
+    // copyEnabled=false adds straight to observation, so no poll or RTDS push
+    // can copy the trader before a follow-up /copy call would disable it.
+    const added = addWatchlistTrader(addr, labelStr, copyEnabled !== false);
     if (!added) {
       res.status(409).json({ error: 'trader already in watchlist' });
       return;
