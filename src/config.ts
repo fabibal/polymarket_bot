@@ -38,6 +38,10 @@ export const CONFIG = {
   POLL_INTERVAL_MS: parseInt(process.env.POLL_INTERVAL_MS ?? '30000', 10),
   PRICE_UPDATE_INTERVAL_MS: parseInt(process.env.PRICE_UPDATE_INTERVAL_MS ?? '300000', 10),
   ACTIVITY_LIMIT: 100,
+  // Real-time trade feed (Polymarket RTDS websocket) on top of the data-api
+  // poll, which stays as the backfill. Set RTDS_ENABLED=false to fall back to
+  // polling only.
+  RTDS_ENABLED: process.env.RTDS_ENABLED !== 'false',
   PORT: parseInt(process.env.PORT ?? '8080', 10),
   DB_FILE: process.env.DB_FILE ?? './data/store.db',
   // If price crosses this threshold treat the market as resolved
@@ -54,10 +58,13 @@ export const CONFIG = {
   // MAX_TOTAL_OPEN_POSITIONS, MIN_TRADER_SAMPLE, MIN_TRADER_SHADOW_SAMPLE. Watchlist
   // trades bypass all of them by design — see CLAUDE.md "Key rules".
   // Cost-simulation constants — used to project live-trading PNL from DRY_RUN trades.
-  // Polymarket charges NO fees on sports markets (only 15-min crypto). Gas on Polygon is negligible.
-  // 2% slippage each side (entry at ask, exit at bid) still applies.
+  // Gas on Polygon is negligible. 2% slippage each side (entry at ask, exit at bid) still applies.
+  // Polymarket taker fees (2026, per market category) are modelled separately — see src/fees.ts.
   GAS_COST_PER_BUY: parseFloat(process.env.GAS_COST_PER_BUY ?? '0'),
   SLIPPAGE_RATE:    parseFloat(process.env.SLIPPAGE_RATE    ?? '0.02'),
+  // Taker fee rate used when the market's Gamma fee config can't be fetched:
+  // 0.05 is the Sports/Economics/Other rate, the most common non-zero one.
+  FALLBACK_TAKER_FEE_RATE: 0.05,
   // Simulated wallet cap — when >0, stop opening new BUYs
   // once sum(simulatedAmount) on open trades reaches SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION.
   // 0 disables the check. Buffer keeps headroom for slippage/price drift in a real wallet.

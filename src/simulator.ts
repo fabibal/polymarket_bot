@@ -23,6 +23,7 @@ import {
   updateObservationTradePrices, resolveObservationByPrice,
 } from './store';
 import { CONFIG } from './config';
+import { takerFeeCost } from './fees';
 import { SimulatedTrade } from './types';
 
 // ── Cost simulation helpers ────────────────────────────────────────────────
@@ -61,25 +62,28 @@ export function tradeCostAdjustedPnl(t: SimulatedTrade): number {
   const shares = t.simulatedShares;
   const gas    = t.entryGasCost      ?? CONFIG.GAS_COST_PER_BUY;
   const eSlip  = t.entrySlippageCost ?? CONFIG.SLIPPAGE_RATE * t.entryPrice * shares;
+  const eFee   = t.entryFeeCost ?? 0;
   if (t.status === 'open') {
     const mark = t.currentPrice ?? t.entryPrice;
     const eSlipExit = CONFIG.SLIPPAGE_RATE * mark * shares;
-    return (t.unrealizedPnl ?? 0) - gas - eSlip - eSlipExit;
+    return (t.unrealizedPnl ?? 0) - gas - eSlip - eSlipExit - eFee - takerFeeCost(t.feeRate, mark, shares);
   }
   const xSlip = t.exitSlippageCost ?? CONFIG.SLIPPAGE_RATE * (t.exitPrice ?? 0) * shares;
-  return (t.realizedPnl ?? 0) - gas - eSlip - xSlip;
+  const xFee  = t.exitFeeCost ?? takerFeeCost(t.feeRate, t.exitPrice ?? 0, shares);
+  return (t.realizedPnl ?? 0) - gas - eSlip - xSlip - eFee - xFee;
 }
 
 export function tradeTotalCosts(t: SimulatedTrade): number {
   const shares = t.simulatedShares;
   const gas    = t.entryGasCost      ?? CONFIG.GAS_COST_PER_BUY;
   const eSlip  = t.entrySlippageCost ?? CONFIG.SLIPPAGE_RATE * t.entryPrice * shares;
+  const eFee   = t.entryFeeCost ?? 0;
   if (t.status === 'open') {
     const mark = t.currentPrice ?? t.entryPrice;
-    return gas + eSlip + CONFIG.SLIPPAGE_RATE * mark * shares;
+    return gas + eSlip + CONFIG.SLIPPAGE_RATE * mark * shares + eFee + takerFeeCost(t.feeRate, mark, shares);
   }
   const xSlip = t.exitSlippageCost ?? CONFIG.SLIPPAGE_RATE * (t.exitPrice ?? 0) * shares;
-  return gas + eSlip + xSlip;
+  return gas + eSlip + xSlip + eFee + (t.exitFeeCost ?? takerFeeCost(t.feeRate, t.exitPrice ?? 0, shares));
 }
 
 // ── Threshold-resolution decision ──────────────────────────────────────────
@@ -199,7 +203,16 @@ function extractOutcomePrice(data: ReturnType<typeof getMarketPrice> extends Pro
 const fetchFailureCount = new Map<string, number>();
 const deadMarkets       = new Set<string>();
 const DEAD_THRESHOLD    = 3;
-const PRICE_FETCH_CONCURRENCY = 10; // parallel price fetches per batch
+// Parallel price fetches per batch. Gamma accepted ~15 req/s on 2026-09-26:
+// 10 (~80 req/s) drew 76-153 HTTP 429s per ~450-slug sweep, 4 (~20 req/s)
+// still 68-112. 2 (~10 req/s) leaves headroom for the copy path's Gamma calls;
+// a sweep then takes ~45s of its 5-minute interval.
+const PRICE_FETCH_CONCURRENCY = 2;
+
+// HTTP 429 means we were too fast, not that the market is gone.
+export function isRateLimitError(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith('HTTP 429');
+}
 
 let priceUpdateRunning = false;
 
@@ -234,6 +247,7 @@ export async function updatePrices(): Promise<void> {
     const obsPriceUpdates: Array<{ id: string; currentPrice: number; unrealizedPnl: number }> = [];
     const obsResolutions: Array<{ id: string; exitPrice: number }> = [];
     const obsStaleResolutions: Array<{ id: string; exitPrice: number }> = [];
+    let rateLimited = 0; // slugs skipped this sweep on HTTP 429 (retried next sweep)
     const maxAgeMs = CONFIG.MAX_HOLD_DAYS * 86_400_000;
     // Threshold resolution requires the position to have lived through at least
     // one full price-update cycle. Without this, an entry at/near the threshold
@@ -256,6 +270,10 @@ export async function updatePrices(): Promise<void> {
           data = await getMarketPrice(slug);
           fetchFailureCount.delete(slug); // reset on success
         } catch (err) {
+          // Never count a 429 toward the dead threshold: three rate-limited
+          // sweeps used to "kill" live markets and expire their positions at a
+          // stale price. The slug is simply retried next sweep.
+          if (isRateLimitError(err)) { rateLimited++; return; }
           const fails = (fetchFailureCount.get(slug) ?? 0) + 1;
           fetchFailureCount.set(slug, fails);
           if (fails >= DEAD_THRESHOLD && !deadMarkets.has(slug)) {
@@ -369,7 +387,7 @@ export async function updatePrices(): Promise<void> {
       console.log(`[simulator] Expired ${obsStaleResolutions.length} observation position(s)`);
     }
     const elapsedS = ((Date.now() - startMs) / 1000).toFixed(1);
-    console.log(`[simulator] Price update complete — ${uniqueSlugs.length} slugs checked in ${elapsedS}s, ${resolutions.length}+${obsResolutions.length} resolved, ${staleResolutions.length}+${obsStaleResolutions.length} expired`);
+    console.log(`[simulator] Price update complete — ${uniqueSlugs.length} slugs checked in ${elapsedS}s, ${resolutions.length}+${obsResolutions.length} resolved, ${staleResolutions.length}+${obsStaleResolutions.length} expired${rateLimited ? `, ${rateLimited} rate-limited (retry next sweep)` : ''}`);
   } finally {
     priceUpdateRunning = false;
   }

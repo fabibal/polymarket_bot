@@ -31,6 +31,7 @@ vi.mock('../src/bullpen', () => ({
   getTraderActivity: (...args: unknown[]) => activityFeed(...args),
   getOrderbookDepth: vi.fn(async () => null),
   getTraderPositionSize: vi.fn(async () => null), // sell-fraction lookup → not recorded
+  getMarketFeeRate: vi.fn(async () => null), // fee config lookup → fallback rate
 }));
 
 import { pollTrader } from '../src/monitor';

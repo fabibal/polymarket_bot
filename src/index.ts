@@ -1,10 +1,11 @@
-import { pollTrader, resetSkipDedup } from './monitor';
+import { pollTrader, processRealtimeTrade, resetSkipDedup } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
 import { readStore, runDailyCleanup, startWalCheckpoint, stopWalCheckpoint, initInsertionCounter, updateOpenTradeDepth } from './store';
 import { getOrderbookDepth } from './bullpen';
 import { CONFIG } from './config';
 import { isCircuitBreakerActive, checkCircuitBreaker, checkTraderDecay } from './risk';
+import { startRtds } from './rtds';
 
 /**
  * One-shot startup task: for every open watchlist trade missing orderbook depth,
@@ -134,6 +135,29 @@ async function main(): Promise<void> {
 
   // Start polling shortly after startup (dashboard/backfill get a head start).
   setTimeout(poll, 5_000);
+
+  // Real-time trade feed: a watched wallet's trade is processed ~1s after the
+  // fill instead of after the data-api index catches up (~20-35s). The poll
+  // above keeps running as the backfill for anything the socket misses.
+  if (CONFIG.RTDS_ENABLED) {
+    startRtds(
+      wallet => readStore().watchlistTraders.some(w => w.address === wallet),
+      (wallet, item) => {
+        const w = readStore().watchlistTraders.find(x => x.address === wallet);
+        if (!w) return;
+        processRealtimeTrade({ address: w.address }, item, {
+          copyEnabled: w.copyEnabled,
+          tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT,
+          suspended: isCircuitBreakerActive(),
+        }).then(n => {
+          if (n > 0 && w.copyEnabled) {
+            const lagS = (Date.now() - Date.parse(String(item.timestamp))) / 1000;
+            console.log(`[rtds] ${w.label ?? w.address.slice(0, 10)} ${item.side} ${item.slug} processed ${lagS.toFixed(1)}s after the fill`);
+          }
+        }).catch(err => console.error(`[rtds] processing failed for ${wallet.slice(0, 10)}...:`, err instanceof Error ? err.message : err));
+      },
+    );
+  }
 }
 
 function shutdown(signal: string): void {

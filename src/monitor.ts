@@ -1,15 +1,17 @@
 /**
- * Polls a single watchlist trader's recent activity.
+ * Processes a watchlist trader's activity, from the data-api poll or pushed in
+ * real time by the RTDS socket (see src/rtds.ts).
  * - BUY  → create a new simulated $5 position (subject to entry cap, depth gate, wallet cap)
  * - SELL → close the oldest matching open position at sell price (realized PNL)
  */
-import { getTraderActivity, getOrderbookDepth, getTraderPositionSize, RawActivityItem } from './bullpen';
+import { getTraderActivity, getOrderbookDepth, getTraderPositionSize, getMarketFeeRate, RawActivityItem } from './bullpen';
 import {
   readStore, addOpenTrade, closeOpenTrade, markProcessed, setTraderLastSeen,
   appendTraderHistory, addSkippedTrade, addObservationTrade, closeObservationTrade,
 } from './store';
 import { ActivityTrade, SimulatedTrade, TraderHistoryEntry } from './types';
 import { CONFIG } from './config';
+import { takerFeeCost } from './fees';
 import { countWatchlistEntriesInWindow, computeDynamicTradeAmount, computeSellFraction, isMatchStyleSlug } from './filters';
 import { computeEntryCosts } from './simulator';
 import { v4 as uuidv4 } from 'uuid';
@@ -56,19 +58,22 @@ function parseActivity(raw: RawActivityItem): ActivityTrade | null {
   return { id, timestamp, marketSlug, marketTitle, outcome, side: side as 'buy' | 'sell', price, size, usdcSize };
 }
 
-export async function pollTrader(
-  trader: { address: string; username?: string },
-  options: { copyEnabled?: boolean; tradeAmount?: number; suspended?: boolean } = {}
-): Promise<number> {
-  const copyEnabled  = options.copyEnabled !== false; // default true
-  // Daily-loss circuit breaker: copy-enabled traders' trades are discarded
-  // (cursor advances, nothing recorded — a paused real wallet misses trades,
-  // it doesn't fill them late). Observation traders are unaffected: their
-  // ledger is not real money and must stay continuous.
-  const suspended    = options.suspended === true;
-  const tradeAmount  = options.tradeAmount ?? CONFIG.TRADE_AMOUNT;
-  const store = readStore();
-  const since = store.traderLastSeen[trader.address];
+type TraderRef = { address: string; username?: string };
+type CopyOptions = { copyEnabled?: boolean; tradeAmount?: number; suspended?: boolean };
+
+// One batch of activity is processed at a time, across all traders and both
+// sources (poll + RTDS push). The wallet cap and the per-market entry cap are
+// checked before the depth/fee HTTP awaits, so two concurrent BUYs could
+// otherwise both pass them; serializing also keeps processedTradeIds dedup exact.
+let processingChain: Promise<unknown> = Promise.resolve();
+function withProcessingLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = processingChain.then(fn, fn);
+  processingChain = run.catch(() => undefined);
+  return run;
+}
+
+export async function pollTrader(trader: TraderRef, options: CopyOptions = {}): Promise<number> {
+  const since = readStore().traderLastSeen[trader.address];
 
   let response;
   try {
@@ -80,6 +85,34 @@ export async function pollTrader(
 
   const items = Array.isArray(response) ? response : [];
   if (items.length === 0) return 0;
+  return withProcessingLock(() => processActivity(trader, items, options, since, true));
+}
+
+/**
+ * RTDS push path: a trade seen on the real-time socket, processed exactly like
+ * a polled one. It never moves the data-api cursor — only the poll does — so a
+ * trade the socket missed is still picked up by the next poll, and the poll's
+ * later copy of this trade is dropped by the processedTradeIds dedup.
+ */
+export function processRealtimeTrade(trader: TraderRef, raw: RawActivityItem, options: CopyOptions = {}): Promise<number> {
+  return withProcessingLock(() => processActivity(trader, [raw], options, undefined, false));
+}
+
+async function processActivity(
+  trader: TraderRef,
+  items: RawActivityItem[],
+  options: CopyOptions,
+  since: string | undefined,
+  advanceCursor: boolean,
+): Promise<number> {
+  const copyEnabled  = options.copyEnabled !== false; // default true
+  // Daily-loss circuit breaker: copy-enabled traders' trades are discarded
+  // (cursor advances, nothing recorded — a paused real wallet misses trades,
+  // it doesn't fill them late). Observation traders are unaffected: their
+  // ledger is not real money and must stay continuous.
+  const suspended    = options.suspended === true;
+  const tradeAmount  = options.tradeAmount ?? CONFIG.TRADE_AMOUNT;
+  const store = readStore();
 
   // Persist ALL fetched TRADE items to local history before processing
   const historyEntries: TraderHistoryEntry[] = items
@@ -297,6 +330,10 @@ export async function pollTrader(
       const shares = amount / activity.price;
       const entryGap = watchlistDepth ? watchlistDepth.bestAsk - activity.price : null;
       const entryCosts = computeEntryCosts(activity.price, shares, entryGap);
+      // Taker fee on the copy's fill price (the ask when a snapshot exists).
+      const fetchedFeeRate = await getMarketFeeRate(activity.marketSlug);
+      const feeRate = fetchedFeeRate ?? CONFIG.FALLBACK_TAKER_FEE_RATE;
+      const entryFee = takerFeeCost(feeRate, activity.price + Math.max(0, entryGap ?? 0), shares);
       const trade: SimulatedTrade = {
         id: uuidv4(),
         sourceTradeId: activity.id,
@@ -317,7 +354,12 @@ export async function pollTrader(
         status: 'open',
         entryGasCost:      entryCosts.gas,
         entrySlippageCost: entryCosts.slippage,
+        feeRate,
+        entryFeeCost:      entryFee,
       };
+      if (fetchedFeeRate === null) {
+        console.log(`[monitor] fee config unavailable for ${activity.marketSlug} — using fallback rate ${feeRate}`);
+      }
       // Research fields (GROUP D): the trader's own bet notional (conviction
       // signal) and the taker entry-price gap (maker-execution study).
       const notional = activity.usdcSize ?? (activity.size > 0 ? activity.price * activity.size : undefined);
@@ -377,7 +419,7 @@ export async function pollTrader(
     }
   }
 
-  if (latestTimestamp && latestTimestamp !== since) {
+  if (advanceCursor && latestTimestamp && latestTimestamp !== since) {
     setTraderLastSeen(trader.address, latestTimestamp);
   }
 

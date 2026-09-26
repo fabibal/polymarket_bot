@@ -71,11 +71,12 @@ NODE_OPTIONS=--max-old-space-size=450   # Node heap cap; container limit 512MB
 DRY_RUN=true
 PORT=8080
 POLL_INTERVAL_MS=30000                  # 30 s per cycle
+RTDS_ENABLED=true                       # real-time trade socket, poll stays as backfill; false = poll only (2026-09-26)
 PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
 MAX_WATCHLIST_ENTRIES_PER_MARKET=2      # non-dated slugs only (match-style → lifetime 1)
 MAX_WATCHLIST_ENTRY_WINDOW_MS=43200000  # 12h
-GAS_COST_PER_BUY=0                      # Polymarket charges no fees on sports markets
+GAS_COST_PER_BUY=0                      # gas only; per-market taker fees modelled in src/fees.ts (2026-09-26)
 SLIPPAGE_RATE=0.02                      # exit slip (at bid) + entry FALLBACK; entry slip is gap-based when book snapshot exists (2026-06-19)
 DEPTH_GATE_MIN_DEPTH_5=500              # thin-book guard (added 2026-05-27)
 SIMULATED_WALLET_SIZE=1000              # models a fixed real wallet (added 2026-05-28)

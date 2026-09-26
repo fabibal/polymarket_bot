@@ -13,9 +13,10 @@ vi.mock('../src/config', () => ({
 
 import {
   computeEntryCosts, tradeCostAdjustedPnl, tradeTotalCosts,
-  decideThresholdResolution, isMarketResolved, snapDelistExitPrice, decideDelistExit,
+  decideThresholdResolution, isMarketResolved, snapDelistExitPrice, decideDelistExit, isRateLimitError,
 } from '../src/simulator';
 import { SimulatedTrade } from '../src/types';
+import { takerFeeCost } from '../src/fees';
 import { RawPriceResponse } from '../src/bullpen';
 
 function makeOpenTrade(overrides: Partial<SimulatedTrade> = {}): SimulatedTrade {
@@ -119,6 +120,34 @@ describe('tradeCostAdjustedPnl', () => {
       - 0.02 * 0.70 * shares
       - 0.02 * 0.90 * shares;
     expect(tradeCostAdjustedPnl(t)).toBeCloseTo(expected, 10);
+  });
+
+  it('open trade: also subtracts the entry fee and a projected exit fee at the mark', () => {
+    const t = makeOpenTrade({ feeRate: 0.04, entryFeeCost: 0.1 });
+    const shares = t.simulatedShares;
+    const expected = t.unrealizedPnl!
+      - 0.02 * 0.70 * shares - 0.02 * 0.80 * shares
+      - 0.1 - shares * 0.04 * 0.80 * 0.20;
+    expect(tradeCostAdjustedPnl(t)).toBeCloseTo(expected, 10);
+  });
+
+  it('closed trade: subtracts stored entry + exit fees', () => {
+    const t = makeClosedTrade({ feeRate: 0.05, entryFeeCost: 0.1, exitFeeCost: 0.2 });
+    const shares = t.simulatedShares;
+    const expected = t.realizedPnl! - 0.02 * 0.70 * shares - 0.02 * 0.90 * shares - 0.1 - 0.2;
+    expect(tradeCostAdjustedPnl(t)).toBeCloseTo(expected, 10);
+  });
+});
+
+describe('takerFeeCost', () => {
+  it('matches the docs table: 100 shares at 0.50 with rate 0.04 costs $1.00', () => {
+    expect(takerFeeCost(0.04, 0.5, 100)).toBeCloseTo(1.0, 10);
+  });
+  it('is zero for 0/1 resolution payouts and fee-free markets', () => {
+    expect(takerFeeCost(0.05, 1, 100)).toBe(0);
+    expect(takerFeeCost(0.05, 0, 100)).toBe(0);
+    expect(takerFeeCost(0, 0.5, 100)).toBe(0);
+    expect(takerFeeCost(undefined, 0.5, 100)).toBe(0);
   });
 });
 
@@ -271,5 +300,16 @@ describe('tradeTotalCosts', () => {
     const shares = t.simulatedShares;
     const expected = 0 + 0.02 * 0.70 * shares + 0.02 * 0.90 * shares;
     expect(tradeTotalCosts(t)).toBeCloseTo(expected, 10);
+  });
+});
+
+describe('isRateLimitError', () => {
+  it('flags HTTP 429 so the sweep never counts it toward marking a market dead', () => {
+    expect(isRateLimitError(new Error('HTTP 429 from https://gamma-api.polymarket.com/markets?slug=x'))).toBe(true);
+  });
+  it('leaves real failures (404, network) to the dead-market threshold', () => {
+    expect(isRateLimitError(new Error('HTTP 404 from https://gamma-api.polymarket.com/markets?slug=x'))).toBe(false);
+    expect(isRateLimitError(new Error('No market found for slug: x'))).toBe(false);
+    expect(isRateLimitError('HTTP 429')).toBe(false);
   });
 });

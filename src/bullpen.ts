@@ -249,6 +249,33 @@ export async function getOrderbookDepth(
 }
 
 /**
+ * Taker fee rate for a market from its Gamma fee config (feesEnabled +
+ * feeSchedule.rate; 0 when fees are disabled, e.g. geopolitics). A market's fee
+ * config doesn't change, so results are cached per slug. Returns null on any
+ * failure — the caller decides the fallback.
+ */
+const feeRateCache = new Map<string, number>();
+export async function getMarketFeeRate(slug: string): Promise<number | null> {
+  const cached = feeRateCache.get(slug);
+  if (cached !== undefined) return cached;
+  try {
+    let data = await httpsGet(`${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}`) as unknown[];
+    if (!Array.isArray(data) || data.length === 0) {
+      data = await httpsGet(`${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}&closed=true`) as unknown[];
+    }
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const market = data[0] as { feesEnabled?: boolean; feeSchedule?: { rate?: number | string } | null };
+    const rate = market.feesEnabled ? Number(market.feeSchedule?.rate ?? NaN) : 0;
+    if (!Number.isFinite(rate)) return null;
+    if (feeRateCache.size > 5000) feeRateCache.clear();
+    feeRateCache.set(slug, rate);
+    return rate;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Trader's remaining token balance for one (market, outcome) via the data-api
  * /positions endpoint, filtered server-side by conditionId (Gamma slug lookup,
  * with a closed=true retry in case the market was just delisted). Returns the

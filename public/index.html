@@ -553,7 +553,7 @@
 
   <!-- Watchlist stat cards -->
   <h2 style="margin:0 0 10px 0; font-size:15px; color:var(--muted); font-weight:600; letter-spacing:.04em; text-transform:uppercase;">
-    Watchlist Performance <span style="color:var(--text); text-transform:none; letter-spacing:0; font-weight:400; font-size:12px;">— watchlist sim trades only</span>
+    Watchlist Performance <span style="color:var(--text); text-transform:none; letter-spacing:0; font-weight:400; font-size:12px;">— watchlist sim trades only · opened since 2026-09-26 15:08 UTC (reset)</span>
   </h2>
   <div class="stats-grid">
     <div class="stat-card">
@@ -1972,7 +1972,7 @@
         const util = Number(s.walletCapUtilization || 0);
         const cap = size * util;
         const limit = Math.floor(cap / tradeAmt);
-        const open = Number(s.openTrades || 0);
+        const open = Number(s.walletOpenTrades ?? s.openTrades ?? 0); // capacity: all open, not just since reset
         openLimEl.textContent = `${open} / ${limit}`;
         const cls = open > 140 ? 'red' : open >= 80 ? 'yellow' : 'green';
         openLimEl.className = 'value ' + cls;
@@ -2163,7 +2163,11 @@
     try {
       const res = await fetch('/api/trades?source=watchlist');
       const data = await res.json();
-      const closed = (data.items || []).filter(t => t.status !== 'open' && t.closedAt && t.realizedPnl != null);
+      // Panel reset: only trades opened since the Watchlist Performance reset
+      // (keep in sync with WATCHLIST_STATS_SINCE_MS in src/dashboard.ts).
+      const WATCHLIST_STATS_SINCE_MS = Date.parse('2026-09-26T15:08:47Z');
+      const closed = (data.items || []).filter(t => t.status !== 'open' && t.closedAt && t.realizedPnl != null
+        && Date.parse(t.timestamp) >= WATCHLIST_STATS_SINCE_MS);
       if (closed.length === 0) return;
       closed.sort((a, b) => new Date(a.closedAt) - new Date(b.closedAt));
 

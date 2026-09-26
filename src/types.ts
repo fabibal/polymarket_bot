@@ -70,6 +70,12 @@ export interface SimulatedTrade {
   entrySlippageCost?: number;
   exitSlippageCost?: number;
   costAdjustedPnl?: number;
+  // Polymarket taker fee (2026-09-26): the market's fee rate captured at BUY
+  // time (Gamma feeSchedule.rate, 0 when fees are disabled) and the fee on each
+  // copy leg; both legs are included in costAdjustedPnl.
+  feeRate?: number;
+  entryFeeCost?: number;
+  exitFeeCost?: number;
   // Research fields (GROUP D, 2026-06-10), set on watchlist BUYs at copy time:
   // sourceNotional = the trader's OWN bet size in USD (usdc_size, falling back
   // to price*size) — enables conviction-weighted sizing analysis;

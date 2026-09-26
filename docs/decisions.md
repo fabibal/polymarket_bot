@@ -544,3 +544,66 @@ Endpoint output shape unchanged (verified against the live dashboard).
 long stale — the cache is bounded now but that number is still the dominant
 term in it, and it should be pruned or aged out separately. See
 `docs/KNOWN_ISSUES.md`.
+
+## Watchlist Performance panel reset (2026-09-26, `src/dashboard.ts`, `public/index.html`)
+
+User asked to zero the Watchlist Performance panel when three low-frequency
+traders (LowFreq-Events/Politics/Tennis-0926) went live in the sim at
+2026-09-26T15:08:47Z. Implemented as a baseline, not a delete:
+`WATCHLIST_STATS_SINCE_MS` filters the watchlist view of `/api/stats` and the
+panel charts to trades **opened** at or after that instant. All history stays in
+the DB; `?source=all`, the $1k test window (`TEST_START_MS`, May 28) and the
+go-live gate are unchanged. Wallet and open-position cards keep counting every
+open position, because the wallet cap applies to all of them. The constant is
+duplicated in `public/index.html` (same pattern as `TEST_START`); keep both in
+sync when resetting again.
+
+## Taker fees in the sim (2026-09-26, `src/fees.ts`, `src/monitor.ts`, `src/store.ts`, `src/simulator.ts`)
+
+The sim assumed Polymarket had no trading fees. Since 2026 it charges takers
+`fee = shares * rate * p * (1 - p)` with a per-category rate (crypto 0.07;
+sports, economics, culture, other 0.05; politics, finance, tech, mentions 0.04;
+geopolitics 0; makers 0 -- docs.polymarket.com/trading/fees). Every copy is a
+taker order, so each watchlist BUY now reads the market's rate from Gamma
+(`feesEnabled` + `feeSchedule.rate`, cached per slug; fallback 0.05 when the
+lookup fails), stores it as `fee_rate`, and books `entry_fee_cost`; the close
+books `exit_fee_cost` at the exit price, which is zero for 0/1 resolutions by
+the formula. Both are subtracted in `cost_adjusted_pnl` and the dashboard cost
+functions. Trades opened before this change carry no fee fields and stay
+unchanged. The observation ledger is left fee-free (raw by design).
+Backtest impact for $5 copies was small (0x12d6 3.5 months -$46 -> -$69).
+
+## Real-time trade feed via Polymarket RTDS (2026-09-26, `src/rtds.ts`, `src/monitor.ts`, `src/index.ts`)
+
+Latency survey (161 trades, 7 wallets): data-api `/activity` publishes a trade
+~22s (median; p90 34s) after the fill even when polled every 3s, so the bot's
+~33s copy latency came from the index, not the 30s poll interval. The RTDS
+websocket (`wss://ws-live-data.polymarket.com`, topic `activity`/`trades`)
+delivered 158/161 trades at a 0.8s median; Polygon `OrderFilled` logs were
+~0.8s faster still but need asset-id decoding, so RTDS was chosen.
+
+The socket can't be filtered by wallet server-side: the bot receives the whole
+firehose (~30 msg/s, ~26 KB/s measured; the existing poll already downloads
+~110 KB/s) and filters locally, ~1% of a core, no extra disk writes. Matching
+trades go through the same `processActivity` as polled ones. Two rules keep it
+safe: (1) only the poll moves the data-api cursor, so trades the socket misses
+are still backfilled; (2) all processing runs behind one lock, because the
+wallet cap and per-market entry cap are checked before the depth/fee HTTP
+awaits and concurrent BUYs could both pass them (a test without the lock
+double-copies). Reconnects with backoff; a 60s-silent feed is treated as dead.
+`RTDS_ENABLED=false` reverts to polling only. Expected effect: roughly the
+latency share (~21%) of the measured entry gap; the spread itself remains.
+
+## Price sweep: HTTP 429 no longer marks markets dead (2026-09-26, `src/simulator.ts`)
+
+The 5-minute price sweep fetched ~450 slugs from Gamma at concurrency 10
+(~80 req/s) and drew 76-153 HTTP 429s per sweep. Any failure counted toward
+the 3-strike dead-market rule, so a slug rate-limited in three consecutive
+sweeps was "marked dead" and its positions closed at the last price -- e.g. 100
+live markets and 232 observation positions at 20:56 today. The same burst
+pattern (hundreds to thousands of observation expirations per day) is in the
+DB since at least 2026-09-19; `closed_trades` shows none. Fix: 429 is skipped
+and retried next sweep, never counted as a failure (`isRateLimitError`), and
+concurrency dropped to 2 (~10 req/s; Gamma accepted ~15). First sweep after:
+470 slugs in 36s, zero 429s, zero dead markings. Observation rows already
+expired this way are left as they are.

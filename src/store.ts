@@ -20,6 +20,7 @@ import {
   TraderHistoryEntry,
 } from './types';
 import { CONFIG } from './config';
+import { takerFeeCost } from './fees';
 
 const WATCHLIST_DEFAULTS: WatchlistTrader[] = [
   { address: '0x8a6c6811e8937f9e8afc1b9249fa540262c30b3f', label: 'MultiSport-Analytics', addedAt: new Date(0).toISOString(), copyEnabled: true,  copyAmount: 5 },
@@ -320,6 +321,12 @@ function migrateResearchColumns(d: Db): void {
     if (t === 'closed_trades' && !existing.has('source_sell_fraction')) {
       d.exec(`ALTER TABLE ${t} ADD COLUMN source_sell_fraction REAL`);
     }
+    // Polymarket taker fees (2026-09-26): rate captured at BUY, fee per leg.
+    if (!existing.has('fee_rate'))       d.exec(`ALTER TABLE ${t} ADD COLUMN fee_rate REAL`);
+    if (!existing.has('entry_fee_cost')) d.exec(`ALTER TABLE ${t} ADD COLUMN entry_fee_cost REAL`);
+    if (t === 'closed_trades' && !existing.has('exit_fee_cost')) {
+      d.exec(`ALTER TABLE ${t} ADD COLUMN exit_fee_cost REAL`);
+    }
   }
   const obsExisting = new Set(
     (d.prepare(`PRAGMA table_info(observation_trades)`).all() as Array<{ name: string }>).map(r => r.name)
@@ -391,6 +398,7 @@ type TradeRow = {
   spread_at_entry?: number | null; depth_backfilled?: number | null;
   source_notional?: number | null; entry_price_gap?: number | null;
   source_sell_fraction?: number | null;
+  fee_rate?: number | null; entry_fee_cost?: number | null; exit_fee_cost?: number | null;
   insertion_order: number;
 };
 
@@ -431,6 +439,9 @@ function rowToTrade(r: TradeRow): SimulatedTrade {
   if (r.source_notional        != null) t.sourceNotional       = r.source_notional;
   if (r.entry_price_gap        != null) t.entryPriceGap        = r.entry_price_gap;
   if (r.source_sell_fraction   != null) t.sourceSellFraction   = r.source_sell_fraction;
+  if (r.fee_rate               != null) t.feeRate              = r.fee_rate;
+  if (r.entry_fee_cost         != null) t.entryFeeCost         = r.entry_fee_cost;
+  if (r.exit_fee_cost          != null) t.exitFeeCost          = r.exit_fee_cost;
   return t;
 }
 
@@ -445,6 +456,8 @@ const RESEARCH_VALS = (t: SimulatedTrade) => [
   t.sourceNotional ?? null, t.entryPriceGap ?? null,
 ];
 
+const FEE_VALS = (t: SimulatedTrade) => [t.feeRate ?? null, t.entryFeeCost ?? null];
+
 function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
   return [
     t.id, t.sourceTradeId, t.timestamp, t.copiedTrader, t.copiedTraderRank,
@@ -455,6 +468,7 @@ function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
     t.entryGasCost ?? null, t.entrySlippageCost ?? null,
     ...DEPTH_VALS(t),
     ...RESEARCH_VALS(t),
+    ...FEE_VALS(t),
     order,
   ];
 }
@@ -473,26 +487,28 @@ function closedTradeRowParams(t: SimulatedTrade, order: number): any[] {
     ...DEPTH_VALS(t),
     ...RESEARCH_VALS(t),
     t.sourceSellFraction ?? null,
+    ...FEE_VALS(t), t.exitFeeCost ?? null,
     order,
   ];
 }
 
 const DEPTH_COL_NAMES = 'best_ask, best_bid, ask_depth_5, ask_depth_10, spread_at_entry, depth_backfilled';
 const RESEARCH_COL_NAMES = 'source_notional, entry_price_gap';
+const FEE_COL_NAMES = 'fee_rate, entry_fee_cost';
 
 const OPEN_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
-  entry_gas_cost, entry_slippage_cost, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES}, insertion_order)`;
-const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(28).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES}, ${FEE_COL_NAMES}, insertion_order)`;
+const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(30).fill('?').join(',') + ')';
 
 const CLOSED_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
   exit_price, realized_pnl, closed_at, holding_period_ms,
   entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES},
-  source_sell_fraction, insertion_order)`;
-const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(35).fill('?').join(',') + ')';
+  source_sell_fraction, ${FEE_COL_NAMES}, exit_fee_cost, insertion_order)`;
+const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(38).fill('?').join(',') + ')';
 
 // ── Snapshot load ───────────────────────────────────────────────────────────
 function loadSnapshot(): TradesStore {
@@ -725,10 +741,14 @@ function applyExitCosts(trade: SimulatedTrade, exitPrice: number): void {
   const gas    = trade.entryGasCost      ?? CONFIG.GAS_COST_PER_BUY;
   const eSlip  = trade.entrySlippageCost ?? CONFIG.SLIPPAGE_RATE * trade.entryPrice * shares;
   const xSlip  = CONFIG.SLIPPAGE_RATE * exitPrice * shares;
+  // Exit fee at the exit price: zero for 0/1 resolution payouts by formula.
+  const eFee   = trade.entryFeeCost ?? 0;
+  const xFee   = takerFeeCost(trade.feeRate, exitPrice, shares);
   trade.entryGasCost      = gas;
   trade.entrySlippageCost = eSlip;
   trade.exitSlippageCost  = xSlip;
-  trade.costAdjustedPnl   = (trade.realizedPnl ?? 0) - gas - eSlip - xSlip;
+  trade.exitFeeCost       = xFee;
+  trade.costAdjustedPnl   = (trade.realizedPnl ?? 0) - gas - eSlip - xSlip - eFee - xFee;
 }
 
 export function closeOpenTrade(

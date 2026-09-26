@@ -15,6 +15,13 @@ import { getCircuitBreakerStatus, resetCircuitBreaker, rollingNetForTrader } fro
 // $1k wallet-test cutover: leaderboard real copies frozen, watchlist-only sim begins.
 const TEST_START_MS = Date.UTC(2026, 4, 28, 0, 0, 0);
 
+// Watchlist Performance panel reset (2026-09-26, when the LowFreq-* traders went
+// live in the sim): headline PnL / win rate / trade counts only include trades
+// OPENED at or after this instant. Nothing is deleted; ?source=all, the $1k test
+// window and the go-live gate are unaffected. Keep in sync with
+// WATCHLIST_STATS_SINCE_MS in public/index.html.
+const WATCHLIST_STATS_SINCE_MS = Date.parse('2026-09-26T15:08:47Z');
+
 // Minimal shape used by computeTraderStats (compatible with both RawActivityItem and TraderHistoryEntry)
 type ActivityLike = {
   timestamp?: string | null;
@@ -387,6 +394,14 @@ export function startDashboard(): void {
       openTrades   = openTrades.filter(t => t.copiedTraderSource === 'watchlist');
       closedTrades = closedTrades.filter(t => t.copiedTraderSource === 'watchlist');
     }
+    // Wallet capacity counts every open position; performance counts only
+    // trades opened since the panel reset.
+    const walletOpen = openTrades;
+    if (source !== 'all') {
+      const sinceReset = (t: { timestamp: string }) => Date.parse(t.timestamp) >= WATCHLIST_STATS_SINCE_MS;
+      openTrades   = openTrades.filter(sinceReset);
+      closedTrades = closedTrades.filter(sinceReset);
+    }
 
     const realizedPnl = closedTrades.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
     const unrealizedPnl = openTrades.reduce((s, t) => s + (t.unrealizedPnl ?? 0), 0);
@@ -438,7 +453,9 @@ export function startDashboard(): void {
       avgSlippagePerTrade:        avgSlippage,
       avgNetEdgePerTrade:         avgNetEdge,
       simulatedWalletSize:        CONFIG.SIMULATED_WALLET_SIZE,
-      walletInUse:                openTrades.reduce((s, t) => s + (t.simulatedAmount ?? CONFIG.TRADE_AMOUNT), 0),
+      walletInUse:                walletOpen.reduce((s, t) => s + (t.simulatedAmount ?? CONFIG.TRADE_AMOUNT), 0),
+      walletOpenTrades:           walletOpen.length,
+      statsSince:                 source !== 'all' ? new Date(WATCHLIST_STATS_SINCE_MS).toISOString() : null,
       walletCapUtilization:       CONFIG.WALLET_CAP_UTILIZATION,
       walletCapSkips7d:           await getWalletCapSkips7d(),
       tradeAmount:                CONFIG.TRADE_AMOUNT,
@@ -449,7 +466,7 @@ export function startDashboard(): void {
       longshotSkipNotional:       longshot.notional,
       circuitBreaker:             getCircuitBreakerStatus(),
       traderDecayThreshold30d:    CONFIG.TRADER_DECAY_THRESHOLD_30D,
-    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string; longshotSkipCount: number; longshotSkipNotional: number; circuitBreaker: ReturnType<typeof getCircuitBreakerStatus>; traderDecayThreshold30d: number };
+    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletOpenTrades: number; statsSince: string | null; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string; longshotSkipCount: number; longshotSkipNotional: number; circuitBreaker: ReturnType<typeof getCircuitBreakerStatus>; traderDecayThreshold30d: number };
     res.json(stats);
   });
 
