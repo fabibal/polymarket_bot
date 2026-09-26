@@ -557,6 +557,9 @@ go-live gate are unchanged. Wallet and open-position cards keep counting every
 open position, because the wallet cap applies to all of them. The constant is
 duplicated in `public/index.html` (same pattern as `TEST_START`); keep both in
 sync when resetting again.
+Moved to 2026-09-26T21:38:14Z the same evening, when 0x12d6 went to observation:
+all ten trades opened since 15:08 were its, so the panel now starts with the
+three LowFreq traders only.
 
 ## Taker fees in the sim (2026-09-26, `src/fees.ts`, `src/monitor.ts`, `src/store.ts`, `src/simulator.ts`)
 

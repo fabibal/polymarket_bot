@@ -15,12 +15,12 @@ import { getCircuitBreakerStatus, resetCircuitBreaker, rollingNetForTrader } fro
 // $1k wallet-test cutover: leaderboard real copies frozen, watchlist-only sim begins.
 const TEST_START_MS = Date.UTC(2026, 4, 28, 0, 0, 0);
 
-// Watchlist Performance panel reset (2026-09-26, when the LowFreq-* traders went
-// live in the sim): headline PnL / win rate / trade counts only include trades
-// OPENED at or after this instant. Nothing is deleted; ?source=all, the $1k test
+// Watchlist Performance panel reset (2026-09-26 21:38 UTC, when 0x12d6 went to
+// observation and only the LowFreq-* traders were left copying): headline PnL /
+// win rate / trade counts only include trades OPENED at or after this instant. Nothing is deleted; ?source=all, the $1k test
 // window and the go-live gate are unaffected. Keep in sync with
 // WATCHLIST_STATS_SINCE_MS in public/index.html.
-const WATCHLIST_STATS_SINCE_MS = Date.parse('2026-09-26T15:08:47Z');
+const WATCHLIST_STATS_SINCE_MS = Date.parse('2026-09-26T21:38:14Z');
 
 // Minimal shape used by computeTraderStats (compatible with both RawActivityItem and TraderHistoryEntry)
 type ActivityLike = {
