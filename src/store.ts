@@ -16,7 +16,7 @@ import Database from 'better-sqlite3';
 import type { Database as Db } from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
 import {
-  TradesStore, SimulatedTrade, TrackedTrader, WatchlistTrader,
+  TradesStore, SimulatedTrade, WatchlistTrader,
   TraderHistoryEntry,
 } from './types';
 import { CONFIG } from './config';
@@ -31,7 +31,6 @@ const WATCHLIST_DEFAULTS: WatchlistTrader[] = [
 ];
 
 const EMPTY_STORE = (): TradesStore => ({
-  trackedTraders: [],
   openTrades: [],
   closedTrades: [],
   processedTradeIds: [],
@@ -226,6 +225,10 @@ CREATE TABLE IF NOT EXISTS observation_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_observation_fifo
   ON observation_trades (copied_trader, market_slug, outcome, status, insertion_order);
+-- Per-trader stats over a time window (observationStats) without scanning the
+-- whole ledger, which holds 500k+ rows.
+CREATE INDEX IF NOT EXISTS idx_observation_trader_ts
+  ON observation_trades (copied_trader, timestamp);
 `;
 
 // ── DB lifecycle ────────────────────────────────────────────────────────────
@@ -327,6 +330,9 @@ function migrateResearchColumns(d: Db): void {
     if (t === 'closed_trades' && !existing.has('exit_fee_cost')) {
       d.exec(`ALTER TABLE ${t} ADD COLUMN exit_fee_cost REAL`);
     }
+    // Copy timing (2026-09-27): when the copy was opened and by which path.
+    if (!existing.has('copied_at'))   d.exec(`ALTER TABLE ${t} ADD COLUMN copied_at TEXT`);
+    if (!existing.has('copy_source')) d.exec(`ALTER TABLE ${t} ADD COLUMN copy_source TEXT`);
   }
   const obsExisting = new Set(
     (d.prepare(`PRAGMA table_info(observation_trades)`).all() as Array<{ name: string }>).map(r => r.name)
@@ -399,6 +405,7 @@ type TradeRow = {
   source_notional?: number | null; entry_price_gap?: number | null;
   source_sell_fraction?: number | null;
   fee_rate?: number | null; entry_fee_cost?: number | null; exit_fee_cost?: number | null;
+  copied_at?: string | null; copy_source?: string | null;
   insertion_order: number;
 };
 
@@ -442,6 +449,8 @@ function rowToTrade(r: TradeRow): SimulatedTrade {
   if (r.fee_rate               != null) t.feeRate              = r.fee_rate;
   if (r.entry_fee_cost         != null) t.entryFeeCost         = r.entry_fee_cost;
   if (r.exit_fee_cost          != null) t.exitFeeCost          = r.exit_fee_cost;
+  if (r.copied_at              != null) t.copiedAt             = r.copied_at;
+  if (r.copy_source            != null) t.copySource           = r.copy_source as SimulatedTrade['copySource'];
   return t;
 }
 
@@ -458,6 +467,8 @@ const RESEARCH_VALS = (t: SimulatedTrade) => [
 
 const FEE_VALS = (t: SimulatedTrade) => [t.feeRate ?? null, t.entryFeeCost ?? null];
 
+const COPY_VALS = (t: SimulatedTrade) => [t.copiedAt ?? null, t.copySource ?? null];
+
 function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
   return [
     t.id, t.sourceTradeId, t.timestamp, t.copiedTrader, t.copiedTraderRank,
@@ -469,6 +480,7 @@ function openTradeRowParams(t: SimulatedTrade, order: number): any[] {
     ...DEPTH_VALS(t),
     ...RESEARCH_VALS(t),
     ...FEE_VALS(t),
+    ...COPY_VALS(t),
     order,
   ];
 }
@@ -488,6 +500,7 @@ function closedTradeRowParams(t: SimulatedTrade, order: number): any[] {
     ...RESEARCH_VALS(t),
     t.sourceSellFraction ?? null,
     ...FEE_VALS(t), t.exitFeeCost ?? null,
+    ...COPY_VALS(t),
     order,
   ];
 }
@@ -495,43 +508,27 @@ function closedTradeRowParams(t: SimulatedTrade, order: number): any[] {
 const DEPTH_COL_NAMES = 'best_ask, best_bid, ask_depth_5, ask_depth_10, spread_at_entry, depth_backfilled';
 const RESEARCH_COL_NAMES = 'source_notional, entry_price_gap';
 const FEE_COL_NAMES = 'fee_rate, entry_fee_cost';
+const COPY_COL_NAMES = 'copied_at, copy_source';
 
 const OPEN_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
-  entry_gas_cost, entry_slippage_cost, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES}, ${FEE_COL_NAMES}, insertion_order)`;
-const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(30).fill('?').join(',') + ')';
+  entry_gas_cost, entry_slippage_cost, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES}, ${FEE_COL_NAMES},
+  ${COPY_COL_NAMES}, insertion_order)`;
+const OPEN_INSERT_PLACEHOLDERS = '(' + new Array(32).fill('?').join(',') + ')';
 
 const CLOSED_INSERT_COLS = `(id, source_trade_id, timestamp, copied_trader, copied_trader_rank,
   copied_trader_username, copied_trader_source, market_slug, market_title, outcome, side,
   entry_price, simulated_amount, simulated_shares, current_price, unrealized_pnl, status,
   exit_price, realized_pnl, closed_at, holding_period_ms,
   entry_gas_cost, entry_slippage_cost, exit_slippage_cost, cost_adjusted_pnl, ${DEPTH_COL_NAMES}, ${RESEARCH_COL_NAMES},
-  source_sell_fraction, ${FEE_COL_NAMES}, exit_fee_cost, insertion_order)`;
-const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(38).fill('?').join(',') + ')';
+  source_sell_fraction, ${FEE_COL_NAMES}, exit_fee_cost, ${COPY_COL_NAMES}, insertion_order)`;
+const CLOSED_INSERT_PLACEHOLDERS = '(' + new Array(40).fill('?').join(',') + ')';
 
 // ── Snapshot load ───────────────────────────────────────────────────────────
 function loadSnapshot(): TradesStore {
   const d = getDb();
   const s = EMPTY_STORE();
-
-  // Read-only: tracked_traders is never written by the bot — the weekly macro
-  // scan updates it externally; loaded so /api/discovery/candidates can enrich
-  // candidates with falconSharpe.
-  s.trackedTraders = (d.prepare('SELECT * FROM tracked_traders ORDER BY rank ASC').all() as any[]).map(r => {
-    const t: TrackedTrader = {
-      rank: r.rank, address: r.address,
-      weeklyPnl: r.weekly_pnl,
-    };
-    if (r.username        != null) t.username       = r.username;
-    if (r.total_volume    != null) t.totalVolume    = r.total_volume;
-    if (r.inactive        != null) t.inactive       = !!r.inactive;
-    if (r.falcon_win_rate != null) t.falconWinRate  = r.falcon_win_rate;
-    if (r.falcon_roi      != null) t.falconRoi      = r.falcon_roi;
-    if (r.falcon_sharpe   != null) t.falconSharpe   = r.falcon_sharpe;
-    if (r.tracked_since   != null) t.trackedSince   = r.tracked_since;
-    return t;
-  });
 
   s.watchlistTraders = (d.prepare('SELECT * FROM watchlist_traders ORDER BY added_at ASC').all() as any[]).map(r => {
     const w: WatchlistTrader = {
@@ -914,6 +911,59 @@ export function* iterateObservationTrades(): Generator<SimulatedTrade> {
     .prepare('SELECT * FROM observation_trades ORDER BY insertion_order ASC')
     .iterate() as Iterable<TradeRow>;
   for (const r of rows) yield rowToTrade(r);
+}
+
+export interface ObservationClosedStats {
+  closedCount: number;
+  winners: number;
+  netPnl: number;      // cost-adjusted
+  grossWin: number;
+  grossLoss: number;   // positive number
+  entryPriceSum: number;
+  firstTrade: string | null;
+  lastTrade: string | null;
+}
+
+/**
+ * Cost-adjusted stats over one trader's CLOSED observation rows opened at or
+ * after `sinceIso`, aggregated in SQL on idx_observation_trader_ts. Streaming
+ * the whole ledger through JS held the event loop ~9s per dashboard refresh.
+ * Open rows are in the in-memory cache (store.observationOpenTrades).
+ */
+export function observationClosedStats(address: string, sinceIso: string): ObservationClosedStats {
+  const pnl = `COALESCE(cost_adjusted_pnl,
+    realized_pnl - COALESCE(entry_gas_cost, ${Number(CONFIG.GAS_COST_PER_BUY)})
+      - COALESCE(entry_slippage_cost, ${Number(CONFIG.SLIPPAGE_RATE)} * entry_price * simulated_shares)
+      - COALESCE(exit_slippage_cost, ${Number(CONFIG.SLIPPAGE_RATE)} * COALESCE(exit_price, 0) * simulated_shares))`;
+  const r = getDb().prepare(
+    `SELECT COUNT(*) AS n,
+            COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS winners,
+            COALESCE(SUM(pnl), 0) AS net,
+            COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0) AS gross_win,
+            COALESCE(SUM(CASE WHEN pnl > 0 THEN 0 ELSE -pnl END), 0) AS gross_loss,
+            COALESCE(SUM(entry_price), 0) AS entry_sum,
+            MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
+       FROM (SELECT ${pnl} AS pnl, entry_price, timestamp FROM observation_trades
+              WHERE copied_trader = ? AND timestamp >= ? AND status != 'open')`,
+  ).get(address, sinceIso) as {
+    n: number; winners: number; net: number; gross_win: number; gross_loss: number;
+    entry_sum: number; first_ts: string | null; last_ts: string | null;
+  };
+  return {
+    closedCount: r.n,
+    winners: r.winners,
+    netPnl: r.net,
+    grossWin: r.gross_win,
+    grossLoss: r.gross_loss,
+    entryPriceSum: r.entry_sum,
+    firstTrade: r.first_ts,
+    lastTrade: r.last_ts,
+  };
+}
+
+/** Row count of the whole observation ledger (for the dashboard's DB health). */
+export function observationRowCount(): number {
+  return (getDb().prepare('SELECT COUNT(*) AS c FROM observation_trades').get() as { c: number }).c;
 }
 
 /** FIFO-close the oldest open observation position matching (trader, slug, outcome). */

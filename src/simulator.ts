@@ -86,6 +86,38 @@ export function tradeTotalCosts(t: SimulatedTrade): number {
   return gas + eSlip + xSlip + eFee + (t.exitFeeCost ?? takerFeeCost(t.feeRate, t.exitPrice ?? 0, shares));
 }
 
+export interface CostBreakdown {
+  trades: number;
+  gross: number;          // realized PnL at the trader's own prices
+  entrySlippage: number;  // ask above the trader's price (gap), or the flat fallback
+  fees: number;           // taker fees, entry + exit
+  exitSlippage: number;
+  gas: number;
+  net: number;            // gross minus every cost = sum of tradeCostAdjustedPnl
+}
+
+/** Where a set of CLOSED trades' PnL went. Open trades are skipped. */
+export function costBreakdown(trades: SimulatedTrade[]): CostBreakdown {
+  const out: CostBreakdown = { trades: 0, gross: 0, entrySlippage: 0, fees: 0, exitSlippage: 0, gas: 0, net: 0 };
+  for (const t of trades) {
+    if (t.status === 'open') continue;
+    const shares = t.simulatedShares;
+    const gas   = t.entryGasCost      ?? CONFIG.GAS_COST_PER_BUY;
+    const eSlip = t.entrySlippageCost ?? CONFIG.SLIPPAGE_RATE * t.entryPrice * shares;
+    const xSlip = t.exitSlippageCost  ?? CONFIG.SLIPPAGE_RATE * (t.exitPrice ?? 0) * shares;
+    const fees  = (t.entryFeeCost ?? 0) + (t.exitFeeCost ?? takerFeeCost(t.feeRate, t.exitPrice ?? 0, shares));
+    const gross = t.realizedPnl ?? 0;
+    out.trades++;
+    out.gross += gross;
+    out.gas += gas;
+    out.entrySlippage += eSlip;
+    out.exitSlippage += xSlip;
+    out.fees += fees;
+    out.net += gross - gas - eSlip - xSlip - fees;
+  }
+  return out;
+}
+
 // ── Threshold-resolution decision ──────────────────────────────────────────
 
 // A market is confirmed resolved when Gamma marks it closed AND every outcome

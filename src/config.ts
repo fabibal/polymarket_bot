@@ -109,6 +109,6 @@ export const CONFIG = {
     BREAKER_DISABLED ? undefined : process.env.DAILY_LOSS_CIRCUIT_BREAKER,
     process.env.DAILY_LOSS_CIRCUIT_BREAKER_PCT,
     WALLET_SIZE, 3, -30),
-  // Falcon (Polymarket Analytics) API key — optional, used by the weekly macro-scan Falcon enrichment
+  // Falcon (Polymarket Analytics) API key — optional; only manual scripts use it since the weekly macro scan was retired (2026-09-27)
   POLYMARKET_ANALYTICS_API_KEY: process.env.POLYMARKET_ANALYTICS_API_KEY ?? '',
 };

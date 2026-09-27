@@ -98,6 +98,8 @@ export function processRealtimeTrade(trader: TraderRef, raw: RawActivityItem, op
   return withProcessingLock(() => processActivity(trader, [raw], options, undefined, false));
 }
 
+// advanceCursor is true for the data-api poll and false for the RTDS push, so
+// it also records which path delivered a copied trade.
 async function processActivity(
   trader: TraderRef,
   items: RawActivityItem[],
@@ -356,6 +358,8 @@ async function processActivity(
         entrySlippageCost: entryCosts.slippage,
         feeRate,
         entryFeeCost:      entryFee,
+        copiedAt:          new Date().toISOString(),
+        copySource:        advanceCursor ? 'poll' : 'rtds',
       };
       if (fetchedFeeRate === null) {
         console.log(`[monitor] fee config unavailable for ${activity.marketSlug} — using fallback rate ${feeRate}`);

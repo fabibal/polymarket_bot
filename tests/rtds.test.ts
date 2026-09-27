@@ -33,7 +33,7 @@ vi.mock('../src/bullpen', () => ({
 }));
 
 import { pollTrader, processRealtimeTrade } from '../src/monitor';
-import { rtdsPayloadToActivity } from '../src/rtds';
+import { rtdsPayloadToActivity, countFeedMessage, getRtdsStatus, _resetFeedStatusForTests } from '../src/rtds';
 import * as store from '../src/store';
 
 let txSeq = 0;
@@ -105,5 +105,28 @@ describe('monitor: RTDS push path', () => {
     ]);
     expect(a + b).toBe(1);
     expect(store.readStore().openTrades.length).toBe(1);
+  });
+});
+
+describe('copy source', () => {
+  it('records which path delivered the copy', async () => {
+    await processRealtimeTrade({ address: TRADER }, item(), opts);
+    activityFeed.mockResolvedValue([item()]);
+    await pollTrader({ address: TRADER }, opts);
+    const src = store.readStore().openTrades.map(t => t.copySource).sort();
+    expect(src).toEqual(['poll', 'rtds']);
+    expect(store.readStore().openTrades.every(t => typeof t.copiedAt === 'string')).toBe(true);
+  });
+});
+
+describe('feed status', () => {
+  it('msgs/sec is the mean over the last minute; older buckets drop out', () => {
+    _resetFeedStatusForTests();
+    const t0 = Date.parse('2026-09-27T00:00:00Z');
+    for (let s = 0; s < 60; s++) for (let k = 0; k < 30; k++) countFeedMessage(t0 + s * 1000 + k);
+    expect(getRtdsStatus(t0 + 59_500).msgsPerSec).toBeCloseTo(30, 10);
+    // 30s later only the last 30 seconds of traffic are inside the window
+    expect(getRtdsStatus(t0 + 89_500).msgsPerSec).toBeCloseTo(15, 10);
+    expect(getRtdsStatus(t0 + 89_500).lastMessageAgoMs).toBe(89_500 - 59_029);
   });
 });

@@ -106,6 +106,10 @@ Removed 2026-05-29 (inert no-ops): `LEADERBOARD_REFRESH_MS`,
 - Telegram creds (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) live at
   `~/.env.shared` (chmod 600, server-only, shared with `paper_trader`), injected
   via `env_file` in docker-compose. Use `[polymarket_bot]` prefix on messages.
+- polymarket_bot posts to its own channel ("Polymarket", 2026-09-27) via
+  `POLYMARKET_TELEGRAM_CHAT_ID` in `~/.env.shared`, like the other projects'
+  `<NAME>_TELEGRAM_CHAT_ID` entries (`src/alerts.ts` and every alert script);
+  unset -> the shared `TELEGRAM_CHAT_ID`.
 
 ### Alerts
 Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/logs/`
@@ -116,14 +120,13 @@ Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/log
 | Script | Cron | Purpose |
 |---|---|---|
 | `check-bullpen-expiry.sh` | `0 9 * * *` | `bullpen --output json status` → `account.session_expires`. Refresh: `bullpen login`. |
-| `check-falcon-expiry.sh` | `0 9 * * *` | `POLYMARKET_ANALYTICS_API_KEY` raw JWT, ~60d TTL, no auto-refresh. Refresh: new JWT at polymarketanalytics.com → `.env` → `docker compose up -d --no-deps bot`. |
 | `git-sync.sh` | `0 3 * * *` | Auto-commits tracked changes (`src/ tests/ scripts/ public/` + root configs) as `chore(sync): daily auto-sync <date>`, pushes `origin/main`. Untracked files NOT auto-added. |
 | `watchdog.sh` | `*/5 * * * *` | Probes `http://localhost:8082/`; ≥2 consecutive non-200 → `docker compose restart bot` + alert. Recovers the gluetun-restart orphan-namespace failure. |
-| `weekly-macro-scan.sh` | `0 4 * * 1` | Falcon enrichment of `tracked_traders` + 90d on-chain scan; Telegram top-5 candidates (>0 only). Does NOT auto-add to watchlist. |
-| `weekly-lowfreq-scan.sh` | `0 5 * * 0` | Leaderboard pool -> copyability filters -> backtest gate (`scripts/lowfreq_scan.js`, own container in the VPN netns); survivors auto-added as observation (copy_enabled=0, cap 10 standing) via the dashboard API, Telegram per addition. Replaced `weekly-tape-scan.sh` 2026-09-26. |
+| `weekly-lowfreq-scan.sh` | `30 5 * * 0` | Leaderboard pool -> copyability filters -> backtest gate (`scripts/lowfreq_scan.js`, own container in the VPN netns); survivors auto-added as observation (copy_enabled=0, cap 10 standing) via the dashboard API, Telegram per addition. Replaced `weekly-tape-scan.sh` 2026-09-26; the Falcon `weekly-macro-scan.sh` + `check-falcon-expiry.sh` crons were retired 2026-09-27. |
 | `update-bullpen.sh` | `0 2 * * *` | `npm install -g @bullpenfi/cli@latest`, before git-sync at 03:00. Log-only (`bullpen-update.log`), no Telegram alert even on failure. |
 
-New alerts: copy `send_telegram()` from `check-bullpen-expiry.sh`. Always log one
+New alerts: copy `send_telegram()` and the env loading (incl. the
+`POLYMARKET_TELEGRAM_CHAT_ID` line) from `check-bullpen-expiry.sh`. Always log one
 line per run so a quiet log proves the cron ran.
 
 ## MCP Tools: code-review-graph

@@ -6,6 +6,7 @@ import { getOrderbookDepth } from './bullpen';
 import { CONFIG } from './config';
 import { isCircuitBreakerActive, checkCircuitBreaker, checkTraderDecay } from './risk';
 import { startRtds } from './rtds';
+import { startLoopMonitor } from './health';
 
 /**
  * One-shot startup task: for every open watchlist trade missing orderbook depth,
@@ -111,6 +112,9 @@ async function main(): Promise<void> {
   // Periodic PASSIVE WAL checkpoint (all store mutations persist immediately
   // via targeted SQL — this only keeps the WAL file from growing unbounded).
   startWalCheckpoint(60_000);
+
+  // Event-loop lag for the dashboard: a blocked loop delays every copy.
+  startLoopMonitor();
 
   startDashboard();
   scheduleMidnightCleanup();

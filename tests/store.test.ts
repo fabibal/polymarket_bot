@@ -207,3 +207,18 @@ describe('store: GROUP D research columns', () => {
     expect(open.entryPriceGap).toBeUndefined();
   });
 });
+
+describe('store: copy timing columns', () => {
+  it('copiedAt and copySource persist through open -> close -> reload', () => {
+    store.addOpenTrade(makeTrade({ id: 'ct-1', sourceTradeId: 'ct-src-1', copiedAt: '2026-09-27T10:00:01.500Z', copySource: 'rtds' }));
+    store._resetStoreCache();
+    const open = store.readStore().openTrades.find(x => x.id === 'ct-1')!;
+    expect(open.copiedAt).toBe('2026-09-27T10:00:01.500Z');
+    expect(open.copySource).toBe('rtds');
+    store.closeOpenTrade('0xabc', 'foo-market', 'Yes', 0.90);
+    store._resetStoreCache();
+    const closed = store.readStore().closedTrades.find(x => x.id === 'ct-1')!;
+    expect(closed.copiedAt).toBe('2026-09-27T10:00:01.500Z');
+    expect(closed.copySource).toBe('rtds');
+  });
+});

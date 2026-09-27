@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# RETIRED 2026-09-27: no longer in crontab -- no scheduled job uses the Falcon key
+# (docs/decisions.md "Falcon macro scan and its key alert retired"). Kept for manual runs.
+#
 # Falcon (Polymarket Analytics) JWT expiry check for polymarket_bot.
 #
 # Decodes the JWT in POLYMARKET_ANALYTICS_API_KEY from
@@ -40,6 +43,9 @@ if [ -f "${SHARED_ENV}" ]; then
     # shellcheck disable=SC1090
     set -a; . "${SHARED_ENV}"; set +a
 fi
+# polymarket_bot's own channel ("Polymarket") when ~/.env.shared defines it,
+# like the other projects' <NAME>_TELEGRAM_CHAT_ID; otherwise the shared chat.
+TELEGRAM_CHAT_ID="${POLYMARKET_TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
 
 # Hard-fail if alerting infrastructure is broken — better to scream into the
 # log + stderr (now redirected to falcon-expiry.cron.log) than to silently

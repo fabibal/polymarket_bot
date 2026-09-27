@@ -3,24 +3,37 @@ import https from 'https';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
-import { readStore, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount, getSkippedTradeStats, iterateObservationTrades } from './store';
-import { DashboardStats } from './types';
+import {
+  readStore, addWatchlistTrader, removeWatchlistTrader, setWatchlistCopyEnabled, setWatchlistCopyAmount,
+  observationClosedStats, observationRowCount,
+} from './store';
+import { DashboardStats, SimulatedTrade } from './types';
 import { CONFIG } from './config';
 import { checkVpnConnectivity, RawActivityItem } from './bullpen';
 import { detectCategory } from './categories';
-import { tradeCostAdjustedPnl, tradeTotalCosts } from './simulator';
-import { groupStats } from './stats';
+import { tradeCostAdjustedPnl, tradeTotalCosts, costBreakdown } from './simulator';
 import { getCircuitBreakerStatus, resetCircuitBreaker, rollingNetForTrader } from './risk';
-
-// $1k wallet-test cutover: leaderboard real copies frozen, watchlist-only sim begins.
-const TEST_START_MS = Date.UTC(2026, 4, 28, 0, 0, 0);
+import { FORWARD_TESTS, evaluateForwardTest, buildReadiness } from './forwardtest';
+import { parseLowfreqReport, latestReportFile, nextWeeklyRun } from './discovery';
+import {
+  getLoopLag, copyLatencyStats, parseExpiryLine, parseGitSyncLine, parseScanLine,
+  summarizeWatchdog, readLastLine, readText, lastLineMatching, dbInfo,
+} from './health';
+import { getRtdsStatus } from './rtds';
 
 // Watchlist Performance panel reset (2026-09-26 21:38 UTC, when 0x12d6 went to
-// observation and only the LowFreq-* traders were left copying): headline PnL /
-// win rate / trade counts only include trades OPENED at or after this instant. Nothing is deleted; ?source=all, the $1k test
-// window and the go-live gate are unaffected. Keep in sync with
-// WATCHLIST_STATS_SINCE_MS in public/index.html.
+// observation and only the LowFreq-* traders were left copying): headline PnL,
+// win rate, trade counts, charts, costs and risk only include trades OPENED at
+// or after this instant. Nothing is deleted; ?source=all on /api/stats still
+// covers everything. Keep in sync with WATCHLIST_STATS_SINCE_MS in public/index.html.
 const WATCHLIST_STATS_SINCE_MS = Date.parse('2026-09-26T21:38:14Z');
+
+// Observation-ledger stats start here: before the 429 fix (deployed ~21:00 UTC
+// 2026-09-26) rate-limited price sweeps marked live markets dead and expired
+// observation positions at stale prices, 109k of them at 15:40 that day alone.
+const OBSERVATION_STATS_SINCE = '2026-09-26T21:00:00.000Z';
+
+const LOGS_DIR = '/app/logs';
 
 // Minimal shape used by computeTraderStats (compatible with both RawActivityItem and TraderHistoryEntry)
 type ActivityLike = {
@@ -204,7 +217,11 @@ async function fetchOneContainerStat(name: string): Promise<ContainerStat> {
     const numCpus = (cpu?.online_cpus as number) || 1;
     const cpuPct = sysDelta > 0 ? (cpuDelta / sysDelta) * numCpus * 100 : 0;
     const rawUsage = (mem?.usage as number) ?? 0;
-    const cache = ((mem?.stats as Record<string, unknown>)?.cache as number) ?? 0;
+    // Reclaimable page cache is subtracted like `docker stats` does: cgroup v2
+    // reports inactive_file (there is no `cache` key, so nothing was subtracted
+    // and the bot showed ~400MB/512MB right after scanning the DB).
+    const memStats = (mem?.stats as Record<string, unknown>) ?? {};
+    const cache = (memStats.inactive_file as number) ?? (memStats.cache as number) ?? 0;
     const ramUsed = rawUsage - cache;
     const ramLimit = (mem?.limit as number) ?? 0;
     const ramMB = ramUsed / 1_048_576;
@@ -355,23 +372,24 @@ function computeInlineStats(
   return { hasEnoughData: true as const, tradeCount30d, winRate7d, avgWin, avgLoss, topCategory, histVol30d };
 }
 
-// Cost-adjusted per-trade edge stats for a set of closed trades.
-// Used by the go-live readiness and risk endpoints.
-function edgeStats(trades: import('./types').SimulatedTrade[]) {
-  const vals = trades.map(t => tradeCostAdjustedPnl(t));
-  const gs = groupStats(vals);
-  const winners = vals.filter(v => v > 0).length;
-  const totalPnl = vals.reduce((s, v) => s + v, 0);
-  return {
-    n: gs.n,
-    winRate: gs.n > 0 ? winners / gs.n : null,
-    expPerTrade: gs.mean,
-    ciLow: gs.ciLow,
-    ciHigh: gs.ciHigh,
-    tStat: gs.tStat,
-    pValue: gs.pValue,
-    totalPnl,
+const openedSinceReset = (t: { timestamp: string }) => Date.parse(t.timestamp) >= WATCHLIST_STATS_SINCE_MS;
+
+// File-backed parts of /api/system (log tails, DB size, ledger row count).
+let systemFilesCache: { data: unknown; ts: number } | null = null;
+const SYSTEM_FILES_TTL_MS = 5 * 60 * 1000;
+
+function readSystemFiles(nowMs: number) {
+  if (systemFilesCache && nowMs - systemFilesCache.ts < SYSTEM_FILES_TTL_MS) return systemFilesCache.data;
+  const data = {
+    bullpen: parseExpiryLine(lastLineMatching(readText(path.join(LOGS_DIR, 'bullpen-expiry.log')), 'days_left=')),
+    gitSync: parseGitSyncLine(readLastLine(path.join(LOGS_DIR, 'git-sync.log'))),
+    lowfreqScan: parseScanLine(readLastLine(path.join(LOGS_DIR, 'weekly-lowfreq-scan.log'))),
+    watchdog7d: summarizeWatchdog(readText(path.join(LOGS_DIR, 'watchdog.log')), nowMs, 7 * 86_400_000),
+    db: dbInfo(CONFIG.DB_FILE, path.join(path.dirname(CONFIG.DB_FILE), 'backups'), nowMs),
+    observationRows: observationRowCount(),
   };
+  systemFilesCache = { data, ts: nowMs };
+  return data;
 }
 
 export function startDashboard(): void {
@@ -398,9 +416,8 @@ export function startDashboard(): void {
     // trades opened since the panel reset.
     const walletOpen = openTrades;
     if (source !== 'all') {
-      const sinceReset = (t: { timestamp: string }) => Date.parse(t.timestamp) >= WATCHLIST_STATS_SINCE_MS;
-      openTrades   = openTrades.filter(sinceReset);
-      closedTrades = closedTrades.filter(sinceReset);
+      openTrades   = openTrades.filter(openedSinceReset);
+      closedTrades = closedTrades.filter(openedSinceReset);
     }
 
     const realizedPnl = closedTrades.reduce((s, t) => s + (t.realizedPnl ?? 0), 0);
@@ -410,8 +427,8 @@ export function startDashboard(): void {
     const losers  = closedTrades.filter(t => (t.costAdjustedPnl ?? t.realizedPnl ?? 0) <= 0).length;
     const resolved = winners + losers;
 
-    // Slippage-adjusted projections — Polymarket has NO fees on sports markets,
-    // only 2% slippage each side (entry at ask, exit at bid) applies.
+    // Cost-adjusted projections: entry gap (or 2% fallback), 2% exit slippage
+    // and per-market taker fees (src/fees.ts).
     const realizedAdj   = closedTrades.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
     const unrealizedAdj = openTrades.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
     const totalCosts    = [...openTrades, ...closedTrades].reduce((s, t) => s + tradeTotalCosts(t), 0);
@@ -420,18 +437,6 @@ export function startDashboard(): void {
     const avgRawPnl     = realizedPnl / closedCount;
     const avgSlippage   = closedCosts / closedCount;
     const avgNetEdge    = realizedAdj / closedCount;
-
-    // $1k wallet-test window: watchlist-only closes at or after TEST_START_MS.
-    const testCloses = store.closedTrades.filter(t =>
-      t.copiedTraderSource === 'watchlist' &&
-      t.closedAt != null &&
-      new Date(t.closedAt).getTime() >= TEST_START_MS
-    );
-    const testPnl    = testCloses.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
-    const testTrades = testCloses.length;
-
-    // Per-trader longshot carve-out (0x12d6) — record-only count + would-be notional.
-    const longshot = getSkippedTradeStats('longshot_filter_0x12d6');
 
     const stats = {
       totalTrades: openTrades.length + closedTrades.length,
@@ -459,14 +464,9 @@ export function startDashboard(): void {
       walletCapUtilization:       CONFIG.WALLET_CAP_UTILIZATION,
       walletCapSkips7d:           await getWalletCapSkips7d(),
       tradeAmount:                CONFIG.TRADE_AMOUNT,
-      testPnl,
-      testTrades,
-      testStart:                  new Date(TEST_START_MS).toISOString(),
-      longshotSkipCount:          longshot.count,
-      longshotSkipNotional:       longshot.notional,
       circuitBreaker:             getCircuitBreakerStatus(),
       traderDecayThreshold30d:    CONFIG.TRADER_DECAY_THRESHOLD_30D,
-    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletOpenTrades: number; statsSince: string | null; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; testPnl: number; testTrades: number; testStart: string; longshotSkipCount: number; longshotSkipNotional: number; circuitBreaker: ReturnType<typeof getCircuitBreakerStatus>; traderDecayThreshold30d: number };
+    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletOpenTrades: number; statsSince: string | null; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; circuitBreaker: ReturnType<typeof getCircuitBreakerStatus>; traderDecayThreshold30d: number };
     res.json(stats);
   });
 
@@ -474,20 +474,18 @@ export function startDashboard(): void {
   // trades active on each day (opened on/before dayEnd, not closed before dayEnd).
   app.get('/api/wallet/history', (_req, res) => {
     const store = readStore();
-    const all = [...store.openTrades, ...store.closedTrades];
-    const watchOnly = all.filter(t => t.copiedTraderSource === 'watchlist');
+    // Watchlist only: 466 legacy April rows have no closed_at and would
+    // otherwise count as still open (~$2.3k phantom in use).
+    const watchOnly = [...store.openTrades, ...store.closedTrades].filter(t => t.copiedTraderSource === 'watchlist');
     const DAY_MS = 86_400_000;
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
     const days: string[] = [];
     const amounts: number[] = [];
-    const testAmounts: (number | null)[] = [];
     for (let i = 29; i >= 0; i--) {
       const dayStart = new Date(today.getTime() - i * DAY_MS);
       const dayEnd   = dayStart.getTime() + DAY_MS;
       let inUse = 0;
-      // Watchlist only: 466 legacy April rows have no closed_at and would
-      // otherwise count as still open (~$2.3k phantom in use).
       for (const t of watchOnly) {
         const opened = new Date(t.timestamp).getTime();
         if (opened >= dayEnd) continue;
@@ -498,24 +496,9 @@ export function startDashboard(): void {
       }
       days.push(dayStart.toISOString().slice(0, 10));
       amounts.push(Math.round(inUse * 100) / 100);
-
-      if (dayEnd <= TEST_START_MS) {
-        testAmounts.push(null);
-      } else {
-        let testInUse = 0;
-        for (const t of watchOnly) {
-          const opened = new Date(t.timestamp).getTime();
-          if (opened >= dayEnd) continue;
-          const amt = Number(t.simulatedAmount ?? CONFIG.TRADE_AMOUNT) || 0;
-          if (!t.closedAt) { testInUse += amt; continue; }
-          const closed = new Date(t.closedAt).getTime();
-          if (closed >= dayEnd) testInUse += amt;
-        }
-        testAmounts.push(Math.round(testInUse * 100) / 100);
-      }
     }
     const cap = CONFIG.SIMULATED_WALLET_SIZE * CONFIG.WALLET_CAP_UTILIZATION;
-    res.json({ days, amounts, testAmounts, testStart: new Date(TEST_START_MS).toISOString(), walletSize: CONFIG.SIMULATED_WALLET_SIZE, cap });
+    res.json({ days, amounts, walletSize: CONFIG.SIMULATED_WALLET_SIZE, cap });
   });
 
   app.get('/api/trades', (req, res) => {
@@ -532,6 +515,11 @@ export function startDashboard(): void {
     } else if (range === '30d') {
       cutoff = Date.now() - 30 * 86_400_000;
     }
+    // ?since=<epoch ms> (opened at or after) and ?limit=<n> keep the payload
+    // small: the full watchlist history is ~5 MB of JSON.
+    const since = Number(req.query.since);
+    if (Number.isFinite(since) && since > 0) cutoff = Math.max(cutoff ?? 0, since);
+    const limit = Number(req.query.limit);
 
     let all = [...store.openTrades, ...store.closedTrades];
     if (source === 'watchlist') {
@@ -541,8 +529,10 @@ export function startDashboard(): void {
       all = all.filter(t => new Date(t.timestamp).getTime() >= cutoff!);
     }
     all.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    const items = all.map(t => ({ ...t, costAdjustedPnl: tradeCostAdjustedPnl(t) }));
-    res.json({ count: items.length, items });
+    const labels = new Map(store.watchlistTraders.map(w => [w.address, w.label]));
+    const page = Number.isInteger(limit) && limit > 0 ? all.slice(0, limit) : all;
+    const items = page.map(t => ({ ...t, costAdjustedPnl: tradeCostAdjustedPnl(t), traderLabel: labels.get(t.copiedTrader) ?? null }));
+    res.json({ count: all.length, items });
   });
 
   app.get('/api/vpn-status', async (_req, res) => {
@@ -586,7 +576,7 @@ export function startDashboard(): void {
 
       const simAllWinners = simClosed.filter(c => (c.costAdjustedPnl ?? c.realizedPnl ?? 0) > 0).length;
       const allTimeWinRate = simClosed.length >= 3 ? simAllWinners / simClosed.length : null;
-      // Cost-adjusted realized PNL — consistent basis with the sparkline + go-live panel.
+      // Cost-adjusted realized PNL — same basis as the sparkline and the cards.
       const realizedPnl = simClosed.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0);
 
       // Break-even win rate = average entry price (implied probability paid).
@@ -626,11 +616,43 @@ export function startDashboard(): void {
         dailyPnl30d[idx] += (t.costAdjustedPnl ?? t.realizedPnl ?? 0);
       }
 
-      // Category breakdown for this trader's closed sim trades (using shared detectCategory).
-      const categoryBreakdown: Record<string, number> = {};
-      for (const t of simClosed) {
-        const cat = detectCategory(t.marketSlug || '');
-        categoryBreakdown[cat] = (categoryBreakdown[cat] || 0) + 1;
+      // Card status: copying, observing, or switched off by the decay kill switch.
+      const status = w.copyEnabled ? 'copying' : w.autoDisabledAt ? 'auto-disabled' : 'observing';
+
+      // Newest trade the bot has seen from this trader (local history).
+      let lastTradeAt: string | null = null;
+      for (const h of histTrades) {
+        if ((h.type ?? '').toUpperCase() === 'TRADE' && (!lastTradeAt || h.timestamp > lastTradeAt)) lastTradeAt = h.timestamp;
+      }
+
+      // Copy-ledger results since the panel reset (cost-adjusted).
+      const resetClosed = simClosed.filter(openedSinceReset);
+      const resetOpen = traderOpenTrades.filter(openedSinceReset);
+      const sinceReset = {
+        closed: resetClosed.length,
+        winners: resetClosed.filter(t => tradeCostAdjustedPnl(t) > 0).length,
+        netPnl: resetClosed.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0),
+        open: resetOpen.length,
+        unrealizedPnl: resetOpen.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0),
+      };
+
+      // Observation ledger for copy-disabled traders, from the clean window on.
+      let observation: {
+        since: string; closed: number; winRate: number | null; profitFactor: number | null;
+        netPnl: number; open: number; unrealizedPnl: number;
+      } | null = null;
+      if (!w.copyEnabled) {
+        const c = observationClosedStats(w.address, OBSERVATION_STATS_SINCE);
+        const openObs = store.observationOpenTrades.filter(t => t.copiedTrader === w.address && t.timestamp >= OBSERVATION_STATS_SINCE);
+        observation = {
+          since: OBSERVATION_STATS_SINCE,
+          closed: c.closedCount,
+          winRate: c.closedCount >= 3 ? c.winners / c.closedCount : null,
+          profitFactor: c.closedCount >= 3 && c.grossLoss > 0 ? c.grossWin / c.grossLoss : null,
+          netPnl: c.netPnl,
+          open: openObs.length,
+          unrealizedPnl: openObs.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0),
+        };
       }
 
       // Aggregate open trades by (market_slug, outcome) for the expand-row
@@ -720,24 +742,10 @@ export function startDashboard(): void {
 
       // Drop stale Falcon fields (leaderboard removed 2026-05-29 — no refresh path; no UI consumer).
       const { falconWinRate: _fwr, falconRoi: _fr, falconSharpe: _fs, ...wRest } = w;
-      return { ...wRest, username: tradeWithName?.copiedTraderUsername, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, categoryBreakdown, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length, pnl30d, decayDistance, decayThreshold: CONFIG.TRADER_DECAY_THRESHOLD_30D };
+      return { ...wRest, username: tradeWithName?.copiedTraderUsername, status, lastTradeAt, sinceReset, observation, inlineStats, allTimeWinRate, avgEntryPrice, profitFactor, realizedPnl, openPositions, avgHoldMs, dailyPnl30d, openTradesData, recentTrades, traderStats, avgAskDepth5, avgSpread, liqSampleCount: liqSamples.length, pnl30d, decayDistance, decayThreshold: CONFIG.TRADER_DECAY_THRESHOLD_30D };
     });
 
-    // Watchlist-wide PNL totals (simulated)
-    const totalRealizedPnl   = items.reduce((s, i) => s + (i.realizedPnl  ?? 0), 0);
-    const totalUnrealizedPnl = store.openTrades
-      .filter(t => t.copiedTraderSource === 'watchlist')
-      .reduce((s, t) => s + (t.unrealizedPnl ?? 0), 0);
-
-    // Watchlist-wide category breakdown across ALL watchlist closed trades
-    const categoryBreakdownAll: Record<string, number> = {};
-    for (const t of store.closedTrades) {
-      if (t.copiedTraderSource !== 'watchlist') continue;
-      const cat = detectCategory(t.marketSlug || '');
-      categoryBreakdownAll[cat] = (categoryBreakdownAll[cat] || 0) + 1;
-    }
-
-    res.json({ count: items.length, items, totalRealizedPnl, totalUnrealizedPnl, categoryBreakdownAll });
+    res.json({ count: items.length, items, statsSince: new Date(WATCHLIST_STATS_SINCE_MS).toISOString(), observationSince: OBSERVATION_STATS_SINCE });
   });
 
   app.get('/api/watchlist/open-history', (_req, res) => {
@@ -935,165 +943,75 @@ export function startDashboard(): void {
     res.json({ address: address.toLowerCase(), copyEnabled });
   });
 
-  // Discovery candidates from latest weekly macro scan.
-  // Parses /app/logs/weekly-macro-scan-runs/*-scan90d.log (host logs/ dir is bind-mounted ro)
-  // and enriches each candidate with Sharpe from store.trackedTraders.
-  app.get('/api/discovery/candidates', (_req, res) => {
-    const RUNS_DIR = '/app/logs/weekly-macro-scan-runs';
-    const SUMMARY_LOG = '/app/logs/weekly-macro-scan.log';
+  // Weekly low-frequency discovery: the newest run's report.json from
+  // scripts/weekly-lowfreq-scan.sh (host logs/ dir is bind-mounted read-only).
+  app.get('/api/discovery', (_req, res) => {
+    const runsDir = path.join(LOGS_DIR, 'weekly-lowfreq-scan-runs');
+    const file = latestReportFile(runsDir);
+    const nextRunAt = nextWeeklyRun(Date.now());
+    if (!file) {
+      res.json({ report: null, nextRunAt, message: 'No weekly scan has run yet.' });
+      return;
+    }
     try {
-      let scanFile: string | null = null;
-      let scanDate: string | null = null;
-      if (fs.existsSync(RUNS_DIR)) {
-        const files = fs.readdirSync(RUNS_DIR).filter(f => f.endsWith('-scan90d.log')).sort();
-        if (files.length > 0) {
-          scanFile = path.join(RUNS_DIR, files[files.length - 1]);
-          const m = files[files.length - 1].match(/^(\d{8}T\d{6}Z)/);
-          if (m) {
-            const s = m[1];
-            scanDate = `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(9,11)}:${s.slice(11,13)}:${s.slice(13,15)}Z`;
-          }
-        }
-      }
-
-      if (!scanFile) {
-        res.json({ scanDate: null, scanned: 0, candidates: [], message: 'No weekly scan has run yet.' });
-        return;
-      }
-
-      const content = fs.readFileSync(scanFile, 'utf8');
-      const lines = content.split('\n');
-
-      const headMatch = content.match(/\[scan\] cached=(\d+)/);
-      const scanned = headMatch ? Number(headMatch[1]) : 0;
-
-      // Candidate rows: prefer the machine-readable CANDIDATES_JSON line
-      // (emitted by macro_scan_90d.js since 2026-06-10). Position-parsing the
-      // human table is only a fallback for logs from older scans — a column
-      // change there would silently shift fields into the wrong numbers.
-      type RawCandidate = {
-        address: string; onFalcon7d: boolean; tr90: number; tpw: number;
-        closed: number; avgHoldDays: number; winRate: number; pnl: number;
-      };
-      let rawCandidates: RawCandidate[] | null = null;
-      const jsonLine = lines.find(l => l.startsWith('CANDIDATES_JSON '));
-      if (jsonLine) {
-        try {
-          const arr = JSON.parse(jsonLine.slice('CANDIDATES_JSON '.length));
-          if (Array.isArray(arr)) {
-            rawCandidates = arr.map((c: Record<string, unknown>) => ({
-              address:     String(c.address ?? '').toLowerCase(),
-              onFalcon7d:  Boolean(c.onFalcon7d),
-              tr90:        Number(c.tr90) || 0,
-              tpw:         Number(c.tpw) || 0,
-              closed:      Number(c.closed) || 0,
-              avgHoldDays: Number(c.avgHoldDays) || 0,
-              winRate:     Number(c.winRate) || 0,
-              pnl:         Number(c.pnl) || 0,
-            })).filter(c => /^0x[0-9a-f]{40}$/.test(c.address));
-          }
-        } catch (e) {
-          console.error('[dashboard] CANDIDATES_JSON parse failed, falling back to table parse:', e);
-        }
-      }
-      if (!rawCandidates) {
-        // Legacy fallback: extract the top "MACRO CANDIDATES" section (before
-        // "--- subset NOT on 7d ---") and split rows on whitespace.
-        // Row format: addr on7d tr90 t/wk closed hold_d >48h >7d wr pnl
-        let inTop = false;
-        const rawRows: string[] = [];
-        for (const ln of lines) {
-          if (/^========== MACRO CANDIDATES/.test(ln)) { inTop = true; continue; }
-          if (/^--- subset NOT on 7d/.test(ln))       { inTop = false; }
-          if (inTop && /^0x[0-9a-f]{40}/i.test(ln))   { rawRows.push(ln); }
-        }
-        rawCandidates = rawRows.map(row => {
-          const parts = row.trim().split(/\s+/);
-          return {
-            address:     (parts[0] || '').toLowerCase(),
-            onFalcon7d:  (parts[1] || '') === 'Y',
-            tr90:        Number(parts[2]) || 0,
-            tpw:         Number(parts[3]) || 0,
-            closed:      Number(parts[4]) || 0,
-            avgHoldDays: Number(parts[5]) || 0,
-            winRate:     Number(String(parts[8] ?? '').replace('%', '')) || 0,
-            pnl:         Number(parts[9]) || 0,
-          };
-        });
-      }
-
+      const report = parseLowfreqReport(JSON.parse(fs.readFileSync(file, 'utf8')));
       const store = readStore();
-      const sharpeByAddr = new Map<string, number>();
-      for (const t of store.trackedTraders ?? []) {
-        if (t.address && typeof (t as any).falconSharpe === 'number') {
-          sharpeByAddr.set(t.address.toLowerCase(), (t as any).falconSharpe);
-        }
-      }
-      for (const w of store.watchlistTraders ?? []) {
-        if (w.address && typeof (w as any).falconSharpe === 'number') {
-          sharpeByAddr.set(w.address.toLowerCase(), (w as any).falconSharpe);
-        }
-      }
-      const watchlistAddrs = new Set((store.watchlistTraders ?? []).map(w => w.address.toLowerCase()));
-
-      const candidates = rawCandidates.map(c => {
-        const expPerTrade = c.closed > 0 ? c.pnl / c.closed : 0;
-        const sharpe = sharpeByAddr.has(c.address) ? sharpeByAddr.get(c.address)! : null;
-        const why    = `WR ${c.winRate}% · hold ${c.avgHoldDays}d · ${c.tpw} trades/wk · ${c.closed} closed · PNL +$${c.pnl.toFixed(0)}`;
-        return {
-          ...c,
-          expPerTrade,
-          sharpe,
-          alreadyWatchlisted: watchlistAddrs.has(c.address),
-          why,
-        };
-      }).filter(c => c.closed >= 10);
-
-      // Pull "SENT" line from summary log to confirm last cron run.
-      let lastRunLine: string | null = null;
-      if (fs.existsSync(SUMMARY_LOG)) {
-        const sumLines = fs.readFileSync(SUMMARY_LOG, 'utf8').trim().split('\n').reverse();
-        for (const ln of sumLines) {
-          if (ln.includes('SENT') || ln.includes('SEND_FAILED')) { lastRunLine = ln; break; }
-        }
-      }
-
-      res.json({ scanDate, scanned, candidates, lastRunLine });
+      const onWatchlist = new Set(store.watchlistTraders.map(w => w.address));
+      const candidates = (report?.candidates ?? []).map(c => ({ ...c, onWatchlist: onWatchlist.has(c.address) }));
+      const lastRun = parseScanLine(readLastLine(path.join(LOGS_DIR, 'weekly-lowfreq-scan.log')));
+      res.json({ report: report ? { ...report, candidates } : null, lastRun, nextRunAt });
     } catch (e) {
-      console.error('[dashboard] /api/discovery/candidates error:', e);
-      res.status(500).json({ error: 'failed to read scan results' });
+      console.error('[dashboard] /api/discovery error:', e);
+      res.status(500).json({ error: 'failed to read scan report' });
     }
   });
 
-  // ── Go-live readiness ───────────────────────────────────────────────────────
-  // Statistical gate for flipping DRY_RUN=false. Computed over watchlist closed
-  // trades in the $1k test window only (closed_at >= TEST_START_MS), cost-adjusted.
-  app.get('/api/golive/readiness', (_req, res) => {
+  // ── Forward test + live-readiness checklist ─────────────────────────────────
+  // Copy-ledger results of the traders in src/forwardtest.ts against their
+  // backtest bands, and the checklist that gates a real-money test.
+  app.get('/api/forward-test', (_req, res) => {
     const store = readStore();
-    const TARGET = 5000;
-    const P_THRESHOLD = 0.01;
-    const test = store.closedTrades.filter(t =>
-      t.copiedTraderSource === 'watchlist' &&
-      t.closedAt != null &&
-      new Date(t.closedAt).getTime() >= TEST_START_MS,
-    );
-    const e = edgeStats(test);
-    // READY requires significance AND a positive edge — a significant *negative*
-    // edge must never read as "go live" in this DRY_RUN-safety context.
-    const ready = e.n >= TARGET && e.pValue < P_THRESHOLD && e.expPerTrade > 0;
+    const now = Date.now();
+    const onWatchlist = new Map(store.watchlistTraders.map(w => [w.address, w]));
+    const results = FORWARD_TESTS
+      .filter(p => onWatchlist.has(p.address))
+      .map(p => {
+        const lots = [...store.openTrades, ...store.closedTrades]
+          .filter(t => t.copiedTrader === p.address && t.copiedTraderSource === 'watchlist');
+        const r = evaluateForwardTest(p, lots, now, tradeCostAdjustedPnl);
+        return { ...r, copyEnabled: onWatchlist.get(p.address)!.copyEnabled };
+      });
+    res.json({ results, readiness: buildReadiness(results, now), dryRun: CONFIG.DRY_RUN });
+  });
+
+  // ── Where the money goes ───────────────────────────────────────────────────
+  // Gross PnL at the trader's prices vs every cost, closed copies opened since
+  // the panel reset, per trader and in total.
+  app.get('/api/costs', (_req, res) => {
+    const store = readStore();
+    const closed = store.closedTrades.filter(t => t.copiedTraderSource === 'watchlist' && openedSinceReset(t));
+    const labels = new Map(store.watchlistTraders.map(w => [w.address, w.label]));
+    const byTrader = new Map<string, SimulatedTrade[]>();
+    for (const t of closed) byTrader.set(t.copiedTrader, [...(byTrader.get(t.copiedTrader) ?? []), t]);
+    const traders = [...byTrader.entries()]
+      .map(([address, trades]) => ({ address, label: labels.get(address) ?? null, ...costBreakdown(trades) }))
+      .sort((a, b) => b.gross - a.gross);
+    res.json({ since: new Date(WATCHLIST_STATS_SINCE_MS).toISOString(), total: costBreakdown(closed), traders });
+  });
+
+  // ── System health ──────────────────────────────────────────────────────────
+  // Live parts (feed, loop lag, copy latency) on every call; log tails, DB
+  // size and the ledger row count are cached for 5 minutes.
+  app.get('/api/system', (_req, res) => {
+    const store = readStore();
+    const now = Date.now();
+    const copies = [...store.openTrades, ...store.closedTrades].filter(t => t.copiedTraderSource === 'watchlist');
     res.json({
-      n: e.n,
-      target: TARGET,
-      pThreshold: P_THRESHOLD,
-      netEdgePerTrade: e.expPerTrade,
-      ciLow: e.ciLow,
-      ciHigh: e.ciHigh,
-      tStat: e.tStat,
-      pValue: e.pValue,
-      totalPnl: e.totalPnl,
-      winRate: e.winRate,
-      ready,
-      testStart: new Date(TEST_START_MS).toISOString(),
+      rtds: { ...getRtdsStatus(now), configured: CONFIG.RTDS_ENABLED },
+      loopLag: getLoopLag(),
+      uptimeSec: Math.round(process.uptime()),
+      copyLatency7d: copyLatencyStats(copies, now, 7 * 86_400_000),
+      files: readSystemFiles(now),
     });
   });
 
@@ -1103,86 +1021,13 @@ export function startDashboard(): void {
     res.json({ ok: true, circuitBreaker: getCircuitBreakerStatus() });
   });
 
-  // ── Observation forward-test (copy-disabled watchlist traders) ───────────────
-  // Per-trader stats over the observation ledger: trades simulated with the full
-  // lifecycle but never copied. Same cost-adjusted basis as the active watchlist.
-  // Streaming the whole ledger (550k+ rows) holds the event loop ~9s, which
-  // stalls copying while it runs; the dashboard asks every 30s, so the result
-  // is recomputed at most every 10 minutes.
-  let observationCache: { data: unknown; ts: number } | null = null;
-  app.get('/api/observation', (_req, res) => {
-    if (observationCache && Date.now() - observationCache.ts < 10 * 60_000) {
-      res.json(observationCache.data);
-      return;
-    }
-    const store = readStore();
-    // The ledger is far too large to materialise (300k+ rows), so accumulate
-    // per-trader totals while streaming it out of SQLite. Memory here is
-    // O(traders), not O(trades).
-    type Acc = {
-      openCount: number; closedCount: number; winners: number;
-      netPnl: number; grossWin: number; grossLoss: number;
-      unrealizedPnl: number; entryPriceSum: number;
-      firstTrade: string | null; lastTrade: string | null;
-    };
-    const byTrader = new Map<string, Acc>();
-    for (const t of iterateObservationTrades()) {
-      let a = byTrader.get(t.copiedTrader);
-      if (!a) {
-        a = {
-          openCount: 0, closedCount: 0, winners: 0,
-          netPnl: 0, grossWin: 0, grossLoss: 0,
-          unrealizedPnl: 0, entryPriceSum: 0,
-          firstTrade: null, lastTrade: null,
-        };
-        byTrader.set(t.copiedTrader, a);
-      }
-      const v = tradeCostAdjustedPnl(t);
-      if (t.status === 'open') {
-        a.openCount++;
-        a.unrealizedPnl += v;
-      } else {
-        a.closedCount++;
-        a.netPnl += v;
-        if (v > 0) { a.winners++; a.grossWin += v; } else a.grossLoss += -v;
-        a.entryPriceSum += Number(t.entryPrice) || 0;
-      }
-      // ISO-8601 strings sort lexicographically, so min/max need no parsing.
-      if (a.firstTrade === null || t.timestamp < a.firstTrade) a.firstTrade = t.timestamp;
-      if (a.lastTrade  === null || t.timestamp > a.lastTrade)  a.lastTrade  = t.timestamp;
-    }
-    const items = [...byTrader.entries()].map(([address, a]) => {
-      const w = store.watchlistTraders.find(x => x.address === address);
-      return {
-        address,
-        label: w?.label ?? null,
-        copyEnabled: w?.copyEnabled ?? null,   // null = no longer on watchlist
-        openCount: a.openCount,
-        closedCount: a.closedCount,
-        winRate: a.closedCount >= 3 ? a.winners / a.closedCount : null,
-        profitFactor: (a.closedCount >= 3 && a.grossLoss > 0) ? a.grossWin / a.grossLoss : null,
-        netPnl: a.netPnl,
-        unrealizedPnl: a.unrealizedPnl,
-        avgEntryPrice: a.closedCount > 0 ? a.entryPriceSum / a.closedCount : null,
-        firstTrade: a.firstTrade,
-        lastTrade: a.lastTrade,
-      };
-    })
-      // Only traders currently under observation: removed traders (null) and
-      // copy-enabled ones (their rows are the add-time seed) would mislead.
-      .filter(it => it.copyEnabled === false)
-      .sort((a, b) => b.netPnl - a.netPnl);
-    const data = { count: items.length, items };
-    observationCache = { data, ts: Date.now() };
-    res.json(data);
-  });
-
   // ── Risk metrics ──────────────────────────────────────────────────────────────
   app.get('/api/risk/metrics', (_req, res) => {
     const store = readStore();
     const DAY_MS = 86_400_000;
+    // Same window as the Watchlist Performance panel: copies opened since the reset.
     const closed = store.closedTrades
-      .filter(t => t.copiedTraderSource === 'watchlist' && t.closedAt != null)
+      .filter(t => t.copiedTraderSource === 'watchlist' && t.closedAt != null && openedSinceReset(t))
       .sort((a, b) => new Date(a.closedAt!).getTime() - new Date(b.closedAt!).getTime());
 
     // Equity curve (cost-adjusted) → max drawdown $ and %.
@@ -1246,6 +1091,7 @@ export function startDashboard(): void {
       .sort((a, b) => b.amount - a.amount);
 
     res.json({
+      since: new Date(WATCHLIST_STATS_SINCE_MS).toISOString(),
       closedCount: closed.length,
       maxDrawdownUsd,
       maxDrawdownPct,

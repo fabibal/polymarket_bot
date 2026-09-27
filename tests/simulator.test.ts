@@ -12,7 +12,7 @@ vi.mock('../src/config', () => ({
 }));
 
 import {
-  computeEntryCosts, tradeCostAdjustedPnl, tradeTotalCosts,
+  computeEntryCosts, tradeCostAdjustedPnl, tradeTotalCosts, costBreakdown,
   decideThresholdResolution, isMarketResolved, snapDelistExitPrice, decideDelistExit, isRateLimitError,
 } from '../src/simulator';
 import { SimulatedTrade } from '../src/types';
@@ -311,5 +311,18 @@ describe('isRateLimitError', () => {
     expect(isRateLimitError(new Error('HTTP 404 from https://gamma-api.polymarket.com/markets?slug=x'))).toBe(false);
     expect(isRateLimitError(new Error('No market found for slug: x'))).toBe(false);
     expect(isRateLimitError('HTTP 429')).toBe(false);
+  });
+});
+
+describe('costBreakdown', () => {
+  it('gross minus every cost equals the summed cost-adjusted PnL; open trades are skipped', () => {
+    const a = makeClosedTrade();
+    const b = makeClosedTrade({ id: 'c2', feeRate: 0.05, entryFeeCost: 0.1, exitFeeCost: 0.05, entrySlippageCost: 0.07 });
+    const r = costBreakdown([a, b, makeOpenTrade()]);
+    expect(r.trades).toBe(2);
+    expect(r.gross).toBeCloseTo((a.realizedPnl ?? 0) + (b.realizedPnl ?? 0), 10);
+    expect(r.fees).toBeCloseTo(0.15, 10);
+    expect(r.gross - r.entrySlippage - r.exitSlippage - r.fees - r.gas).toBeCloseTo(r.net, 10);
+    expect(r.net).toBeCloseTo(tradeCostAdjustedPnl(a) + tradeCostAdjustedPnl(b), 10);
   });
 });

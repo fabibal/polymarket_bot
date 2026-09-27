@@ -8,9 +8,9 @@ history and, where they changed behaviour, in `docs/decisions.md`.
 - **Frozen shadow / leaderboard tables.** `shadow_open_trades`,
   `shadow_closed_trades`, `tracked_traders` (excl. the macro-scan writes),
   `excluded_traders` remain on disk as a historical record. The bot never reads
-  or writes them as part of the live loop (exception: the weekly macro scan
-  writes `tracked_traders.falcon_*` columns externally; `/api/discovery/candidates`
-  reads `falconSharpe`). Do NOT re-add CREATE TABLE / migration logic for the
+  or writes them as part of the live loop (the weekly macro scan that wrote
+  `tracked_traders.falcon_*` externally was retired 2026-09-27; nothing reads
+  those columns now). Do NOT re-add CREATE TABLE / migration logic for the
   shadow tables — they were deliberately dropped from startup. Context:
   `docs/decisions.md` "Watchlist-only architecture" + "Final shadow/leaderboard
   cleanup".
@@ -49,6 +49,15 @@ history and, where they changed behaviour, in `docs/decisions.md`.
   6.8% vs the 2% modeled slippage (1,167-trade review 2026-06-10). Taker
   execution is assumed for all PnL; do not model maker fills as free improvement.
   Context: `docs/decisions.md` "Sizing + maker-execution research".
+
+- **Observation rows closed before 2026-09-26 21:00 UTC are partly false.**
+  Until the 429 fix, rate-limited price sweeps marked live markets dead and the
+  observation ledger expired (or snapped to 0/1) positions at stale prices: 109k
+  closes at 15:40 UTC that day alone, and smaller bursts since at least 09-19.
+  The rows were left as they are. The dashboard's observation stats count only
+  rows opened from 21:00 on (`OBSERVATION_STATS_SINCE` in `src/dashboard.ts`);
+  any analysis of `observation_trades` should do the same or skip the bursts.
+  Context: `docs/decisions.md` "Price sweep: HTTP 429 no longer marks markets dead".
 
 ## Operational notes
 

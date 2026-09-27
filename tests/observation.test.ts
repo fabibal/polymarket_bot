@@ -128,3 +128,26 @@ describe('observation ledger: lifecycle', () => {
     expect(s.observationOpenTrades.find(t => t.id === 'o-no')!.sourceNotional).toBeUndefined();
   });
 });
+
+describe('observation ledger: observationClosedStats (SQL aggregate)', () => {
+  it('matches the per-row cost-adjusted PnL, honours the since cut-off and skips open rows', () => {
+    store.addObservationTrade(makeObsTrade({ id: 'w', sourceTradeId: 'sw', marketSlug: 'mw', timestamp: '2026-09-27T01:00:00.000Z' }));
+    store.addObservationTrade(makeObsTrade({ id: 'l', sourceTradeId: 'sl', marketSlug: 'ml', timestamp: '2026-09-27T02:00:00.000Z' }));
+    store.addObservationTrade(makeObsTrade({ id: 'old', sourceTradeId: 'so', marketSlug: 'mo', timestamp: '2026-09-20T00:00:00.000Z' }));
+    store.addObservationTrade(makeObsTrade({ id: 'open', sourceTradeId: 'sp', marketSlug: 'mp', timestamp: '2026-09-27T03:00:00.000Z' }));
+    store.closeObservationTrade('0xobs', 'mw', 'Yes', 0.80);
+    store.closeObservationTrade('0xobs', 'ml', 'Yes', 0.20);
+    store.closeObservationTrade('0xobs', 'mo', 'Yes', 0.90);
+    const rows = [...store.iterateObservationTrades()].filter(t => t.status !== 'open' && t.timestamp >= '2026-09-26T21:00:00.000Z');
+    const expectedNet = rows.reduce((s, t) => s + (t.costAdjustedPnl ?? 0), 0);
+    const r = store.observationClosedStats('0xobs', '2026-09-26T21:00:00.000Z');
+    expect(r.closedCount).toBe(2);
+    expect(r.winners).toBe(1);
+    expect(r.netPnl).toBeCloseTo(expectedNet, 10);
+    expect(r.grossWin - r.grossLoss).toBeCloseTo(expectedNet, 10);
+    expect(r.firstTrade).toBe('2026-09-27T01:00:00.000Z');
+    expect(r.lastTrade).toBe('2026-09-27T02:00:00.000Z');
+    expect(store.observationClosedStats('0xnobody', '2026-01-01T00:00:00.000Z').closedCount).toBe(0);
+    expect(store.observationRowCount()).toBe(4);
+  });
+});

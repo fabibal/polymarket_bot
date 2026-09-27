@@ -1,18 +1,3 @@
-// Row in tracked_traders — written externally by the weekly macro scan,
-// read by /api/discovery/candidates for Falcon enrichment.
-export interface TrackedTrader {
-  rank: number;
-  address: string;
-  username?: string;
-  weeklyPnl: number;
-  totalVolume?: number;
-  inactive?: boolean;   // true if no activity detected in last 30 days
-  falconWinRate?: number;   // Falcon API win rate (0–1 fraction)
-  falconRoi?: number;       // Falcon API ROI (percentage, e.g. 150 = 150%)
-  falconSharpe?: number;    // Falcon API Sharpe ratio
-  trackedSince?: string;    // ISO timestamp of when this trader first entered trackedTraders
-}
-
 export interface ActivityTrade {
   id: string;
   timestamp: string;
@@ -89,6 +74,11 @@ export interface SimulatedTrade {
   // so values < 1 quantify the partial-sell mismatch. Unset when the position
   // lookup failed or the close wasn't a copy-SELL (threshold/expiry/delist).
   sourceSellFraction?: number;
+  // Copy timing (2026-09-27), set on watchlist BUYs: when the bot opened the
+  // copy and which path delivered the trader's fill. copiedAt - timestamp is
+  // the copy latency, including the depth and fee lookups before the entry.
+  copiedAt?: string;
+  copySource?: 'poll' | 'rtds';
   // Orderbook snapshot at fill time. Populated for watchlist BUYs via CLOB
   // /book; depthBackfilled=true if filled in after the fact from current state.
   bestAsk?: number;
@@ -119,9 +109,6 @@ export interface TraderHistory {
 }
 
 export interface TradesStore {
-  // Loaded read-only: the weekly macro scan updates tracked_traders externally
-  // and /api/discovery/candidates reads falconSharpe from it. Never persisted back.
-  trackedTraders: TrackedTrader[];
   openTrades: SimulatedTrade[];
   closedTrades: SimulatedTrade[];
   processedTradeIds: string[];
@@ -135,7 +122,8 @@ export interface TradesStore {
   // IN-MEMORY: open rows ONLY. The closed tail (resolved/expired) grows
   // without bound and loading it all cost ~450MB of heap — the bot OOM-looped
   // on boot once it passed ~300k rows. Consumers that need closed rows must
-  // stream them from SQLite via store.iterateObservationTrades().
+  // aggregate them in SQL (store.observationStats) or stream them from SQLite
+  // via store.iterateObservationTrades().
   observationOpenTrades: SimulatedTrade[];
 }
 

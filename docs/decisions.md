@@ -638,3 +638,82 @@ watchlist (their observation rows stay in the DB), and 0x12d6 was switched to
 observation: its 30d copy PnL was significantly negative (t -2.4) and it fails
 the gate with fees. Its 35 open copies stay open until resolution or the 7-day
 max hold, since its SELLs now go to the observation ledger.
+
+## Dashboard rework after the 2026-09-26 review (2026-09-27, `src/dashboard.ts`, `public/index.html`, `src/forwardtest.ts`, `src/health.ts`, `src/discovery.ts`)
+
+The review found the dashboard slowing the bot and showing stale or wrong numbers.
+
+- **Observation stats no longer block the bot.** `/api/observation` streamed
+  all 550k ledger rows through JS on every 30s refresh, holding the event loop
+  ~9s each time; copies arriving meanwhile waited. Stats are now a SQL
+  aggregate per trader (`observationClosedStats`, new index on
+  `(copied_trader, timestamp)`) for copy-disabled watchlist traders only,
+  merged into `/api/watchlist`. They count rows opened from 2026-09-26 21:00 UTC,
+  since earlier observation closes are contaminated by the 429 bug
+  (KNOWN_ISSUES).
+- **Removed, because they mixed in traders and regimes the bot no longer copies:**
+  - the Test PNL / Test Trades cards (since May 28) and the 0x12d6 Longshot
+    Skips card;
+  - the all-time slug-category panel (42% "other");
+  - the go-live gate (n >= 5000 and p < 0.01 over everything closed since
+    May 28, which is unreachable for low-frequency traders anyway).
+- **Now counted since the panel reset:** Risk metrics, which had been all-time
+  (Sharpe 2.45 came from the April edge).
+- **Traders:** the 2000px table (copy and remove buttons off-screen at 1440px)
+  and the observation table became one card per trader. Each card shows its
+  status, last trade, its ledger since the right start, kill-switch headroom
+  and the copy toggle. One details panel opens below the cards. The FIFO
+  "Hist Win Rate / Best / Worst" rows were dropped (the fake-win-rate trap).
+  The positions rows were relabelled "current book".
+- **New panels:**
+  - **Forward test:** copy ledger vs each trader's backtest, per settled
+    market, with a 90% band (constants in `src/forwardtest.ts`).
+  - **Where the money goes:** gross at trader prices -> entry gap, fees, exit
+    slippage -> net.
+  - **Live readiness:** a checklist with automatic items from the forward test
+    and manual build items.
+  - **Header badges:** RTDS feed status and event-loop lag.
+  - **System health strip:** copy latency (new `copied_at`/`copy_source`
+    columns), Bullpen session, DB size and growth, git-sync, weekly scan,
+    watchdog.
+  - **Weekly discovery:** funnel and backtest reasons from the low-frequency
+    scan's `report.json`.
+- **Fixed:**
+  - The history charts never loaded while nothing had closed since the reset.
+  - The wallet chart counted 466 legacy April rows with no `closed_at` as open
+    (~$2.3k phantom).
+  - The charts pulled the full 5 MB trade history every 30s; `/api/trades` now
+    takes `since` and `limit`.
+  - The container RAM included page cache on cgroup v2 (`inactive_file` is now
+    subtracted, as `docker stats` does).
+  - The mobile header overflowed.
+
+## Falcon macro scan and its key alert retired (2026-09-27, crontab)
+
+`weekly-macro-scan.sh` (Mon 04:00, Falcon 7d/30d leaderboards + 90d scan) had
+produced at most one weak candidate a week. The latest was 5 closed trades at a
+100% win rate, the fake-win-rate trap. The dashboard's parser for its log had
+also broken. The Sunday low-frequency scan covers discovery without Falcon. With
+the macro scan gone, no scheduled job uses the Falcon key, so
+`check-falcon-expiry.sh` would only have asked for a key nobody needs. Both
+cron lines were removed. The scripts stay in the repo and the key stays in
+`.env`. `trader_review.js` / `macro_verify.js` can still use it by hand until it
+expires on 2026-11-13. To restore, re-add the two lines (`0 4 * * 1
+weekly-macro-scan.sh`, `0 9 * * * check-falcon-expiry.sh`).
+
+## Weekly low-frequency scan moved to Sunday 05:30 UTC (2026-09-27, crontab)
+
+The Sunday 05:00 `docker system prune -f` removed the unused `node:20-alpine`
+image at the moment the first scheduled scan started, so the scan had to pull it
+again. It worked, but a prune mid-pull would fail the run. The scan now starts at
+05:30.
+
+## Watchlist: Auto-Obs-0830 and Shadow-Top4 removed (2026-09-27)
+
+Auto-Obs-0830 (0x5268…135d) is a high-frequency bot. On clean observation data
+alone (from 2026-09-26 21:00) it closed 3,806 positions in ~10 hours at PF 0.87,
+-$1,338. It was also the largest source of ledger growth. Shadow-Top4
+(0x507e…beae) was switched off by the kill switch on 2026-07-15 and has not
+traded since. Both were removed through the dashboard API; their rows stay in
+the DB. Auto-Obs-0723 stays: it is the one auto-added trader with a positive
+record, and a silent trader costs nothing.
