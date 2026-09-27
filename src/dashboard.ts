@@ -486,7 +486,9 @@ export function startDashboard(): void {
       const dayStart = new Date(today.getTime() - i * DAY_MS);
       const dayEnd   = dayStart.getTime() + DAY_MS;
       let inUse = 0;
-      for (const t of all) {
+      // Watchlist only: 466 legacy April rows have no closed_at and would
+      // otherwise count as still open (~$2.3k phantom in use).
+      for (const t of watchOnly) {
         const opened = new Date(t.timestamp).getTime();
         if (opened >= dayEnd) continue;
         const amt = Number(t.simulatedAmount ?? CONFIG.TRADE_AMOUNT) || 0;
@@ -1104,7 +1106,15 @@ export function startDashboard(): void {
   // ── Observation forward-test (copy-disabled watchlist traders) ───────────────
   // Per-trader stats over the observation ledger: trades simulated with the full
   // lifecycle but never copied. Same cost-adjusted basis as the active watchlist.
+  // Streaming the whole ledger (550k+ rows) holds the event loop ~9s, which
+  // stalls copying while it runs; the dashboard asks every 30s, so the result
+  // is recomputed at most every 10 minutes.
+  let observationCache: { data: unknown; ts: number } | null = null;
   app.get('/api/observation', (_req, res) => {
+    if (observationCache && Date.now() - observationCache.ts < 10 * 60_000) {
+      res.json(observationCache.data);
+      return;
+    }
     const store = readStore();
     // The ledger is far too large to materialise (300k+ rows), so accumulate
     // per-trader totals while streaming it out of SQLite. Memory here is
@@ -1157,8 +1167,14 @@ export function startDashboard(): void {
         firstTrade: a.firstTrade,
         lastTrade: a.lastTrade,
       };
-    }).sort((a, b) => b.netPnl - a.netPnl);
-    res.json({ count: items.length, items });
+    })
+      // Only traders currently under observation: removed traders (null) and
+      // copy-enabled ones (their rows are the add-time seed) would mislead.
+      .filter(it => it.copyEnabled === false)
+      .sort((a, b) => b.netPnl - a.netPnl);
+    const data = { count: items.length, items };
+    observationCache = { data, ts: Date.now() };
+    res.json(data);
   });
 
   // ── Risk metrics ──────────────────────────────────────────────────────────────

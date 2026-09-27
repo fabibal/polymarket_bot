@@ -2160,6 +2160,13 @@
 
   async function loadWatchlistCharts() {
     if (!wlChartsInitialized) return;
+    // Separate functions: the equity charts return early while there are no
+    // closes since the panel reset, which must not skip the history charts.
+    await loadEquityCharts();
+    await loadHistoryCharts();
+  }
+
+  async function loadEquityCharts() {
     try {
       const res = await fetch('/api/trades?source=watchlist');
       const data = await res.json();
@@ -2244,6 +2251,9 @@
     } catch (e) {
       console.error('[wl-charts] Load failed:', e);
     }
+  }
+
+  async function loadHistoryCharts() {
     try {
       const r = await fetch('/api/watchlist/open-history');
       const d = await r.json();
