@@ -15,7 +15,7 @@ import type { RawActivityItem } from './bullpen';
 
 const RTDS_URL = 'wss://ws-live-data.polymarket.com';
 const PING_MS = 10_000;          // server drops idle clients; it expects a text PING
-const STALE_MS = 60_000;         // a live firehose is never silent this long
+const STALE_MS = 20_000;         // ~27 msg/s (and a PONG every 10s): 20s of silence is a dead socket
 const MAX_BACKOFF_MS = 60_000;
 const STATS_EVERY_MS = 30 * 60_000;
 const RATE_WINDOW_S = 60;
@@ -144,7 +144,7 @@ export function startRtds(
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = setInterval(() => {
         if (Date.now() - lastMsgAt > STALE_MS) {
-          console.warn('[rtds] feed silent for 60s — reconnecting');
+          console.warn(`[rtds] feed silent for ${STALE_MS / 1000}s — reconnecting`);
           sock.terminate();
           return;
         }

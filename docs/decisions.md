@@ -717,3 +717,12 @@ alone (from 2026-09-26 21:00) it closed 3,806 positions in ~10 hours at PF 0.87,
 traded since. Both were removed through the dashboard API; their rows stay in
 the DB. Auto-Obs-0723 stays: it is the one auto-added trader with a positive
 record, and a silent trader costs nothing.
+
+## RTDS stale-feed threshold 60s -> 20s (2026-09-29, `src/rtds.ts`)
+
+Over 49 hours the socket went silent and reconnected 73 times (~1.7 per hour,
+not periodic). At a 60s threshold each stall left up to a minute where only the
+data-api poll delivered trades, which is why copy latency p90 was 46s and 29% of
+copies came from the poll. The feed carries ~27 msg/s plus a PONG every 10s, so
+20s of silence is a dead socket; reconnecting sooner cuts the blind window to a
+third. The poll stays as the backfill either way.
