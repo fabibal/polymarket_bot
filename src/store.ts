@@ -737,7 +737,11 @@ function applyExitCosts(trade: SimulatedTrade, exitPrice: number): void {
   const shares = trade.simulatedShares;
   const gas    = trade.entryGasCost      ?? CONFIG.GAS_COST_PER_BUY;
   const eSlip  = trade.entrySlippageCost ?? CONFIG.SLIPPAGE_RATE * trade.entryPrice * shares;
-  const xSlip  = CONFIG.SLIPPAGE_RATE * exitPrice * shares;
+  // A resolution payout (exit exactly 1; at 0 the formula is already 0) is redeemed,
+  // not sold into the book, so it carries no exit slippage. Real sells (copy-SELL,
+  // expiry at the last price) still pay it. Same rule as the backtest, where
+  // redemption is free (2026-10-01).
+  const xSlip  = exitPrice >= 1 ? 0 : CONFIG.SLIPPAGE_RATE * exitPrice * shares;
   // Exit fee at the exit price: zero for 0/1 resolution payouts by formula.
   const eFee   = trade.entryFeeCost ?? 0;
   const xFee   = takerFeeCost(trade.feeRate, exitPrice, shares);

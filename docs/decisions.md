@@ -726,3 +726,15 @@ data-api poll delivered trades, which is why copy latency p90 was 46s and 29% of
 copies came from the poll. The feed carries ~27 msg/s plus a PONG every 10s, so
 20s of silence is a dead socket; reconnecting sooner cuts the blind window to a
 third. The poll stays as the backfill either way.
+
+## No exit slippage on resolution payouts (2026-10-01, `src/store.ts` applyExitCosts)
+
+The sim charged the 2% exit slippage on every close, including positions that
+simply resolved at 1 and were redeemed: 11 of the first 16 closes of the
+LowFreq traders, $1.37 of $15.92 gross (about 14% of net). Redemption is not a
+sale into the book and has no slippage, and the backtest already treats it as
+free, so the forward test was comparing against a cheaper model than it ran.
+An exit price of exactly 1 now carries no exit slippage (at 0 the formula was
+already 0). Copy-SELLs and expiries at the last price still pay it. Closes
+before 2026-10-01 keep their stored values; the cost-adjusted PnL regime
+changes at this date.

@@ -222,3 +222,18 @@ describe('store: copy timing columns', () => {
     expect(closed.copySource).toBe('rtds');
   });
 });
+
+describe('store: exit slippage on resolution', () => {
+  it('a payout at exactly 1 is redeemed (no exit slippage); a real sell still pays 2%', () => {
+    store.addOpenTrade(makeTrade({ id: 'x-win', sourceTradeId: 'x-win', marketSlug: 'm-win' }));
+    store.addOpenTrade(makeTrade({ id: 'x-sell', sourceTradeId: 'x-sell', marketSlug: 'm-sell' }));
+    store.resolveByPrice([{ id: 'x-win', exitPrice: 1 }]);
+    store.closeOpenTrade('0xabc', 'm-sell', 'Yes', 0.80);
+    const closed = store.readStore().closedTrades;
+    const win = closed.find(t => t.id === 'x-win')!;
+    const sell = closed.find(t => t.id === 'x-sell')!;
+    expect(win.exitSlippageCost).toBe(0);
+    expect(win.costAdjustedPnl).toBeCloseTo((win.realizedPnl ?? 0) - (win.entrySlippageCost ?? 0), 10);
+    expect(sell.exitSlippageCost).toBeCloseTo(0.02 * 0.80 * sell.simulatedShares, 10);
+  });
+});
