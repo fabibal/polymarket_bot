@@ -434,6 +434,9 @@
       transition: border-color var(--dur-fast) var(--ease);
     }
     .chart-card:hover { border-color: var(--border-strong); }
+    /* Grid items default to min-width:auto, so a wide table (the per-trader cost table)
+       would stretch the column past the viewport instead of scrolling inside its card. */
+    .charts-grid > * { min-width: 0; }
     .chart-card-title {
       font-size: 10px;
       font-weight: 600;
@@ -594,6 +597,7 @@
       .cstat-card { white-space: normal; height: auto; flex-wrap: wrap; row-gap: 2px; padding: 6px 10px; max-width: 100%; }
       .cstat-meta { flex-basis: 100%; }
       #health-strip { padding: 8px 16px; }
+      .hchip { white-space: normal; max-width: 100%; }
       .ready-item { flex-wrap: wrap; }
       .ready-item .rd { flex-basis: 100%; text-align: left; padding-left: 28px; }
       .ft-grid, .trader-grid { grid-template-columns: 1fr; }
