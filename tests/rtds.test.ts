@@ -33,7 +33,7 @@ vi.mock('../src/bullpen', () => ({
 }));
 
 import { pollTrader, processRealtimeTrade } from '../src/monitor';
-import { rtdsPayloadToActivity, countFeedMessage, getRtdsStatus, _resetFeedStatusForTests } from '../src/rtds';
+import { rtdsPayloadToActivity, countFeedMessage, getRtdsStatus, _resetFeedStatusForTests, makeFillDeduper } from '../src/rtds';
 import * as store from '../src/store';
 
 let txSeq = 0;
@@ -128,5 +128,27 @@ describe('feed status', () => {
     // 30s later only the last 30 seconds of traffic are inside the window
     expect(getRtdsStatus(t0 + 89_500).msgsPerSec).toBeCloseTo(15, 10);
     expect(getRtdsStatus(t0 + 89_500).lastMessageAgoMs).toBe(89_500 - 59_029);
+  });
+});
+
+describe('parallel connections', () => {
+  it('the first copy of a fill wins; a different fill in the same tx still passes', () => {
+    const first = makeFillDeduper(3);
+    expect(first('w|tx1|m|Yes|BUY|10|0.5')).toBe(true);
+    expect(first('w|tx1|m|Yes|BUY|10|0.5')).toBe(false);  // same fill from the second socket
+    expect(first('w|tx1|m|Yes|BUY|4|0.51')).toBe(true);   // another fill in the same tx
+    first('a'); first('b');                               // limit 3: the oldest key is evicted
+    expect(first('w|tx1|m|Yes|BUY|10|0.5')).toBe(true);
+  });
+
+  it('status aggregates the connections: newest message, busiest rate', () => {
+    _resetFeedStatusForTests();
+    const t0 = Date.parse('2026-10-04T00:00:00Z');
+    for (let s = 0; s < 60; s++) for (let k = 0; k < 30; k++) countFeedMessage(t0 + s * 1000 + k, 0);
+    countFeedMessage(t0 + 10_000, 1);   // second socket stalled after 10s
+    const st = getRtdsStatus(t0 + 59_500);
+    expect(st.connections).toBe(2);
+    expect(st.msgsPerSec).toBeCloseTo(30, 10);
+    expect(st.lastMessageAgoMs).toBe(59_500 - 59_029);
   });
 });

@@ -1702,7 +1702,7 @@
       const fb = $('feed-badge'), fl = $('feed-label');
       if (!f.configured) { fb.className = 'vpn-badge vpn-unknown'; fl.textContent = 'FEED OFF · poll only'; }
       else if (f.connected && f.lastMessageAgoMs != null && f.lastMessageAgoMs < 30_000) {
-        fb.className = 'vpn-badge vpn-ok'; fl.textContent = `FEED LIVE · ${Math.round(f.msgsPerSec)} msg/s`;
+        fb.className = 'vpn-badge vpn-ok'; fl.textContent = `FEED LIVE ${f.connectedCount}/${f.connections} · ${Math.round(f.msgsPerSec)} msg/s`;
       } else {
         // Degraded, not broken: the data-api poll still copies every trade (~30s later).
         fb.className = 'vpn-badge vpn-warn'; fl.textContent = f.connected ? 'FEED STALLED · poll only' : 'FEED DOWN · poll only';

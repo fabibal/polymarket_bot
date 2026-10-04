@@ -160,6 +160,8 @@ async function main(): Promise<void> {
           }
         }).catch(err => console.error(`[rtds] processing failed for ${wallet.slice(0, 10)}...:`, err instanceof Error ? err.message : err));
       },
+      // Two sockets: each stalls ~2.5x an hour, rarely both at once (2026-10-04).
+      2,
     );
   }
 }

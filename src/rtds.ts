@@ -20,57 +20,92 @@ const MAX_BACKOFF_MS = 60_000;
 const STATS_EVERY_MS = 30 * 60_000;
 const RATE_WINDOW_S = 60;
 
-// Feed status for the dashboard header. Module-level: one feed per process.
-const feed = {
-  enabled: false,
-  connected: false,
-  connectedSince: null as number | null,
-  lastMessageAt: null as number | null,
-  watchedTrades: 0,
-  reconnects: 0,
+// Feed status for the dashboard header, one entry per parallel connection.
+interface FeedState {
+  connected: boolean;
+  connectedSince: number | null;
+  lastMessageAt: number | null;
+  reconnects: number;
   // Per-second message counts over the last RATE_WINDOW_S seconds (ring).
-  counts: new Array<number>(RATE_WINDOW_S).fill(0),
-  secs: new Array<number>(RATE_WINDOW_S).fill(-1),
-};
+  counts: number[];
+  secs: number[];
+}
+const newFeed = (): FeedState => ({
+  connected: false, connectedSince: null, lastMessageAt: null, reconnects: 0,
+  counts: new Array<number>(RATE_WINDOW_S).fill(0), secs: new Array<number>(RATE_WINDOW_S).fill(-1),
+});
+let feeds: FeedState[] = [];
+let enabled = false;
+let watchedTrades = 0;
 
-export function _resetFeedStatusForTests(): void {
-  feed.enabled = false; feed.connected = false; feed.connectedSince = null;
-  feed.lastMessageAt = null; feed.watchedTrades = 0; feed.reconnects = 0;
-  feed.counts.fill(0); feed.secs.fill(-1);
+function feedAt(conn: number): FeedState {
+  while (feeds.length <= conn) feeds.push(newFeed());
+  return feeds[conn];
 }
 
-export function countFeedMessage(nowMs: number): void {
-  feed.lastMessageAt = nowMs;
+export function _resetFeedStatusForTests(): void {
+  feeds = []; enabled = false; watchedTrades = 0;
+}
+
+export function countFeedMessage(nowMs: number, conn = 0): void {
+  const f = feedAt(conn);
+  f.lastMessageAt = nowMs;
   const sec = Math.floor(nowMs / 1000);
   const i = sec % RATE_WINDOW_S;
-  if (feed.secs[i] !== sec) { feed.secs[i] = sec; feed.counts[i] = 0; }
-  feed.counts[i]++;
+  if (f.secs[i] !== sec) { f.secs[i] = sec; f.counts[i] = 0; }
+  f.counts[i]++;
+}
+
+function rateOf(f: FeedState, nowSec: number): number {
+  let n = 0;
+  for (let i = 0; i < RATE_WINDOW_S; i++) {
+    if (f.secs[i] > nowSec - RATE_WINDOW_S && f.secs[i] <= nowSec) n += f.counts[i];
+  }
+  return n / RATE_WINDOW_S;
 }
 
 export interface RtdsStatus {
   enabled: boolean;
-  connected: boolean;
+  connected: boolean;          // at least one connection is up
+  connections: number;
+  connectedCount: number;
   connectedSince: string | null;
-  lastMessageAgoMs: number | null;
-  msgsPerSec: number;       // mean over the last minute
-  watchedTrades: number;    // since process start
-  reconnects: number;       // since process start
+  lastMessageAgoMs: number | null;  // newest message on any connection
+  msgsPerSec: number;          // busiest connection, mean over the last minute
+  watchedTrades: number;       // since process start, after de-duplication
+  reconnects: number;          // all connections, since process start
 }
 
 export function getRtdsStatus(nowMs: number = Date.now()): RtdsStatus {
   const nowSec = Math.floor(nowMs / 1000);
-  let n = 0;
-  for (let i = 0; i < RATE_WINDOW_S; i++) {
-    if (feed.secs[i] > nowSec - RATE_WINDOW_S && feed.secs[i] <= nowSec) n += feed.counts[i];
-  }
+  const up = feeds.filter(f => f.connected);
+  const last = Math.max(-Infinity, ...feeds.map(f => f.lastMessageAt ?? -Infinity));
+  const since = Math.min(Infinity, ...up.map(f => f.connectedSince ?? Infinity));
   return {
-    enabled: feed.enabled,
-    connected: feed.connected,
-    connectedSince: feed.connectedSince != null ? new Date(feed.connectedSince).toISOString() : null,
-    lastMessageAgoMs: feed.lastMessageAt != null ? nowMs - feed.lastMessageAt : null,
-    msgsPerSec: n / RATE_WINDOW_S,
-    watchedTrades: feed.watchedTrades,
-    reconnects: feed.reconnects,
+    enabled,
+    connected: up.length > 0,
+    connections: feeds.length,
+    connectedCount: up.length,
+    connectedSince: Number.isFinite(since) ? new Date(since).toISOString() : null,
+    lastMessageAgoMs: Number.isFinite(last) ? nowMs - last : null,
+    msgsPerSec: Math.max(0, ...feeds.map(f => rateOf(f, nowSec))),
+    watchedTrades,
+    reconnects: feeds.reduce((s, f) => s + f.reconnects, 0),
+  };
+}
+
+/**
+ * Every connection receives every trade, so the first copy wins. The key is the
+ * whole fill (two fills in one transaction differ in size or price), kept for
+ * the last `limit` fills.
+ */
+export function makeFillDeduper(limit = 5_000): (key: string) => boolean {
+  const seen = new Set<string>();
+  return key => {
+    if (seen.has(key)) return false;
+    seen.add(key);
+    if (seen.size > limit) seen.delete(seen.values().next().value as string);
+    return true;
   };
 }
 
@@ -99,14 +134,40 @@ export function rtdsPayloadToActivity(p: Record<string, unknown>): RawActivityIt
 }
 
 /**
- * Connects and keeps reconnecting (exponential backoff) until the returned
- * stop function is called. `isWatched` gets the lowercase wallet of every
- * trade; `onTrade` is called for the watched ones.
+ * Opens `connections` independent sockets and keeps each reconnecting
+ * (exponential backoff) until the returned stop function is called. The socket
+ * stalls ~2.5 times an hour; while one is silent the others keep delivering,
+ * instead of the trade waiting ~30s for the data-api poll. `isWatched` gets the
+ * lowercase wallet of every trade; `onTrade` is called once per watched fill.
  */
 export function startRtds(
   isWatched: (wallet: string) => boolean,
   onTrade: (wallet: string, item: RawActivityItem) => void,
+  connections = 1,
 ): () => void {
+  const firstSight = makeFillDeduper();
+  const stops: Array<() => void> = [];
+  enabled = true;
+  for (let i = 0; i < connections; i++) {
+    stops.push(startConnection(i, connections > 1 ? `[rtds#${i + 1}]` : '[rtds]', isWatched, (wallet, item, key) => {
+      if (!firstSight(key)) return;
+      watchedTrades++;
+      onTrade(wallet, item);
+    }));
+  }
+  return () => {
+    enabled = false;
+    for (const stop of stops) stop();
+  };
+}
+
+function startConnection(
+  conn: number,
+  tag: string,
+  isWatched: (wallet: string) => boolean,
+  onTrade: (wallet: string, item: RawActivityItem, key: string) => void,
+): () => void {
+  const feed = feedAt(conn);
   let ws: WebSocket | null = null;
   let stopped = false;
   let backoffMs = 1_000;
@@ -114,10 +175,9 @@ export function startRtds(
   let pingTimer: NodeJS.Timeout | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   const stats = { msgs: 0, matched: 0, reconnects: 0 };
-  feed.enabled = true;
 
   const statsTimer = setInterval(() => {
-    console.log(`[rtds] last ${STATS_EVERY_MS / 60_000}m: ${stats.msgs} msgs, ${stats.matched} watched trades, ${stats.reconnects} reconnects`);
+    console.log(`${tag} last ${STATS_EVERY_MS / 60_000}m: ${stats.msgs} msgs, ${stats.matched} watched trades, ${stats.reconnects} reconnects`);
     stats.msgs = 0; stats.matched = 0; stats.reconnects = 0;
   }, STATS_EVERY_MS);
   statsTimer.unref();
@@ -138,13 +198,13 @@ export function startRtds(
 
     sock.on('open', () => {
       sock.send(JSON.stringify({ action: 'subscribe', subscriptions: [{ topic: 'activity', type: 'trades' }] }));
-      console.log('[rtds] connected');
+      console.log(`${tag} connected`);
       feed.connected = true;
       feed.connectedSince = Date.now();
       if (pingTimer) clearInterval(pingTimer);
       pingTimer = setInterval(() => {
         if (Date.now() - lastMsgAt > STALE_MS) {
-          console.warn(`[rtds] feed silent for ${STALE_MS / 1000}s — reconnecting`);
+          console.warn(`${tag} feed silent for ${STALE_MS / 1000}s — reconnecting`);
           sock.terminate();
           return;
         }
@@ -156,7 +216,7 @@ export function startRtds(
       lastMsgAt = Date.now();
       backoffMs = 1_000; // a delivering connection resets the backoff
       stats.msgs++;
-      countFeedMessage(lastMsgAt);
+      countFeedMessage(lastMsgAt, conn);
       let payload: Record<string, unknown> | undefined;
       try { payload = JSON.parse(data.toString()).payload; } catch { return; } // PONGs etc.
       if (!payload || typeof payload.proxyWallet !== 'string') return;
@@ -165,21 +225,21 @@ export function startRtds(
       const item = rtdsPayloadToActivity(payload);
       if (!item) return;
       stats.matched++;
-      feed.watchedTrades++;
-      onTrade(wallet, item);
+      const key = [wallet, item.transaction_hash, item.slug, item.outcome, item.side, item.size, item.price].join('|');
+      onTrade(wallet, item, key);
     });
 
     sock.on('close', () => {
       if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
       if (ws === sock) { ws = null; feed.connected = false; }
       if (!stopped) {
-        console.warn(`[rtds] disconnected — reconnecting in ${backoffMs / 1000}s (data-api polling continues)`);
+        console.warn(`${tag} disconnected — reconnecting in ${backoffMs / 1000}s (data-api polling continues)`);
         scheduleReconnect();
       }
     });
 
     sock.on('error', err => {
-      console.warn('[rtds] socket error:', err.message);
+      console.warn(`${tag} socket error:`, err.message);
       // 'close' follows 'error' and handles the reconnect.
     });
   };
@@ -188,7 +248,6 @@ export function startRtds(
 
   return () => {
     stopped = true;
-    feed.enabled = false;
     feed.connected = false;
     clearInterval(statsTimer);
     if (pingTimer) clearInterval(pingTimer);

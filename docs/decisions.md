@@ -738,3 +738,15 @@ An exit price of exactly 1 now carries no exit slippage (at 0 the formula was
 already 0). Copy-SELLs and expiries at the last price still pay it. Closes
 before 2026-10-01 keep their stored values; the cost-adjusted PnL regime
 changes at this date.
+
+## Two parallel RTDS sockets (2026-10-04, `src/rtds.ts`, `src/index.ts`)
+
+Even with the 20s stale threshold the socket stalled ~2.5 times an hour (206
+reconnects in 82h), and 24% of copies still arrived through the data-api poll
+~38s late. Those late copies paid a 6.5-cent entry gap on average against 1.5
+cents for the 1-2s copies: about $3 of the $5 entry cost on the first 26 copies.
+The bot now keeps two independent sockets. A fill reaches `onTrade` once (keyed
+on wallet, tx, market, outcome, side, size and price), so the second copy is
+dropped before the processing lock. The poll stays as the backfill. Reading
+Polygon directly was considered and rejected: it would save ~1s on copies that
+already pay mostly the spread, at 1-2 days of work.
