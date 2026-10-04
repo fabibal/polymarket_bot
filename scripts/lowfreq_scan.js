@@ -133,9 +133,17 @@ async function loadExclusions() {
   const dir = '/app/data/backups';
   const f = fs.readdirSync(dir).filter(x => /^store-\d{4}-\d{2}-\d{2}\.db$/.test(x)).sort().pop();
   if (f) {
-    const db = new Database(path.join(dir, f), { readonly: true, fileMustExist: true });
-    for (const r of db.prepare('SELECT address FROM excluded_traders').all()) skip.add(r.address.toLowerCase());
-    db.close();
+    // Backups are WAL-mode: even a readonly open must create a -shm next to the
+    // file, which fails on the :ro /app mount. Open a scratch copy in WORK instead.
+    const tmp = path.join(WORK, 'exclusions.db');
+    fs.copyFileSync(path.join(dir, f), tmp);
+    try {
+      const db = new Database(tmp, { readonly: true, fileMustExist: true });
+      for (const r of db.prepare('SELECT address FROM excluded_traders').all()) skip.add(r.address.toLowerCase());
+      db.close();
+    } finally {
+      for (const s of ['', '-shm', '-wal']) fs.rmSync(tmp + s, { force: true });
+    }
   }
   return { skip, watchlist: wl.items || [] };
 }
