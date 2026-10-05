@@ -275,6 +275,37 @@ export async function getMarketFeeRate(slug: string): Promise<number | null> {
   }
 }
 
+export interface TokenMarket { slug: string; title: string; outcome: string }
+const tokenMarketCache = new Map<string, TokenMarket>();
+
+/**
+ * Market slug, title and outcome name of a CLOB token id (on-chain fills carry
+ * only the token id). Gamma `clob_token_ids` lookup with a closed=true retry;
+ * token ids never change, so hits are cached. null on any failure.
+ */
+export async function getMarketByTokenId(tokenId: string): Promise<TokenMarket | null> {
+  const cached = tokenMarketCache.get(tokenId);
+  if (cached) return cached;
+  try {
+    let data = await httpsGet(`${GAMMA_BASE}/markets?clob_token_ids=${tokenId}`) as unknown[];
+    if (!Array.isArray(data) || data.length === 0) {
+      data = await httpsGet(`${GAMMA_BASE}/markets?clob_token_ids=${tokenId}&closed=true`) as unknown[];
+    }
+    if (!Array.isArray(data) || data.length === 0) return null;
+    const m = data[0] as { slug?: string; question?: string; outcomes?: string; clobTokenIds?: string };
+    const ids = JSON.parse(m.clobTokenIds ?? '[]') as string[];
+    const outcomes = JSON.parse(m.outcomes ?? '[]') as string[];
+    const i = ids.indexOf(tokenId);
+    if (!m.slug || i < 0 || !outcomes[i]) return null;
+    const out = { slug: m.slug, title: m.question ?? m.slug, outcome: outcomes[i] };
+    if (tokenMarketCache.size > 5000) tokenMarketCache.clear();
+    tokenMarketCache.set(tokenId, out);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Trader's remaining token balance for one (market, outcome) via the data-api
  * /positions endpoint, filtered server-side by conditionId (Gamma slug lookup,

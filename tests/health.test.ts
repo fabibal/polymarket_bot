@@ -35,11 +35,12 @@ describe('copyLatencyStats', () => {
     expect(r.n).toBe(3);
     expect(r.medianMs).toBe(2000);
     expect(r.p90Ms).toBe(30_000);
-    expect(r.rtdsShare).toBeCloseTo(2 / 3, 10);
+    expect(r.pushShare).toBeCloseTo(2 / 3, 10);
+    expect(r.bySource).toEqual({ rtds: 2, poll: 1 });
   });
 
   it('empty when nothing qualifies', () => {
-    expect(copyLatencyStats([], now, 1000)).toEqual({ n: 0, medianMs: null, p90Ms: null, rtdsShare: null });
+    expect(copyLatencyStats([], now, 1000)).toEqual({ n: 0, medianMs: null, p90Ms: null, pushShare: null, bySource: {} });
   });
 });
 

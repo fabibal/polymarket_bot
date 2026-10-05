@@ -152,3 +152,16 @@ describe('parallel connections', () => {
     expect(st.lastMessageAgoMs).toBe(59_500 - 59_029);
   });
 });
+
+describe('chain source', () => {
+  it('a chain-delivered trade is tagged chain; the later poll and RTDS copies of the tx are deduped', async () => {
+    const t = item();
+    expect(await processRealtimeTrade({ address: TRADER }, t, opts, 'chain')).toBe(1);
+    expect(await processRealtimeTrade({ address: TRADER }, t, opts, 'rtds')).toBe(0);
+    activityFeed.mockResolvedValue([t]);
+    expect(await pollTrader({ address: TRADER }, opts)).toBe(0);
+    const open = store.readStore().openTrades;
+    expect(open.length).toBe(1);
+    expect(open[0].copySource).toBe('chain');
+  });
+});

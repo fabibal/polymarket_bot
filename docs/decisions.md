@@ -750,3 +750,36 @@ on wallet, tx, market, outcome, side, size and price), so the second copy is
 dropped before the processing lock. The poll stays as the backfill. Reading
 Polygon directly was considered and rejected: it would save ~1s on copies that
 already pay mostly the spread, at 1-2 days of work.
+
+## Polygon chain feed as a third trade source (2026-10-05, `src/chainfeed.ts`)
+
+**Supersedes** the 2026-10-04 rejection of on-chain reading in "Two parallel RTDS
+sockets". After the second socket, 3 of 10 copies still came through the ~50s
+poll with both sockets up. Every poll-delivered copy since 09-27 traced back
+to a news burst:
+- all 4 fills at the Fed decision;
+- all 3 at the 2026-10-05 14:00 ISM release.
+
+These were taker fills on both negRisk and binary markets. RTDS dropped them
+on every socket, and they are the costliest copies because prices move
+fastest then. A block lands regardless of exchange load.
+
+The bot now subscribes to `OrderFilled` logs of Polymarket's two exchange
+contracts (`0xe1111800…` binary, `0xe2222d27…` negRisk) through
+`wss://polygon-bor-rpc.publicnode.com`:
+- topic-filtered to the copy-enabled wallets as order maker (topic 2), which
+  covers their taker orders and their resting orders;
+- token id mapped to slug and outcome via Gamma `clob_token_ids` (cached);
+- block time from `eth_getBlockByNumber`.
+
+The same `processActivity` handles the trade, tagged `copy_source = 'chain'`;
+the tx-hash dedup keeps whichever source is first, and only the poll moves the
+cursor. A 30s `eth_blockNumber` heartbeat detects a dead socket; removed
+(reorged) logs are ignored.
+
+Decoding was verified against data-api fills:
+- 6 sampled BUY/SELL fills on both contracts;
+- a 2-minute live run on two active wallets caught 15/15 data-api fills with
+  identical slug/outcome/side/price at ~0s lag.
+
+Observation traders stay on RTDS + poll. `CHAIN_FEED_ENABLED=false` turns it off.

@@ -2,10 +2,11 @@ import { pollTrader, processRealtimeTrade, resetSkipDedup } from './monitor';
 import { updatePrices } from './simulator';
 import { startDashboard } from './dashboard';
 import { readStore, runDailyCleanup, startWalCheckpoint, stopWalCheckpoint, initInsertionCounter, updateOpenTradeDepth } from './store';
-import { getOrderbookDepth } from './bullpen';
+import { getOrderbookDepth, getMarketByTokenId, RawActivityItem } from './bullpen';
 import { CONFIG } from './config';
 import { isCircuitBreakerActive, checkCircuitBreaker, checkTraderDecay } from './risk';
 import { startRtds } from './rtds';
+import { startChainFeed } from './chainfeed';
 import { startLoopMonitor } from './health';
 
 /**
@@ -143,25 +144,40 @@ async function main(): Promise<void> {
   // Real-time trade feed: a watched wallet's trade is processed ~1s after the
   // fill instead of after the data-api index catches up (~20-35s). The poll
   // above keeps running as the backfill for anything the socket misses.
+  // Push sources share one handler: the trade goes through the same processing
+  // as a polled one, tagged with its source.
+  const onPushedTrade = (source: 'rtds' | 'chain') => (wallet: string, item: RawActivityItem) => {
+    const w = readStore().watchlistTraders.find(x => x.address === wallet);
+    if (!w) return;
+    processRealtimeTrade({ address: w.address }, item, {
+      copyEnabled: w.copyEnabled,
+      tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT,
+      suspended: isCircuitBreakerActive(),
+    }, source).then(n => {
+      if (n > 0 && w.copyEnabled) {
+        const lagS = (Date.now() - Date.parse(String(item.timestamp))) / 1000;
+        console.log(`[${source}] ${w.label ?? w.address.slice(0, 10)} ${item.side} ${item.slug} processed ${lagS.toFixed(1)}s after the fill`);
+      }
+    }).catch(err => console.error(`[${source}] processing failed for ${wallet.slice(0, 10)}...:`, err instanceof Error ? err.message : err));
+  };
+
   if (CONFIG.RTDS_ENABLED) {
     startRtds(
       wallet => readStore().watchlistTraders.some(w => w.address === wallet),
-      (wallet, item) => {
-        const w = readStore().watchlistTraders.find(x => x.address === wallet);
-        if (!w) return;
-        processRealtimeTrade({ address: w.address }, item, {
-          copyEnabled: w.copyEnabled,
-          tradeAmount: w.copyAmount ?? CONFIG.TRADE_AMOUNT,
-          suspended: isCircuitBreakerActive(),
-        }).then(n => {
-          if (n > 0 && w.copyEnabled) {
-            const lagS = (Date.now() - Date.parse(String(item.timestamp))) / 1000;
-            console.log(`[rtds] ${w.label ?? w.address.slice(0, 10)} ${item.side} ${item.slug} processed ${lagS.toFixed(1)}s after the fill`);
-          }
-        }).catch(err => console.error(`[rtds] processing failed for ${wallet.slice(0, 10)}...:`, err instanceof Error ? err.message : err));
-      },
+      onPushedTrade('rtds'),
       // Two sockets: each stalls ~2.5x an hour, rarely both at once (2026-10-04).
       2,
+    );
+  }
+
+  // Polygon OrderFilled logs of the copy-enabled wallets: catches the news-burst
+  // fills RTDS drops on every socket (2026-10-05). Observation traders stay on
+  // RTDS + poll; their timing does not matter.
+  if (CONFIG.CHAIN_FEED_ENABLED) {
+    startChainFeed(
+      () => readStore().watchlistTraders.filter(w => w.copyEnabled).map(w => w.address),
+      onPushedTrade('chain'),
+      getMarketByTokenId,
     );
   }
 }

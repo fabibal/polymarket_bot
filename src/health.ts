@@ -51,7 +51,8 @@ export interface CopyLatency {
   n: number;
   medianMs: number | null;
   p90Ms: number | null;
-  rtdsShare: number | null;  // fraction of copies delivered by the RTDS socket
+  pushShare: number | null;  // fraction delivered by a push source (RTDS or chain), not the poll
+  bySource: Record<string, number>;
 }
 
 function percentile(sorted: number[], q: number): number {
@@ -62,18 +63,20 @@ function percentile(sorted: number[], q: number): number {
 /** Trader fill -> copy opened, over copies opened in the last `windowMs`. */
 export function copyLatencyStats(trades: SimulatedTrade[], nowMs: number, windowMs: number): CopyLatency {
   const lat: number[] = [];
-  let rtds = 0;
+  const bySource: Record<string, number> = {};
   for (const t of trades) {
     if (!t.copiedAt) continue;
     const copied = Date.parse(t.copiedAt);
     const filled = Date.parse(t.timestamp);
     if (!Number.isFinite(copied) || !Number.isFinite(filled) || nowMs - copied > windowMs) continue;
     lat.push(Math.max(0, copied - filled));
-    if (t.copySource === 'rtds') rtds++;
+    const src = t.copySource ?? 'unknown';
+    bySource[src] = (bySource[src] ?? 0) + 1;
   }
-  if (lat.length === 0) return { n: 0, medianMs: null, p90Ms: null, rtdsShare: null };
+  if (lat.length === 0) return { n: 0, medianMs: null, p90Ms: null, pushShare: null, bySource };
   lat.sort((a, b) => a - b);
-  return { n: lat.length, medianMs: percentile(lat, 0.5), p90Ms: percentile(lat, 0.9), rtdsShare: rtds / lat.length };
+  const pushed = (bySource.rtds ?? 0) + (bySource.chain ?? 0);
+  return { n: lat.length, medianMs: percentile(lat, 0.5), p90Ms: percentile(lat, 0.9), pushShare: pushed / lat.length, bySource };
 }
 
 // ── Cron status lines ───────────────────────────────────────────────────────

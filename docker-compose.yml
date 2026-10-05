@@ -79,6 +79,7 @@ services:
       - BULLPEN_HOME=/home/node/.bullpen     # explicit; matches the mount above
       - POLL_INTERVAL_MS=30000          # 30 seconds
       - RTDS_ENABLED=true               # real-time trade socket (~1s); false = data-api polling only
+      - CHAIN_FEED_ENABLED=true         # Polygon fill logs of copied wallets (~2s, catches RTDS news-burst drops); false = off
       - PRICE_UPDATE_INTERVAL_MS=300000 # 5 minutes
       # Entry-filter + leaderboard env vars removed 2026-05-29 (watchlist-only — they were
       # inert no-ops): LEADERBOARD_REFRESH_MS, AUTO_EXCLUDE_WIN_RATE_THRESHOLD, MIN_PRICE,

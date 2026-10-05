@@ -85,28 +85,32 @@ export async function pollTrader(trader: TraderRef, options: CopyOptions = {}): 
 
   const items = Array.isArray(response) ? response : [];
   if (items.length === 0) return 0;
-  return withProcessingLock(() => processActivity(trader, items, options, since, true));
+  return withProcessingLock(() => processActivity(trader, items, options, since, 'poll'));
 }
 
 /**
- * RTDS push path: a trade seen on the real-time socket, processed exactly like
- * a polled one. It never moves the data-api cursor — only the poll does — so a
- * trade the socket missed is still picked up by the next poll, and the poll's
- * later copy of this trade is dropped by the processedTradeIds dedup.
+ * Push path (RTDS socket or the Polygon chain feed): a trade processed exactly
+ * like a polled one. It never moves the data-api cursor — only the poll does —
+ * so a trade a push source missed is still picked up by the next poll, and any
+ * later copy of the same trade (same tx hash) is dropped by the
+ * processedTradeIds dedup.
  */
-export function processRealtimeTrade(trader: TraderRef, raw: RawActivityItem, options: CopyOptions = {}): Promise<number> {
-  return withProcessingLock(() => processActivity(trader, [raw], options, undefined, false));
+export function processRealtimeTrade(
+  trader: TraderRef, raw: RawActivityItem, options: CopyOptions = {}, source: 'rtds' | 'chain' = 'rtds',
+): Promise<number> {
+  return withProcessingLock(() => processActivity(trader, [raw], options, undefined, source));
 }
 
-// advanceCursor is true for the data-api poll and false for the RTDS push, so
-// it also records which path delivered a copied trade.
+// Only the data-api poll moves the cursor; `source` is also stored on each
+// copy to show which path delivered it.
 async function processActivity(
   trader: TraderRef,
   items: RawActivityItem[],
   options: CopyOptions,
   since: string | undefined,
-  advanceCursor: boolean,
+  source: 'poll' | 'rtds' | 'chain',
 ): Promise<number> {
+  const advanceCursor = source === 'poll';
   const copyEnabled  = options.copyEnabled !== false; // default true
   // Daily-loss circuit breaker: copy-enabled traders' trades are discarded
   // (cursor advances, nothing recorded — a paused real wallet misses trades,
@@ -359,7 +363,7 @@ async function processActivity(
         feeRate,
         entryFeeCost:      entryFee,
         copiedAt:          new Date().toISOString(),
-        copySource:        advanceCursor ? 'poll' : 'rtds',
+        copySource:        source,
       };
       if (fetchedFeeRate === null) {
         console.log(`[monitor] fee config unavailable for ${activity.marketSlug} — using fallback rate ${feeRate}`);

@@ -20,6 +20,7 @@ import {
   summarizeWatchdog, readLastLine, readText, lastLineMatching, dbInfo,
 } from './health';
 import { getRtdsStatus } from './rtds';
+import { getChainFeedStatus } from './chainfeed';
 
 // Watchlist Performance panel reset (2026-09-26 21:38 UTC, when 0x12d6 went to
 // observation and only the LowFreq-* traders were left copying): headline PnL,
@@ -1008,6 +1009,7 @@ export function startDashboard(): void {
     const copies = [...store.openTrades, ...store.closedTrades].filter(t => t.copiedTraderSource === 'watchlist');
     res.json({
       rtds: { ...getRtdsStatus(now), configured: CONFIG.RTDS_ENABLED },
+      chain: { ...getChainFeedStatus(now), configured: CONFIG.CHAIN_FEED_ENABLED },
       loopLag: getLoopLag(),
       uptimeSec: Math.round(process.uptime()),
       copyLatency7d: copyLatencyStats(copies, now, 7 * 86_400_000),

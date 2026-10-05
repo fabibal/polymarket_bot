@@ -72,6 +72,7 @@ DRY_RUN=true
 PORT=8080
 POLL_INTERVAL_MS=30000                  # 30 s per cycle
 RTDS_ENABLED=true                       # real-time trade socket, poll stays as backfill; false = poll only (2026-09-26)
+CHAIN_FEED_ENABLED=true                 # Polygon fill logs of copy-enabled wallets, 3rd source (2026-10-05)
 PRICE_UPDATE_INTERVAL_MS=300000         # 5 min mark-to-market sweep
 
 MAX_WATCHLIST_ENTRIES_PER_MARKET=2      # non-dated slugs only (match-style → lifetime 1)

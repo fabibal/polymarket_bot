@@ -42,6 +42,9 @@ export const CONFIG = {
   // poll, which stays as the backfill. Set RTDS_ENABLED=false to fall back to
   // polling only.
   RTDS_ENABLED: process.env.RTDS_ENABLED !== 'false',
+  // Polygon OrderFilled logs for the copy-enabled wallets (src/chainfeed.ts), a
+  // third source next to RTDS and the poll. CHAIN_FEED_ENABLED=false turns it off.
+  CHAIN_FEED_ENABLED: process.env.CHAIN_FEED_ENABLED !== 'false',
   PORT: parseInt(process.env.PORT ?? '8080', 10),
   DB_FILE: process.env.DB_FILE ?? './data/store.db',
   // If price crosses this threshold treat the market as resolved

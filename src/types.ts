@@ -78,7 +78,7 @@ export interface SimulatedTrade {
   // copy and which path delivered the trader's fill. copiedAt - timestamp is
   // the copy latency, including the depth and fee lookups before the entry.
   copiedAt?: string;
-  copySource?: 'poll' | 'rtds';
+  copySource?: 'poll' | 'rtds' | 'chain';
   // Orderbook snapshot at fill time. Populated for watchlist BUYs via CLOB
   // /book; depthBackfilled=true if filled in after the fact from current state.
   bestAsk?: number;
