@@ -27,6 +27,10 @@ export const ORDER_FILLED_TOPIC = '0xd543adfd945773f1a62f74f0ee55a5e3b9b1a282629
 const RPC_URL = 'wss://polygon-bor-rpc.publicnode.com';
 const HEARTBEAT_MS = 30_000;      // eth_blockNumber; an unanswered one means a dead socket
 const RESUBSCRIBE_CHECK_MS = 60_000;
+// The node's push subscription silently dropped fills (2026-10-06: 2 of 4 while
+// "connected"), so eth_getLogs sweeps the newest blocks as a safety net.
+const CATCHUP_MS = 5_000;
+const MAX_CATCHUP_BLOCKS = 600;   // ~20 min of Polygon blocks after a long outage
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -108,12 +112,13 @@ export interface ChainFeedStatus {
   lastFillAt: string | null;
   unresolved: number;         // fills whose token could not be mapped to a market
   reconnects: number;
+  recovered: number;          // fills the subscription never delivered, found by the getLogs sweep
 }
 
 const status = {
   enabled: false, connected: false, connectedSince: null as number | null, wallets: 0,
   lastHeartbeatAt: null as number | null, fills: 0, lastFillAt: null as number | null,
-  unresolved: 0, reconnects: 0,
+  unresolved: 0, reconnects: 0, recovered: 0,
 };
 
 export function getChainFeedStatus(nowMs: number = Date.now()): ChainFeedStatus {
@@ -127,6 +132,7 @@ export function getChainFeedStatus(nowMs: number = Date.now()): ChainFeedStatus 
     lastFillAt: status.lastFillAt != null ? new Date(status.lastFillAt).toISOString() : null,
     unresolved: status.unresolved,
     reconnects: status.reconnects,
+    recovered: status.recovered,
   };
 }
 
@@ -147,9 +153,14 @@ export function startChainFeed(
   let nextId = 1;
   let subId: string | null = null;
   let walletKey = '';
+  let filterTopics: unknown[] | null = null;
+  let scannedBlock: number | null = null;   // survives reconnects so an outage gap is swept too
+  let sweeping = false;
+  const seen = new Set<string>();           // tx:logIndex of fills already handled
   let heartbeatPending = false;
   let heartbeatTimer: NodeJS.Timeout | null = null;
   let resubTimer: NodeJS.Timeout | null = null;
+  let sweepTimer: NodeJS.Timeout | null = null;
   let reconnectTimer: NodeJS.Timeout | null = null;
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
   const blockTimes = new Map<number, number>();
@@ -186,13 +197,22 @@ export function startChainFeed(
     status.wallets = wallets.length;
     if (wallets.length === 0) return;
     const filter = { address: EXCHANGES, topics: [ORDER_FILLED_TOPIC, null, wallets.map(pad32)] };
+    filterTopics = filter.topics;
     subId = String(await request('eth_subscribe', ['logs', filter]));
     console.log(`[chain] subscribed to fills of ${wallets.length} wallet(s)`);
   };
 
-  const handleLog = async (log: ChainLog) => {
+  const handleLog = async (log: ChainLog, viaSweep = false) => {
     const f = decodeOrderFilled(log);
     if (!f) return;
+    const key = `${log.transactionHash}:${log.logIndex ?? ''}`;
+    if (seen.has(key)) return;
+    if (seen.size > 500) seen.clear();
+    seen.add(key);
+    if (viaSweep) {
+      status.recovered++;
+      console.warn(`[chain] fill of tx ${f.tx.slice(0, 12)}… was missed by the subscription — recovered by the sweep`);
+    }
     status.fills++;
     status.lastFillAt = Date.now();
     const market = await resolveToken(f.tokenId);
@@ -202,6 +222,24 @@ export function startChainFeed(
       return;
     }
     onTrade(f.wallet, fillToActivity(f, market, await blockTimeMs(f.blockNumber)));
+  };
+
+  const sweep = async () => {
+    if (sweeping || !subId || !filterTopics) return;
+    sweeping = true;
+    try {
+      const head = parseInt(String(await request('eth_blockNumber', [])), 16);
+      if (!Number.isFinite(head)) return;
+      const from = scannedBlock == null ? head : Math.max(scannedBlock, head - MAX_CATCHUP_BLOCKS);
+      if (head < from) return;   // a lagging node behind the block already scanned
+      const logs = await request('eth_getLogs', [{ address: EXCHANGES, topics: filterTopics, fromBlock: '0x' + from.toString(16), toBlock: '0x' + head.toString(16) }]) as ChainLog[];
+      scannedBlock = head - 1;   // the newest block is re-read next time in case the node was still indexing it
+      for (const log of logs ?? []) await handleLog(log, true);
+    } catch (err) {
+      console.warn('[chain] sweep failed:', err instanceof Error ? err.message : err);
+    } finally {
+      sweeping = false;
+    }
   };
 
   const scheduleReconnect = () => {
@@ -214,6 +252,7 @@ export function startChainFeed(
   const clearTimers = () => {
     if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
     if (resubTimer) { clearInterval(resubTimer); resubTimer = null; }
+    if (sweepTimer) { clearInterval(sweepTimer); sweepTimer = null; }
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('socket closed')); }
     pending.clear();
   };
@@ -246,6 +285,7 @@ export function startChainFeed(
       resubTimer = setInterval(() => {
         subscribe().catch(err => { console.warn('[chain] resubscribe failed:', err.message); sock.terminate(); });
       }, RESUBSCRIBE_CHECK_MS);
+      sweepTimer = setInterval(() => { void sweep(); }, CATCHUP_MS);
     });
 
     sock.on('message', (data: WebSocket.RawData) => {
