@@ -92,13 +92,6 @@ Removed 2026-05-29 (inert no-ops): `LEADERBOARD_REFRESH_MS`,
 `FORCE_EXCLUDE_CATEGORIES`, `MAX_POSITIONS_PER_MARKET*`,
 `MAX_TOTAL_OPEN_POSITIONS`, `MIN_TRADER_*SAMPLE`. See `docs/decisions.md`.
 
-## Server Environment
-- Host: `<server-host>` (fallback `<server-ip>`), port `<ssh-port>`, user `user`
-- Key: `~/.ssh/id_ed25519`
-- Runtime dir: `/home/user/polymarket_bot/` — **source of truth filesystem**
-- Bullpen CLI on server: `/home/user/.npm-global/lib/node_modules/@bullpenfi/cli/bin/bullpen`
-- Dashboard: http://localhost:8082 — Claude Code runs directly on the server
-
 ## Secrets
 - WireGuard creds (`WIREGUARD_*`) live in `/home/user/polymarket_bot/.env`,
   referenced from `docker-compose.yml` as `${…}`; port hardcoded `51820`. Do not
