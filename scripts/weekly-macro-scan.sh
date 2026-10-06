@@ -12,7 +12,7 @@
 #
 # Does NOT auto-add to watchlist — manual review only.
 #
-# Cron: 0 4 * * 1 /home/user/polymarket_bot/scripts/weekly-macro-scan.sh
+# Cron: 0 4 * * 1 ~/polymarket_bot/scripts/weekly-macro-scan.sh
 # Test: ./weekly-macro-scan.sh           (sends real Telegram message)
 #
 # Telegram creds: ~/.env.shared (cross-project, chmod 600).
@@ -20,7 +20,7 @@
 
 set -u
 
-PROJECT_DIR="/home/user/polymarket_bot"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHARED_ENV="${HOME}/.env.shared"
 CONTAINER="polymarket_bot"
 LOG_DIR="${PROJECT_DIR}/logs"

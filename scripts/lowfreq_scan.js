@@ -30,7 +30,7 @@
  * Runs in its own container inside the VPN namespace (never in the bot's; the
  * dashboard is on localhost:8080 there). Run by scripts/weekly-lowfreq-scan.sh:
  *   docker run --rm -u 1000:1000 --network container:gluetun \
- *     -v /home/user/polymarket_bot:/app:ro -v <work>:/work \
+ *     -v "$PWD":/app:ro -v <work>:/work \
  *     node:20-alpine node /app/scripts/lowfreq_scan.js
  * Output: stage counts, a candidate table, /work/report.json, SUMMARY line.
  */

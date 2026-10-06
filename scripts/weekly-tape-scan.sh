@@ -7,7 +7,7 @@
 # (observation only), capped at 10 standing observation traders. One
 # Telegram alert per auto-added trader.
 #
-# Cron: 0 5 * * 0 /home/user/polymarket_bot/scripts/weekly-tape-scan.sh
+# Cron: 0 5 * * 0 ~/polymarket_bot/scripts/weekly-tape-scan.sh
 # (Sundays 05:00 UTC -- the day before weekly-macro-scan.sh's Monday 04:00
 # UTC run, so the two discovery pipelines don't overlap in the same window)
 # Test: ./weekly-tape-scan.sh        (sends real Telegram messages if any
@@ -18,7 +18,7 @@
 
 set -u
 
-PROJECT_DIR="/home/user/polymarket_bot"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHARED_ENV="${HOME}/.env.shared"
 CONTAINER="polymarket_bot"
 LOG_DIR="${PROJECT_DIR}/logs"

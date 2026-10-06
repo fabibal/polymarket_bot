@@ -3,7 +3,7 @@
 # Cron: 0 3 * * * (03:00 server time)
 set -u
 
-REPO=/home/user/polymarket_bot
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$REPO/logs/git-sync.log"
 mkdir -p "$REPO/logs"
 
@@ -12,7 +12,8 @@ log() { echo "$(ts) $*" >>"$LOG"; }
 
 cd "$REPO" || { log "ERROR cd $REPO failed"; exit 1; }
 
-export GIT_SSH_COMMAND='ssh -i /home/user/.ssh/deploy-key -o IdentitiesOnly=yes'
+# SSH identity comes from the `Host github.com` entry in ~/.ssh/config.
+export GIT_SSH_COMMAND='ssh -o IdentitiesOnly=yes'
 
 # Paths to consider for sync (only tracked changes; untracked files require manual review).
 PATHS=(CLAUDE.md docker-compose.yml Dockerfile package.json package-lock.json tsconfig.json src tests scripts public .env.example .gitignore)

@@ -1,7 +1,7 @@
 # Deploy Workflow
 
 Claude Code runs directly on the Linux server. Source of truth is the server
-filesystem at `/home/user/polymarket_bot/`. Container deployment and GitHub
+filesystem at `~/polymarket_bot/`. Container deployment and GitHub
 push are **separate, manual** operations.
 
 ## Container rebuild
@@ -37,9 +37,8 @@ git push origin HEAD:main
 git ls-remote git@github.com:fabibal/polymarket_bot.git HEAD
 ```
 
-- Repo: `git@github.com:fabibal/polymarket_bot.git` (private, default `main`).
-- SSH key `~/.ssh/deploy-key` wired via `Host github.com` in
-  `~/.ssh/config`.
+- Repo: `git@github.com:fabibal/polymarket_bot.git` (public, default `main`).
+- The SSH key is wired via `Host github.com` in `~/.ssh/config`.
 - A nightly `git-sync.sh` cron auto-commits tracked changes — ad-hoc pushes are
   for when you need it sooner. Untracked files are never auto-added.
 

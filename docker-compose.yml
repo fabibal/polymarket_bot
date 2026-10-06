@@ -69,7 +69,7 @@ services:
     # Shared Telegram credentials (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) — used by
     # the in-bot risk alerts (trader decay kill switch, daily-loss circuit breaker).
     env_file:
-      - /home/user/.env.shared
+      - ${HOME}/.env.shared
     environment:
       - NODE_OPTIONS=--max-old-space-size=450
       - DRY_RUN=true

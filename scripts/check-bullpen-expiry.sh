@@ -5,7 +5,7 @@
 # is no longer decodable from the file. Instead we shell out to
 # `bullpen --output json status` and parse account.session_expires.
 #
-# Cron: 0 9 * * * /home/user/polymarket_bot/scripts/check-bullpen-expiry.sh
+# Cron: 0 9 * * * ~/polymarket_bot/scripts/check-bullpen-expiry.sh
 # Test: FORCE_ALERT=1 ./check-bullpen-expiry.sh
 #
 # Telegram creds: ~/.env.shared (cross-project, chmod 600).
@@ -21,7 +21,7 @@ set -u
 SHARED_ENV="${HOME}/.env.shared"
 CREDS_ENC="${HOME}/.bullpen/credentials.json.enc"
 CREDS_PLAIN="${HOME}/.bullpen/credentials.json"
-BULLPEN_BIN="${BULLPEN_BIN:-$(command -v bullpen || echo /home/user/.npm-global/bin/bullpen)}"
+BULLPEN_BIN="${BULLPEN_BIN:-$(command -v bullpen || echo "${HOME}/.npm-global/bin/bullpen")}"
 LOG_DIR="${HOME}/polymarket_bot/logs"
 LOG_FILE="${LOG_DIR}/bullpen-expiry.log"
 WARN_DAYS=3

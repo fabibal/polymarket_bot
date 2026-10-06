@@ -10,8 +10,8 @@
 # silently degrades to Bullpen-only — bot keeps running but discovery quality
 # drops.
 #
-# Cron: 0 9 * * * /home/user/polymarket_bot/scripts/check-falcon-expiry.sh \
-#         >> /home/user/polymarket_bot/logs/falcon-expiry.cron.log 2>&1
+# Cron: 0 9 * * * ~/polymarket_bot/scripts/check-falcon-expiry.sh \
+#         >> ~/polymarket_bot/logs/falcon-expiry.cron.log 2>&1
 # Test: FORCE_ALERT=1 ./check-falcon-expiry.sh
 #
 # Telegram creds: ~/.env.shared (cross-project, chmod 600).

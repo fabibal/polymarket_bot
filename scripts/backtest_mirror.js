@@ -43,7 +43,7 @@
  *
  * Usage (data-api/Gamma/CLOB are geo-blocked from the host -> VPN namespace):
  *   docker run --rm -u 1000:1000 --network container:gluetun \
- *     -v /home/user/polymarket_bot:/app:ro -v <cache-dir>:/cache \
+ *     -v "$PWD":/app:ro -v <cache-dir>:/cache \
  *     node:20-alpine node /app/scripts/backtest_mirror.js <address> [since] [db]
  * db defaults to the newest data/backups/store-*.db (never the live WAL file).
  * BACKTEST_REFRESH=1 re-fetches instead of using /cache. Per-unit results are

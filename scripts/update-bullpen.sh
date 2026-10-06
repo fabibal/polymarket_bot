@@ -3,12 +3,12 @@
 # Cron: 0 2 * * * (02:00 server time, before git-sync at 03:00)
 set -u
 
-REPO=/home/user/polymarket_bot
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG="$REPO/logs/bullpen-update.log"
 mkdir -p "$REPO/logs"
 
 # npm lives under user-local prefix; ensure PATH includes it for cron.
-export PATH="/home/user/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH="${HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 
 ts() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 

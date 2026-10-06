@@ -12,7 +12,7 @@
 #    at 10 standing observation traders.
 # 3. One Telegram message per added trader.
 #
-# Cron: 30 5 * * 0 /home/user/polymarket_bot/scripts/weekly-lowfreq-scan.sh
+# Cron: 30 5 * * 0 ~/polymarket_bot/scripts/weekly-lowfreq-scan.sh
 #   (05:30, not 05:00: the Sunday 05:00 `docker system prune` deleted the
 #   unused node:20-alpine image under the first scheduled run on 2026-09-27.)
 # Test: LOWFREQ_AUTO_ADD=0 ./weekly-lowfreq-scan.sh   (report only, adds nobody)
@@ -24,7 +24,7 @@
 
 set -u
 
-PROJECT_DIR="/home/user/polymarket_bot"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SHARED_ENV="${HOME}/.env.shared"
 LOG_DIR="${PROJECT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/weekly-lowfreq-scan.log"
@@ -33,7 +33,7 @@ TS="$(date -u +'%F %T') UTC"
 RUN_ID="$(date -u +'%Y%m%dT%H%M%SZ')"
 WORK="${RUNS_DIR}/${RUN_ID}"
 AUTO_ADD="${LOWFREQ_AUTO_ADD:-1}"
-BULLPEN_BIN="${BULLPEN_BIN:-$(command -v bullpen || echo /home/user/.npm-global/bin/bullpen)}"
+BULLPEN_BIN="${BULLPEN_BIN:-$(command -v bullpen || echo "${HOME}/.npm-global/bin/bullpen")}"
 
 mkdir -p "${WORK}/bullpen" "${WORK}/btcache"
 

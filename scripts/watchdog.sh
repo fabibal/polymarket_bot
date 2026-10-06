@@ -6,8 +6,8 @@
 # the gluetun-restart orphan-namespace failure mode where Express keeps
 # listening inside a netns no longer wired to gluetun's published port.
 #
-# Cron: */5 * * * * /home/user/polymarket_bot/scripts/watchdog.sh \
-#         >> /home/user/polymarket_bot/logs/watchdog.cron.log 2>&1
+# Cron: */5 * * * * ~/polymarket_bot/scripts/watchdog.sh \
+#         >> ~/polymarket_bot/logs/watchdog.cron.log 2>&1
 # Test: FORCE_RESTART=1 ./watchdog.sh  (forces 1 fail to trigger restart path)
 #
 # State:    ~/polymarket_bot/logs/watchdog.state  (consecutive failure count)

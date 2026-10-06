@@ -93,7 +93,7 @@ Removed 2026-05-29 (inert no-ops): `LEADERBOARD_REFRESH_MS`,
 `MAX_TOTAL_OPEN_POSITIONS`, `MIN_TRADER_*SAMPLE`. See `docs/decisions.md`.
 
 ## Secrets
-- WireGuard creds (`WIREGUARD_*`) live in `/home/user/polymarket_bot/.env`,
+- WireGuard creds (`WIREGUARD_*`) live in `~/polymarket_bot/.env`,
   referenced from `docker-compose.yml` as `${…}`; port hardcoded `51820`. Do not
   hardcode creds in compose (caused VPN drift). To rotate: edit `.env`,
   `docker compose up -d gluetun bot`.
