@@ -61,6 +61,13 @@ history and, where they changed behaviour, in `docs/decisions.md`.
 
 ## Operational notes
 
+- **Chain subscription drops fills; the HTTPS sweep is the safety net.** The
+  publicnode `eth_subscribe` stream misses a sizeable share of fills (7 of 17
+  in 4 days) and the socket reconnects about once an hour. A sweep over HTTPS
+  (drpc, then publicnode) re-reads the newest blocks every 5s. When RTDS is
+  healthy it has already copied the fill, so the dollar effect has been zero so
+  far. Context: `docs/decisions.md` "Chain feed: HTTPS getLogs sweep on drpc".
+
 - **`logs/` is NOT in the git repo** — server runtime only. `scripts/` files ARE
   tracked, but the daily `git-sync.sh` only commits changes to already-tracked
   files there; new/untracked files under `scripts/` are never auto-added — add

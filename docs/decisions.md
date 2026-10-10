@@ -783,3 +783,31 @@ Decoding was verified against data-api fills:
   identical slug/outcome/side/price at ~0s lag.
 
 Observation traders stay on RTDS + poll. `CHAIN_FEED_ENABLED=false` turns it off.
+
+## Chain feed: HTTPS getLogs sweep on drpc (2026-10-06, moved 2026-10-10)
+
+The publicnode push subscription alone silently drops fills: on 2026-10-06 two
+fills (one block, 18 and 51 logs) never arrived while the socket was "connected"
+and an `eth_getLogs` of the same filter returned both. From 10-06 to 10-10 the
+sweep found 7 of 17 fills before (or without) the subscription.
+
+The first sweep ran over the same WebSocket and failed about a third of the time:
+publicnode's backends disagree on the head ("invalid block range params") and the
+sticky socket times out. A local guard cannot fix that.
+
+The sweep now runs over HTTPS every 5s, independent of the socket (it keeps
+reading while the socket reconnects):
+- providers in order: `polygon.drpc.org`, then publicnode. A 2026-10-10 probe of
+  eight public Polygon RPCs found only these two alive; a 10-minute probe at the
+  5s cadence gave drpc 0 errors in 240 calls and publicnode 37 failed getLogs of 120;
+- the read window starts at the previous head minus 4 blocks, so a lagging
+  backend cannot make a block fall through, and it only moves after a successful
+  read (an outage is read up to 600 blocks back);
+- a provider reporting a head behind the blocks already read counts as failed;
+- failures are summarized every 30 min (`[chain] sweep last 30m: ...`), not logged
+  per call; `/api/system` `chain` has `recovered`, `sweepOk`, `sweepFailed`,
+  `lastSweepOkAgoMs`.
+
+The WebSocket subscription stays (it is ~0.5s faster than a 5s sweep). `recovered`
+counts fills the sweep delivered first. The burst case the chain feed exists for
+(RTDS dropping fills in a news burst) has not happened since, so it is still unproven.

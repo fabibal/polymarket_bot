@@ -1733,9 +1733,11 @@
         cl.p90Ms > 30_000 ? 'warn' : '', `Trader fill -> copy opened, ${cl.n || 0} copies with timing data. By source: ${srcs || '-'} (pushed = RTDS or chain, not the ~40s data-api poll)`);
       const ch = d.chain || {};
       const chUp = ch.connected && ch.lastHeartbeatAgoMs != null && ch.lastHeartbeatAgoMs < 90_000;
-      chip('Chain feed', !ch.configured ? 'off' : chUp ? `live · ${ch.wallets} wallet${ch.wallets === 1 ? '' : 's'} · ${ch.fills} fills` : 'down · RTDS + poll only',
-        !ch.configured ? '' : chUp ? '' : 'warn',
-        `Polygon OrderFilled logs of the copy-enabled wallets. Last fill: ${ch.lastFillAt || 'none yet'} · unresolved tokens: ${ch.unresolved ?? 0} · reconnects: ${ch.reconnects ?? 0}`);
+      const sweepUp = ch.lastSweepOkAgoMs != null && ch.lastSweepOkAgoMs < 60_000;
+      chip('Chain feed', !ch.configured ? 'off' : chUp && sweepUp ? `live · ${ch.wallets} wallet${ch.wallets === 1 ? '' : 's'} · ${ch.fills} fills`
+          : chUp ? `live · ${ch.fills} fills · sweep stale` : sweepUp ? 'socket down · sweep only' : 'down · RTDS + poll only',
+        !ch.configured ? '' : chUp && sweepUp ? '' : 'warn',
+        `Polygon OrderFilled logs of the copy-enabled wallets. Last fill: ${ch.lastFillAt || 'none yet'} · unresolved tokens: ${ch.unresolved ?? 0} · reconnects: ${ch.reconnects ?? 0} · HTTPS sweep: ${ch.sweepOk ?? 0} ok / ${ch.sweepFailed ?? 0} failed, ${ch.recovered ?? 0} fills delivered by it first`);
       const bp = files.bullpen;
       const bpDays = bp && bp.daysLeft != null ? bp.daysLeft : null;
       chip('Bullpen session', bpDays != null ? `${Math.floor(bpDays)} d left` : '—', bpDays == null ? 'warn' : bpDays <= 3 ? 'bad' : bpDays <= 7 ? 'warn' : '',

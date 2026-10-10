@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { decodeOrderFilled, fillToActivity, ChainLog, EXCHANGES } from '../src/chainfeed';
+import { decodeOrderFilled, fillToActivity, makeSweeper, sweepReason, ChainLog, EXCHANGES } from '../src/chainfeed';
 
 // Real OrderFilled logs of LowFreq-Events (0x2f633efb), fetched from Polygon
 // receipts on 2026-10-05; expected values are the data-api fills of the same tx.
@@ -66,5 +66,121 @@ describe('decodeOrderFilled', () => {
       slug: 'will-ism-services-pmi-be-between-56pt0-and-56pt9-in-september', title: 'ISM?', outcome: 'No',
       side: 'BUY', type: 'TRADE', price: f.price, size: f.size, usdc_size: f.usdc,
     });
+  });
+});
+
+// ── HTTPS sweep ─────────────────────────────────────────────────────────────
+type Call = { ep: string; method: string; params: any[] };
+
+/** Fake providers: `heads[ep]` is the head each endpoint reports, `fail[ep]` a message it throws. */
+function fakeChain(heads: Record<string, number>, fail: Record<string, string> = {}, logs: ChainLog[] = []) {
+  const calls: Call[] = [];
+  const call = async (ep: string, method: string, params: unknown[]) => {
+    calls.push({ ep, method, params: params as any[] });
+    if (fail[ep]) throw new Error(fail[ep]);
+    if (method === 'eth_blockNumber') return '0x' + heads[ep].toString(16);
+    return logs;
+  };
+  const range = (i: number) => {
+    const g = calls.filter(c => c.method === 'eth_getLogs')[i].params[0];
+    return [parseInt(g.fromBlock, 16), parseInt(g.toBlock, 16)];
+  };
+  return { calls, call, range };
+}
+
+const TOPICS = ['0xabc', null, ['0x01']];
+const mk = (c: ReturnType<typeof fakeChain>, endpoints = ['A', 'B'], onLogs: (l: ChainLog[], ep: string) => Promise<void> = async () => undefined) =>
+  makeSweeper({ endpoints, call: c.call, getTopics: () => TOPICS, onLogs });
+
+describe('makeSweeper', () => {
+  it('reads the last few blocks first, then re-reads a small overlap each time', async () => {
+    const heads = { A: 100 };
+    const c = fakeChain(heads);
+    const s = mk(c, ['A']);
+    expect(await s.sweep()).toBe(true);
+    expect(c.range(0)).toEqual([97, 100]);
+    heads.A = 103;
+    await s.sweep();
+    expect(c.range(1)).toEqual([97, 103]);   // nothing between two sweeps is skipped
+    heads.A = 105;
+    await s.sweep();
+    expect(c.range(2)).toEqual([100, 105]);
+    const g = c.calls.filter(x => x.method === 'eth_getLogs')[0].params[0];
+    expect(g.address).toEqual(EXCHANGES);
+    expect(g.topics).toEqual(TOPICS);
+  });
+
+  it('hands the logs and the serving provider to onLogs', async () => {
+    const got: Array<[number, string]> = [];
+    const c = fakeChain({ A: 100 }, {}, [BUY, SELL]);
+    await mk(c, ['A'], async (l, ep) => { got.push([l.length, ep]); }).sweep();
+    expect(got).toEqual([[2, 'A']]);
+  });
+
+  it('falls back to the next provider and counts the failure by reason', async () => {
+    const c = fakeChain({ B: 100 }, { A: 'invalid block range params' });
+    const s = mk(c);
+    expect(await s.sweep()).toBe(true);
+    expect(c.calls.map(x => x.ep)).toEqual(['A', 'B', 'B']);
+    expect(s.stats.ok).toBe(1);
+    expect(s.stats.failed).toBe(0);
+    expect(s.summary()).toBe('1 ok, 0 failed (A 0 ok/1 failed, B 1 ok/0 failed); errors: invalid block range x1');
+    expect(s.summary()).toBe('0 ok, 0 failed');   // the window resets
+  });
+
+  it('fails only when every provider fails, and does not skip the gap afterwards', async () => {
+    const heads = { A: 100 };
+    const fail: Record<string, string> = {};
+    const c = fakeChain(heads, fail);
+    const s = mk(c, ['A']);
+    await s.sweep();                                  // reads 97..100, next read starts at 97
+    fail.A = 'timeout';
+    heads.A = 110;
+    expect(await s.sweep()).toBe(false);
+    expect(s.stats.failed).toBe(1);
+    delete fail.A;
+    await s.sweep();
+    expect(c.range(1)).toEqual([97, 110]);            // the whole outage is read
+  });
+
+  it('treats a provider whose head is behind the blocks already read as failed', async () => {
+    const heads: Record<string, number> = { A: 100, B: 100 };
+    const c = fakeChain(heads);
+    const s = mk(c);
+    await s.sweep();                                  // next read starts at 97
+    heads.A = 90;                                     // lagging backend
+    heads.B = 102;
+    expect(await s.sweep()).toBe(true);
+    expect(c.calls.slice(-3).map(x => x.ep)).toEqual(['A', 'B', 'B']);
+    expect(c.range(1)).toEqual([97, 102]);
+    expect(s.summary()).toContain('node behind x1');
+  });
+
+  it('caps the catch-up window after a very long outage', async () => {
+    const heads = { A: 100 };
+    const c = fakeChain(heads);
+    const s = mk(c, ['A']);
+    await s.sweep();
+    heads.A = 5000;
+    await s.sweep();
+    expect(c.range(1)).toEqual([4401, 5000]);
+  });
+
+  it('does nothing without wallets', async () => {
+    const c = fakeChain({ A: 100 });
+    const s = makeSweeper({ endpoints: ['A'], call: c.call, getTopics: () => null, onLogs: async () => undefined });
+    expect(await s.sweep()).toBe(false);
+    expect(c.calls).toHaveLength(0);
+  });
+});
+
+describe('sweepReason', () => {
+  it('normalizes provider errors', () => {
+    expect(sweepReason(new Error('timeout'))).toBe('timeout');
+    expect(sweepReason(new Error('eth_getLogs timed out'))).toBe('timeout');
+    expect(sweepReason(new Error('invalid block range params'))).toBe('invalid block range');
+    expect(sweepReason(new Error('getaddrinfo EAI_AGAIN polygon.drpc.org'))).toBe('dns');
+    expect(sweepReason(new Error('http 429'))).toBe('http 429');
+    expect(sweepReason('weird')).toBe('weird');
   });
 });
