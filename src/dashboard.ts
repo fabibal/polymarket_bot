@@ -1,6 +1,5 @@
 import express from 'express';
 import https from 'https';
-import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import {
@@ -79,7 +78,7 @@ function httpsGet(url: string, timeoutMs = 10_000): Promise<unknown> {
 }
 
 // In-memory VPN status cache (TTL: 25s — frontend polls every 30s)
-let vpnCache: { status: 'ok' | 'error'; ip?: string; country?: string; city?: string; uptimeMs?: number; checkedAt: string } | null = null;
+let vpnCache: { status: 'ok' | 'error'; ip?: string; country?: string; city?: string; checkedAt: string } | null = null;
 let vpnCacheTs = 0;
 const VPN_CACHE_TTL_MS = 25_000;
 
@@ -97,146 +96,6 @@ function fetchIpInfo(): Promise<{ ip?: string; country?: string; city?: string }
     req.on('timeout', () => { req.destroy(); resolve({}); });
   });
 }
-
-// ── Docker socket helpers ──────────────────────────────────────────────────
-function dockerGet(path: string): Promise<unknown> {
-  return new Promise(resolve => {
-    const req = http.request(
-      { socketPath: '/var/run/docker.sock', path, method: 'GET' },
-      res => {
-        let body = '';
-        res.on('data', d => body += d);
-        res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
-      }
-    );
-    req.on('error', () => resolve(null));
-    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
-
-async function getContainerUptimeMs(name: string): Promise<number | null> {
-  const data = await dockerGet(`/containers/${name}/json`) as Record<string, unknown> | null;
-  if (!data) return null;
-  const startedAt = (data.State as Record<string, unknown>)?.StartedAt as string | undefined;
-  if (!startedAt) return null;
-  const started = new Date(startedAt).getTime();
-  return isNaN(started) ? null : Date.now() - started;
-}
-
-// Fetch container logs (multiplexed Docker stream) and count substring matches.
-// Used for "wallet cap skips" — bot logs go to docker stdout, not a host file.
-function countContainerLogMatches(name: string, sinceSec: number, needle: string): Promise<number> {
-  return new Promise(resolve => {
-    const req = http.request(
-      { socketPath: '/var/run/docker.sock', path: `/containers/${name}/logs?stdout=1&stderr=1&since=${sinceSec}`, method: 'GET' },
-      res => {
-        // Count matches incrementally on each streamed chunk so we never hold the
-        // full (potentially tens of MB over 7d) log in memory at once. Each
-        // "wallet_cap:" occurrence is on its own log line, so a raw byte search
-        // across multiplex frame headers is safe (headers are 8 bytes of binary
-        // that cannot contain the literal needle). We carry a small tail of the
-        // previous chunk (needle.length - 1 bytes) so a match split across a
-        // chunk boundary is still counted exactly once.
-        let n = 0;
-        let tail = '';
-        const overlap = Math.max(0, needle.length - 1);
-        res.on('data', (d: Buffer) => {
-          const s = tail + d.toString('utf8');
-          let idx = 0;
-          while ((idx = s.indexOf(needle, idx)) !== -1) { n++; idx += needle.length; }
-          tail = overlap > 0 ? s.slice(-overlap) : '';
-        });
-        res.on('end', () => resolve(n));
-        res.on('error', () => resolve(n));
-      }
-    );
-    req.on('error', () => resolve(0));
-    req.setTimeout(5000, () => { req.destroy(); resolve(0); });
-    req.end();
-  });
-}
-
-let walletCapSkipsCache: { count: number; ts: number } | null = null;
-const WALLET_CAP_SKIPS_TTL_MS = 60_000;
-
-async function getWalletCapSkips7d(): Promise<number> {
-  const now = Date.now();
-  if (walletCapSkipsCache && now - walletCapSkipsCache.ts < WALLET_CAP_SKIPS_TTL_MS) {
-    return walletCapSkipsCache.count;
-  }
-  const sinceSec = Math.floor((now - 7 * 86_400_000) / 1000);
-  const count = await countContainerLogMatches('polymarket_bot', sinceSec, 'wallet_cap:');
-  walletCapSkipsCache = { count, ts: now };
-  return count;
-}
-
-// ── Container stats ────────────────────────────────────────────────────────
-interface ContainerStat {
-  name: string;
-  cpuPct: number | null;
-  ramMB: number | null;
-  ramLimitMB: number | null;
-  ramPct: number | null;
-  restartCount: number | null;
-  startedAt: string | null;
-  uptimeMs: number | null;
-}
-
-async function fetchOneContainerStat(name: string): Promise<ContainerStat> {
-  const empty: ContainerStat = { name, cpuPct: null, ramMB: null, ramLimitMB: null, ramPct: null, restartCount: null, startedAt: null, uptimeMs: null };
-  const [s, info] = await Promise.all([
-    dockerGet(`/containers/${name}/stats?stream=false`) as Promise<Record<string, unknown> | null>,
-    dockerGet(`/containers/${name}/json`)                as Promise<Record<string, unknown> | null>,
-  ]);
-
-  // Extract restart count + uptime from inspect (independent of stats availability)
-  let restartCount: number | null = null;
-  let startedAt: string | null = null;
-  let uptimeMs: number | null = null;
-  if (info) {
-    const rc = info.RestartCount;
-    if (typeof rc === 'number') restartCount = rc;
-    const state = info.State as Record<string, unknown> | undefined;
-    const sa = state?.StartedAt;
-    if (typeof sa === 'string' && sa.length > 0) {
-      startedAt = sa;
-      const t = new Date(sa).getTime();
-      if (!isNaN(t)) uptimeMs = Date.now() - t;
-    }
-  }
-
-  if (!s) return { ...empty, restartCount, startedAt, uptimeMs };
-  try {
-    const cpu = s.cpu_stats as Record<string, unknown>;
-    const precpu = s.precpu_stats as Record<string, unknown>;
-    const mem = s.memory_stats as Record<string, unknown>;
-    const cpuUsage = cpu?.cpu_usage as Record<string, unknown>;
-    const preCpuUsage = precpu?.cpu_usage as Record<string, unknown>;
-    const cpuDelta = (cpuUsage?.total_usage as number) - (preCpuUsage?.total_usage as number);
-    const sysDelta = (cpu?.system_cpu_usage as number) - (precpu?.system_cpu_usage as number);
-    const numCpus = (cpu?.online_cpus as number) || 1;
-    const cpuPct = sysDelta > 0 ? (cpuDelta / sysDelta) * numCpus * 100 : 0;
-    const rawUsage = (mem?.usage as number) ?? 0;
-    // Reclaimable page cache is subtracted like `docker stats` does: cgroup v2
-    // reports inactive_file (there is no `cache` key, so nothing was subtracted
-    // and the bot showed ~400MB/512MB right after scanning the DB).
-    const memStats = (mem?.stats as Record<string, unknown>) ?? {};
-    const cache = (memStats.inactive_file as number) ?? (memStats.cache as number) ?? 0;
-    const ramUsed = rawUsage - cache;
-    const ramLimit = (mem?.limit as number) ?? 0;
-    const ramMB = ramUsed / 1_048_576;
-    const ramLimitMB = ramLimit > 0 ? ramLimit / 1_048_576 : null;
-    const ramPct = ramLimit > 0 ? (ramUsed / ramLimit) * 100 : null;
-    return { name, cpuPct, ramMB, ramLimitMB, ramPct, restartCount, startedAt, uptimeMs };
-  } catch {
-    return { ...empty, restartCount, startedAt, uptimeMs };
-  }
-}
-
-const MONITORED_CONTAINERS = ['gluetun', 'polymarket_bot'];
-let containerStatsCache: { data: ContainerStat[]; ts: number } | null = null;
-const CONTAINER_STATS_TTL_MS = 25_000;
 
 function computeTraderStats(address: string, trades: ActivityLike[]) {
   type BuyEntry = { price: number; size: number; slug: string; title: string; outcome: string };
@@ -463,11 +322,10 @@ export function startDashboard(): void {
       walletOpenTrades:           walletOpen.length,
       statsSince:                 source !== 'all' ? new Date(WATCHLIST_STATS_SINCE_MS).toISOString() : null,
       walletCapUtilization:       CONFIG.WALLET_CAP_UTILIZATION,
-      walletCapSkips7d:           await getWalletCapSkips7d(),
       tradeAmount:                CONFIG.TRADE_AMOUNT,
       circuitBreaker:             getCircuitBreakerStatus(),
       traderDecayThreshold30d:    CONFIG.TRADER_DECAY_THRESHOLD_30D,
-    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletOpenTrades: number; statsSince: string | null; walletCapUtilization: number; walletCapSkips7d: number; tradeAmount: number; circuitBreaker: ReturnType<typeof getCircuitBreakerStatus>; traderDecayThreshold30d: number };
+    } as DashboardStats & { avgRawPnlPerTrade: number; avgSlippagePerTrade: number; avgNetEdgePerTrade: number; simulatedWalletSize: number; walletInUse: number; walletOpenTrades: number; statsSince: string | null; walletCapUtilization: number; tradeAmount: number; circuitBreaker: ReturnType<typeof getCircuitBreakerStatus>; traderDecayThreshold30d: number };
     res.json(stats);
   });
 
@@ -545,24 +403,13 @@ export function startDashboard(): void {
     const ok = await checkVpnConnectivity();
     const checkedAt = new Date().toISOString();
     if (ok) {
-      const [info, uptimeMs] = await Promise.all([fetchIpInfo(), getContainerUptimeMs('gluetun')]);
-      vpnCache = { status: 'ok', ip: info.ip, country: info.country, city: info.city, uptimeMs: uptimeMs ?? undefined, checkedAt };
+      const info = await fetchIpInfo();
+      vpnCache = { status: 'ok', ip: info.ip, country: info.country, city: info.city, checkedAt };
     } else {
       vpnCache = { status: 'error', checkedAt };
     }
     vpnCacheTs = Date.now();
     res.json(vpnCache);
-  });
-
-  app.get('/api/containers', async (_req, res) => {
-    const now = Date.now();
-    if (containerStatsCache && now - containerStatsCache.ts < CONTAINER_STATS_TTL_MS) {
-      res.json({ items: containerStatsCache.data, fetchedAt: new Date(containerStatsCache.ts).toISOString(), cached: true });
-      return;
-    }
-    const data = await Promise.all(MONITORED_CONTAINERS.map(n => fetchOneContainerStat(n)));
-    containerStatsCache = { data, ts: Date.now() };
-    res.json({ items: data, fetchedAt: new Date().toISOString(), cached: false });
   });
 
   // ── Watchlist endpoints ────────────────────────────────────────────────────

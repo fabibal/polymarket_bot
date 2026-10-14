@@ -388,36 +388,6 @@
       border-color: rgba(88,166,255,.4);
     }
 
-    /* ── Container resource strip ── */
-    #container-strip {
-      background: var(--surface);
-      border-bottom: 1px solid var(--border);
-      padding: 6px 24px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .cstat-card {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      height: 36px;
-      padding: 0 12px;
-      background: var(--surface2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      white-space: nowrap;
-    }
-    .cstat-card.warn { border-color: rgba(248,81,73,.35); }
-    .cstat-name { font-size: 11px; font-weight: 700; color: var(--text); min-width: 55px; }
-    .cstat-cpu  { font-size: 11px; font-family: 'Consolas', monospace; color: var(--muted); min-width: 40px; text-align: right; }
-    .cstat-bar  { width: 56px; height: 4px; background: var(--border); border-radius: 2px; flex-shrink: 0; }
-    .cstat-fill { height: 100%; border-radius: 2px; transition: width 0.4s; }
-    .cstat-fill.ok   { background: var(--green); }
-    .cstat-fill.warn { background: var(--red); }
-    .cstat-ram  { font-size: 11px; font-family: 'Consolas', monospace; color: var(--muted); }
-    .cstat-meta { font-size: 11px; font-family: 'Consolas', monospace; color: var(--muted); opacity: 0.75; }
-
     /* ── Charts 2×2 grid ── */
     .charts-grid {
       display: grid;
@@ -586,7 +556,6 @@
     @media (max-width: 800px) {
       .stats-grid { grid-template-columns: repeat(2, 1fr); }
       header { padding: var(--s-3) var(--s-4); }
-      #container-strip { padding: var(--s-2) var(--s-4); flex-wrap: wrap; }
       .stat-card { padding: var(--s-3) var(--s-4); }
       .stat-card .value { font-size: 18px; }
       thead th, tbody td { padding: 7px 8px; }
@@ -594,8 +563,6 @@
     @media (max-width: 520px) {
       header { flex-wrap: wrap; row-gap: 6px; }
       .vpn-badge { white-space: normal; max-width: 100%; }
-      .cstat-card { white-space: normal; height: auto; flex-wrap: wrap; row-gap: 2px; padding: 6px 10px; max-width: 100%; }
-      .cstat-meta { flex-basis: 100%; }
       #health-strip { padding: 8px 16px; }
       .hchip { white-space: normal; max-width: 100%; }
       .ready-item { flex-wrap: wrap; }
@@ -636,9 +603,6 @@
   <span id="last-updated">Connecting…</span>
 </header>
 
-<div id="container-strip">
-  <div class="cstat-card"><span class="cstat-name">Loading…</span></div>
-</div>
 <div id="health-strip"><span class="hchip">Loading system health…</span></div>
 
 <main>
@@ -682,11 +646,6 @@
       <div class="label">💰 Wallet</div>
       <div class="value" id="wl-s-wallet">—</div>
       <div class="sub" id="wl-s-wallet-sub">simulated, hard cap</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Wallet Cap Skips</div>
-      <div class="value" id="wl-s-wallet-skips">—</div>
-      <div class="sub">trades skipped (last 7d)</div>
     </div>
     <div class="stat-card">
       <div class="label">📊 Open Positions</div>
@@ -1005,8 +964,6 @@
         const parts = ['VPN OK'];
         if (d.country) parts.push(COUNTRY_NAMES[d.country] || d.country);
         if (d.ip) parts.push(d.ip);
-        const uptime = fmtUptime(d.uptimeMs);
-        if (uptime) parts.push('uptime: ' + uptime);
         lbl.textContent = parts.join(' · ');
       } else {
         badge.className = 'vpn-badge vpn-error';
@@ -1019,41 +976,6 @@
       $('vpn-badge').className = 'vpn-badge vpn-error';
       $('vpn-label').textContent = 'VPN DOWN';
     }
-  }
-
-  function fmtMB(mb) {
-    if (mb == null) return '—';
-    return mb >= 1024 ? (mb / 1024).toFixed(1) + 'GB' : Math.round(mb) + 'MB';
-  }
-
-  async function loadContainers() {
-    try {
-      const d = await fetch('/api/containers').then(r => r.json());
-      const items = d.items || [];
-      const strip = $('container-strip');
-      strip.innerHTML = '';
-      for (const c of items) {
-        const isWarn = c.ramPct != null && c.ramPct > 80;
-        const cpuStr = c.cpuPct != null ? c.cpuPct.toFixed(1) + '%' : '—';
-        const ramStr = fmtMB(c.ramMB) + (c.ramLimitMB ? ' / ' + fmtMB(c.ramLimitMB) : '');
-        const barPct = c.ramPct != null ? Math.min(100, c.ramPct).toFixed(1) : '0';
-        const shortName = c.name === 'polymarket_bot' ? 'bot' : c.name;
-        const card = document.createElement('div');
-        card.className = 'cstat-card' + (isWarn ? ' warn' : '');
-        const restartStr = c.restartCount != null ? `restarts: ${c.restartCount}` : '';
-        const u          = fmtUptime(c.uptimeMs);
-        const uptimeStr  = u ? 'up ' + u : '';
-        const metaTitle  = c.startedAt ? ` title="started ${c.startedAt}"` : '';
-        const metaParts  = [restartStr, uptimeStr].filter(Boolean).join(' · ');
-        card.innerHTML =
-          `<span class="cstat-name">${shortName}</span>` +
-          `<span class="cstat-cpu">${cpuStr}</span>` +
-          `<div class="cstat-bar"><div class="cstat-fill ${isWarn ? 'warn' : 'ok'}" style="width:${barPct}%"></div></div>` +
-          `<span class="cstat-ram">${ramStr}</span>` +
-          (metaParts ? `<span class="cstat-meta"${metaTitle}>${metaParts}</span>` : '');
-        strip.appendChild(card);
-      }
-    } catch {}
   }
 
   // ── Trader details panel (one trader at a time, below the cards) ──────────
@@ -1921,12 +1843,6 @@
           walletSubEl.textContent = `cap $${cap.toFixed(0)} @ ${((s.walletCapUtilization || 0) * 100).toFixed(0)}%`;
         }
       }
-      const skipsEl = $('wl-s-wallet-skips');
-      if (skipsEl) {
-        const n = Number(s.walletCapSkips7d || 0);
-        skipsEl.textContent = n;
-        skipsEl.className = 'value ' + (n > 0 ? 'red' : 'blue');
-      }
 
       // Effective open-position limit derived from wallet cap (cap $ / $5 per trade)
       const openLimEl = $('wl-s-open-limit');
@@ -2215,9 +2131,6 @@
 
   checkVpn();
   setInterval(checkVpn, 30_000);
-
-  loadContainers();
-  setInterval(loadContainers, 30_000);
 
   loadSystem();
   setInterval(loadSystem, 30_000);

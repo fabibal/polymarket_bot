@@ -9,7 +9,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "8082:8080"        # polymarket bot dashboard
+      - "127.0.0.1:8082:8080"        # polymarket bot dashboard
       # Read-only Gamma API egress for trading_agent. Loopback-only: this is
       # not an internet-facing proxy and does not change host-wide routing.
       - "127.0.0.1:8888:8888"
@@ -45,11 +45,6 @@ services:
     # host-mounted bullpen creds. Running as root tripped the CLI's BULLPEN_HOME
     # ownership check ("owned by uid 1000, not current uid 0") after a CLI bump.
     user: "1000:1000"
-    # Host docker group (gid 988) — required to read /var/run/docker.sock as a
-    # non-root user; without it every dashboard container-stats call fails EACCES.
-    # Host-specific gid: `stat -c %g /var/run/docker.sock` if the host changes.
-    group_add:
-      - "988"
     # Route ALL traffic through the gluetun VPN container
     network_mode: "service:gluetun"
     depends_on:
@@ -62,8 +57,6 @@ services:
       # Mounted under the node user's HOME (uid 1000) — /root is mode 700 and not
       # traversable by a non-root process.
       - ${BULLPEN_CONFIG_PATH:-~/.bullpen}:/home/node/.bullpen:ro
-      # Docker socket (read-only) — used by dashboard to query container CPU/RAM stats
-      - /var/run/docker.sock:/var/run/docker.sock:ro
       # Host logs dir (read-only) — dashboard reads weekly-macro-scan output
       - ./logs:/app/logs:ro
     # Shared Telegram credentials (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) — used by
