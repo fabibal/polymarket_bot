@@ -208,19 +208,26 @@ export async function getOrderbookDepth(
   slug: string,
   outcome: string,
 ): Promise<OrderbookDepth | null> {
+  // Callers only see null, so the failing step is logged here.
+  const fail = (why: string): null => {
+    console.log(`[depth] ${slug} ${outcome} — ${why}`);
+    return null;
+  };
   try {
     const data = await httpsGet(`${GAMMA_BASE}/markets?slug=${encodeURIComponent(slug)}`) as unknown[];
-    if (!Array.isArray(data) || data.length === 0) return null;
+    if (!Array.isArray(data) || data.length === 0) return fail('gamma: no market for slug');
     const market = data[0] as Record<string, unknown>;
     let outcomes: string[] = [];
     let tokenIds: string[] = [];
     try { outcomes = JSON.parse(market.outcomes as string ?? '[]'); } catch {}
     try { tokenIds = JSON.parse(market.clobTokenIds as string ?? '[]'); } catch {}
     const idx = outcomes.findIndex(o => o.toLowerCase() === outcome.toLowerCase());
-    if (idx === -1 || !tokenIds[idx]) return null;
+    if (idx === -1 || !tokenIds[idx]) {
+      return fail(`gamma: outcome not matched (outcomes=${JSON.stringify(outcomes)}, tokens=${tokenIds.length})`);
+    }
 
     const book = await httpsGet(`${CLOB_BASE}/book?token_id=${encodeURIComponent(tokenIds[idx])}`) as any;
-    if (!book || !Array.isArray(book.asks) || !Array.isArray(book.bids)) return null;
+    if (!book || !Array.isArray(book.asks) || !Array.isArray(book.bids)) return fail('clob: malformed book');
 
     // Polymarket /book returns asks sorted DESC by price; bids sorted ASC by price.
     // Best ask = lowest ask price (last entry); best bid = highest bid price (last entry).
@@ -228,7 +235,9 @@ export async function getOrderbookDepth(
       .filter((a: any) => Number.isFinite(a.price) && Number.isFinite(a.size));
     const bids = book.bids.map((b: any) => ({ price: Number(b.price), size: Number(b.size) }))
       .filter((b: any) => Number.isFinite(b.price) && Number.isFinite(b.size));
-    if (asks.length === 0 || bids.length === 0) return null;
+    if (asks.length === 0 || bids.length === 0) {
+      return fail(`clob: empty book side (asks=${asks.length}, bids=${bids.length})`);
+    }
 
     asks.sort((a: any, b: any) => a.price - b.price);
     bids.sort((a: any, b: any) => b.price - a.price);
@@ -243,8 +252,8 @@ export async function getOrderbookDepth(
       else break;
     }
     return { bestAsk, bestBid, spread: bestAsk - bestBid, askDepth5, askDepth10 };
-  } catch {
-    return null;
+  } catch (err) {
+    return fail(`error: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
