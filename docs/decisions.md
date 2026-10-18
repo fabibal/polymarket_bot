@@ -811,3 +811,25 @@ reading while the socket reconnects):
 The WebSocket subscription stays (it is ~0.5s faster than a 5s sweep). `recovered`
 counts fills the sweep delivered first. The burst case the chain feed exists for
 (RTDS dropping fills in a news burst) has not happened since, so it is still unproven.
+
+## Dashboard has no Docker access: container strip, VPN-badge uptime and wallet-cap-skip counter removed (2026-10-13, `src/dashboard.ts`, `public/index.html`)
+
+Decision: the bot container (which also serves the dashboard) no longer mounts
+`/var/run/docker.sock` and has no `group_add: ["988"]`. Removed with it: the
+CPU / RAM / uptime / restart strip (`/api/containers`), the "uptime" segment of
+the VPN badge (gluetun `StartedAt` via Docker), and the "Wallet Cap Skips" tile
+(`walletCapSkips7d`, a count of `wallet_cap:` lines read from `docker logs`).
+Wallet-cap ENFORCEMENT is unchanged (`src/monitor.ts`, including its
+`Skip BUY ... wallet_cap:` log line). VPN status (egress-country probe, ip /
+country / city) and the "Bot uptime" chip (`/api/system`, process uptime) stay.
+
+Alternative considered: a read-only Docker-API facade on a unix socket to keep
+the strip and the counter. Rejected by the operator: the numbers are not needed
+on the dashboard, and `docker stats` / Grafana show them.
+
+Reason: a socket mounted `:ro` still lets its holder drive dockerd (= root on
+the host), and this process is a web app with an unauthenticated write API
+(watchlist, breaker reset) that shares the VPN namespace. Removing the
+capability is cheaper than defending it. If a skip count is wanted again, count
+`wallet_cap:` inside the bot (an in-process counter exposed by `/api/system`),
+not through the Docker log API.
