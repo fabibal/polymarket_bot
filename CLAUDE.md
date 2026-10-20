@@ -116,6 +116,7 @@ Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/log
 | `check-bullpen-expiry.sh` | `0 9 * * *` | `bullpen --output json status` → `account.session_expires`. Refresh: `bullpen login`. |
 | `git-sync.sh` | `0 3 * * *` | Auto-commits tracked changes (`src/ tests/ scripts/ public/` + root configs) as `chore(sync): daily auto-sync <date>`, pushes `origin/main`. Untracked files NOT auto-added. |
 | `watchdog.sh` | `*/5 * * * *` | Probes `http://localhost:8082/`; ≥2 consecutive non-200 → `docker compose restart bot` + alert. Recovers the gluetun-restart orphan-namespace failure. |
+| `vpn-watch.sh` | `*/5 * * * *` | Polls dashboard `/api/vpn-status`; ≥2 consecutive non-ok → ONE Telegram alert, one more on recovery. Needed because `watchdog.sh` stays green when the WireGuard peer dies (2026-10-20, 5 h blind). |
 | `weekly-lowfreq-scan.sh` | `30 5 * * 0` | Leaderboard pool -> copyability filters -> backtest gate (`scripts/lowfreq_scan.js`, own container in the VPN netns); survivors auto-added as observation (copy_enabled=0, cap 10 standing) via the dashboard API, Telegram per addition. Replaced `weekly-tape-scan.sh` 2026-09-26; the Falcon `weekly-macro-scan.sh` + `check-falcon-expiry.sh` crons were retired 2026-09-27. |
 | `update-bullpen.sh` | `0 2 * * *` | `npm install -g @bullpenfi/cli@latest`, before git-sync at 03:00. Log-only (`bullpen-update.log`), no Telegram alert even on failure. |
 
