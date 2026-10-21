@@ -20,6 +20,7 @@ import {
 } from './health';
 import { getRtdsStatus } from './rtds';
 import { getChainFeedStatus } from './chainfeed';
+import { executionEvidence } from './execution_evidence';
 
 // Watchlist Performance panel reset (2026-09-26 21:38 UTC, when 0x12d6 went to
 // observation and only the LowFreq-* traders were left copying): headline PnL,
@@ -299,6 +300,7 @@ export function startDashboard(): void {
     const avgNetEdge    = realizedAdj / closedCount;
 
     const stats = {
+      executionEvidence: executionEvidence(openTrades, closedTrades),
       totalTrades: openTrades.length + closedTrades.length,
       openTrades: openTrades.length,
       closedTrades: closedTrades.length,
@@ -477,6 +479,7 @@ export function startDashboard(): void {
       const resetClosed = simClosed.filter(openedSinceReset);
       const resetOpen = traderOpenTrades.filter(openedSinceReset);
       const sinceReset = {
+        executionEvidence: executionEvidence(resetOpen, resetClosed),
         closed: resetClosed.length,
         winners: resetClosed.filter(t => tradeCostAdjustedPnl(t) > 0).length,
         netPnl: resetClosed.reduce((s, t) => s + tradeCostAdjustedPnl(t), 0),

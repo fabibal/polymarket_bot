@@ -41,7 +41,7 @@ DRY_RUN simulation-only copy bot. **Watchlist-only** (leaderboard removed
 2. **Per-market entry cap** — two-tier: match-style slugs (ISO date,
    `isMatchStyleSlug` in `filters.ts`) → LIFETIME cap of 1/slug; non-dated
    slugs → `MAX_WATCHLIST_ENTRIES_PER_MARKET` within `MAX_WATCHLIST_ENTRY_WINDOW_MS`.
-3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5`, or when the ask side is empty (`no_asks`, 2026-10-20; an unreadable book still bypasses).
+3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5`, when the ask side is empty (`no_asks`), or when the book cannot be read (`book_unavailable`, 2026-10-21).
 
 Plus ONE per-trader carve-out (longshot filter, trader `0x12d6…`) and the
 per-trader decay kill switch. All four constraints + the threshold-resolution,
@@ -59,11 +59,13 @@ documented in `docs/decisions.md`.
 ## Orderbook depth at fill time (watchlist only)
 Every watchlist BUY snapshots CLOB state via `getOrderbookDepth(slug, outcome)`
 (`src/bullpen.ts`) before `addOpenTrade`: two HTTPS calls (Gamma slug →
-`clobTokenIds`, then CLOB `/book`). Failures fall through null — never blocking.
+`clobTokenIds`, then CLOB `/book`). Failures return null and skip the watchlist BUY; raw trader history is preserved.
 Persisted on `open_trades`/`closed_trades`: `best_ask`, `best_bid`,
 `spread_at_entry`, `ask_depth_5`, `ask_depth_10`, `depth_backfilled`. Dashboard
 `/api/watchlist` exposes per-trader `avgAskDepth5`, `avgSpread`, `liqSampleCount`.
 Backfill caveat (coarse proxy): `docs/KNOWN_ISSUES.md`.
+Dashboard `executionEvidence` separates entry-book documented simulated PnL from
+missing/backfilled entries; historical totals are retained, not certified fills.
 
 ## Environment (docker-compose.yml)
 ```
@@ -107,7 +109,7 @@ Removed 2026-05-29 (inert no-ops): `LEADERBOARD_REFRESH_MS`,
 
 ### Alerts
 Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/logs/`
-— **neither is in the git repo** (server runtime only). Each script: app log
+— scripts are versioned, logs are server runtime only. Each script: app log
 `<name>.log` + cron stdout/stderr `<name>.cron.log`; expiry scripts alert at
 ≤3 days (warning) and ≤0 days (urgent), `FORCE_ALERT=1` for test runs.
 
@@ -119,7 +121,7 @@ Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/log
 | `vpn-watch.sh` | `*/5 * * * *` | Polls dashboard `/api/vpn-status`; ≥2 consecutive non-ok → ONE Telegram alert, one more on recovery. Needed because `watchdog.sh` stays green when the WireGuard peer dies (2026-10-20, 5 h blind). |
 | `weekly-lowfreq-scan.sh` | `30 5 * * 0` | Leaderboards -> copyability -> backtests, using one writable scratch backup per run. Technical errors save `btlogs/`, fail the run and suppress additions; successful survivors become observation (copy_enabled=0, cap 10), Telegram per addition. Manual report-only check: `LOWFREQ_AUTO_ADD=0 LOWFREQ_NOTIFY=0` (no additions/messages); notifications default on. Replaced the tape scan; Falcon crons retired 2026-09-27. |
 | `update-bullpen.sh` | `0 2 * * *` | `npm install -g @bullpenfi/cli@latest`, before git-sync at 03:00. Log-only (`bullpen-update.log`), no Telegram alert even on failure. |
-| `release-watch.sh <id>` | one line per release, 3 min before T: `57 17 28 10 *` FOMC, `27 12 29 10 *` GDP/PCE, `57 14 3 11 *` JOLTS, `27 13 6 11 *` jobs, `27 13 10 11 *` CPI | No-money release-sniping measurement (2026-10-20), no orders. `release_watch.js` polls the official page (host network) and logs the CLOB book (VPN namespace) into `logs/release-watch/<id>/`. One Telegram line per run: detection per source, ws msgs, REST snapshots. Skips unless the id's date is today. Evaluate with `release_watch_report.js <id>`. |
+| `release-watch.sh <id>` | one line per release, 3 min before T: `57 17 28 10 *` FOMC, `27 12 29 10 *` GDP/PCE, `57 14 3 11 *` JOLTS, `27 13 6 11 *` jobs, `27 13 10 11 *` CPI | No-money release-sniping measurement (2026-10-20), no orders. `release_watch.js` polls the official page (host network) and logs the CLOB book (VPN namespace) into `logs/release-watch/<id>/<run-id>/` (latest pointer). Numeric knowledge, full-depth validation, shared $800 fee-inclusive scenarios; invalid data produces no profit estimate. One Telegram line per completed run; `RW_NOTIFY=0` suppresses it. Skips unless the id's date is today. Evaluate with `release_watch_report.js <id> [run-id]`. Details: `docs/release_watch_handoff_2026-10-21.md`. |
 
 New alerts: copy `send_telegram()` and the env loading (incl. the
 `POLYMARKET_TELEGRAM_CHAT_ID` line) from `check-bullpen-expiry.sh`. Always log one

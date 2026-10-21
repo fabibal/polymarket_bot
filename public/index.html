@@ -623,6 +623,11 @@
       <div class="sub" id="wl-s-adj-pnl-sub">—</div>
     </div>
     <div class="stat-card">
+      <div class="label">Entry-book documented PNL · simulated</div>
+      <div class="value" id="wl-s-book-pnl">—</div>
+      <div class="sub" id="wl-s-book-pnl-sub">Closed copies with an entry-time book; not actual fills.</div>
+    </div>
+    <div class="stat-card">
       <div class="label">Realized PNL</div>
       <div class="value" id="wl-s-realized-pnl">—</div>
       <div class="sub">closed positions</div>
@@ -1814,6 +1819,11 @@
       setVal('wl-s-adj-pnl', fmtPnl(wlAdjPnl), pnlClass(wlAdjPnl));
       const wlAdjSub = $('wl-s-adj-pnl-sub');
       if (wlAdjSub) wlAdjSub.textContent = `avg/trade net: ${fmtPnl(s.avgNetEdgePerTrade ?? 0)} · costs $${Number(s.totalTradingCosts ?? 0).toFixed(2)} (slippage + fees)`;
+      const evidence = s.executionEvidence;
+      if (evidence) {
+        setVal('wl-s-book-pnl', fmtPnl(evidence.bookBackedClosedNetPnl), pnlClass(evidence.bookBackedClosedNetPnl));
+        $('wl-s-book-pnl-sub').textContent = `${evidence.closedWithEntryBook} closed copies · excluded ${evidence.closedWithoutEntryBook} without entry evidence (${fmtPnl(evidence.unverifiedClosedNetPnl)}). Simulated fills.`;
+      }
       setVal('wl-s-realized-pnl',  fmtPnl(s.totalRealizedPnl), pnlClass(s.totalRealizedPnl));
       setVal('wl-s-unrealized-pnl',fmtPnl(s.totalUnrealizedPnl), pnlClass(s.totalUnrealizedPnl));
 

@@ -29,7 +29,7 @@ vi.mock('../src/config', () => ({
 // getOrderbookDepth returns null (depth gate bypassed) so non-longshot copies open.
 vi.mock('../src/bullpen', () => ({
   getTraderActivity: (...args: unknown[]) => activityFeed(...args),
-  getOrderbookDepth: vi.fn(async () => null),
+  getOrderbookDepth: vi.fn(async () => ({ bestAsk: 0.5, bestBid: 0.49, spread: 0.01, askDepth5: 10000, askDepth10: 10000 })),
   getTraderPositionSize: vi.fn(async () => null), // sell-fraction lookup → not recorded
   getMarketFeeRate: vi.fn(async () => null), // fee config lookup → fallback rate
 }));

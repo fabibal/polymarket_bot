@@ -27,7 +27,7 @@ vi.mock('../src/config', () => ({
 
 vi.mock('../src/bullpen', () => ({
   getTraderActivity: (...args: unknown[]) => activityFeed(...args),
-  getOrderbookDepth: vi.fn(async () => null),
+  getOrderbookDepth: vi.fn(async () => ({ bestAsk: 0.5, bestBid: 0.49, spread: 0.01, askDepth5: 10000, askDepth10: 10000 })),
   getTraderPositionSize: vi.fn(async () => null),
   getMarketFeeRate: vi.fn(async () => null),
 }));

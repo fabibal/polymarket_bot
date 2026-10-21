@@ -293,10 +293,17 @@ async function processActivity(
       }
 
       // Depth gate: fetch CLOB orderbook BEFORE creating the trade so we can
-      // skip thin books. Non-blocking — depth fetch failure falls through to copy.
+      // skip thin or unknown books. An unreadable book cannot prove a fill.
       // Runs before the wallet cap since dynamic sizing needs ask_depth_5 to know
       // the final amount (costs two HTTP calls on wallet-capped skips — rare).
       const watchlistDepth = await getOrderbookDepth(activity.marketSlug, activity.outcome);
+      if (!watchlistDepth) {
+        console.log(`[monitor] Skip BUY ${activity.marketSlug} — book_unavailable: no verified execution price/depth`);
+        // The raw signal is already in trader_history. Do not retry later and
+        // retroactively credit a fill at this signal's old price.
+        markProcessed(activity.id);
+        continue;
+      }
       // Nobody is selling (the trader's fill swept the last asks): a real BUY cannot fill.
       if (watchlistDepth?.noAsks) {
         console.log(
@@ -395,8 +402,6 @@ async function processActivity(
           `ask=${watchlistDepth.bestAsk.toFixed(3)} bid=${watchlistDepth.bestBid.toFixed(3)} ` +
           `spr=${watchlistDepth.spread.toFixed(3)} d5=$${watchlistDepth.askDepth5.toFixed(0)} d10=$${watchlistDepth.askDepth10.toFixed(0)}`
         );
-      } else {
-        console.log(`[depth] ${activity.marketSlug} ${activity.outcome} — orderbook fetch failed (gate bypassed)`);
       }
       addOpenTrade(trade);
       newTrades++;

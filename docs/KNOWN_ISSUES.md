@@ -90,3 +90,18 @@ history and, where they changed behaviour, in `docs/decisions.md`.
   price, so positions in delisted/unresolvable markets appear to accumulate
   open forever. Not yet diagnosed — needs an age/staleness sweep for
   observation rows before the open count becomes the next OOM.
+
+- **Release-watch is a hypothetical execution study, not measured fills.** Schema 2
+  requires parsed period-specific values, full-depth validation and usable books
+  across decision/arrival. Latency and 25/50/100% liquidity participation are
+  assumptions; HTTP read RTT is not order latency. Unknown parser wording, market
+  rules, fees, connection state or payouts yield unavailable results, not guessed
+  profit. The Fed parser accepts the explicit numeric vote format; unsupported
+  dissent wording is withheld. Legacy captures lack numeric knowledge and
+  connection history and are diagnostic-only. See
+  `docs/release_watch_handoff_2026-10-21.md`.
+
+- **Entry-book documented copy PnL still uses the existing simulator.** The new
+  dashboard evidence split excludes missing/backfilled entry books, but does not
+  prove actual fills or resolution. Existing sizing, exit and threshold-resolution
+  limitations remain; historical trades and risk calculations were not rewritten.

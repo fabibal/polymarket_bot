@@ -833,3 +833,203 @@ the host), and this process is a web app with an unauthenticated write API
 capability is cheaper than defending it. If a skip count is wanted again, count
 `wallet_cap:` inside the bot (an in-process counter exposed by `/api/system`),
 not through the Docker log API.
+
+## Depth gate: skip a BUY when nobody is selling (2026-10-20, `src/bullpen.ts`, `src/monitor.ts`)
+
+**Changes an active constraint (depth gate), at the operator's explicit request.**
+Until now a copy proceeded when the order book could not be read ("orderbook
+fetch failed (gate bypassed)"). The 2026-10-18 logging of the failing step
+showed one cause on 2026-10-20: the two LowFreq-Events EFX earnings BUYs
+(Yes @ $0.98) found a book with bids but **no asks at all** (24 and 13 bids).
+The trader's own fill had swept the last asks, so a real BUY could not have
+filled; the sim copied it anyway with a flat 2% slip and no depth check. This
+is typical of the near-certain (>= $0.85) earnings / CPI / ISM markets, where
+20 of 48 Events copies had no book snapshot, so Events' P&L is probably
+optimistic.
+
+Now `getOrderbookDepth` returns the book with `noAsks: true` when the ask side
+is empty (a successful read, not a failure) and the watchlist copy path skips
+the BUY: `Skip BUY <slug> — no_asks: nobody is selling ...`. The fill is marked
+processed (not retried), like a thin-book skip. Unchanged: an unreadable book
+(Gamma miss, outcome mismatch, network error, empty BID side with asks present)
+still bypasses the gate and copies; the thin-book threshold
+(`DEPTH_GATE_MIN_DEPTH_5`) is untouched. The open-trade depth backfill ignores
+`noAsks` books. Observation traders do not use the book and are unaffected.
+
+Regime boundary: copies from the deploy on (2026-10-20 ~13:00 UTC) skip these
+fills. Older rows are not rewritten; the two EFX positions opened 10:30 UTC
+(+$0.10 / +$0.11 unrealized) stay as opened. Expect fewer Events copies in the
+near-certain price band; compare Events P&L per segment around this date.
+
+## Weekly discovery: repair WAL backup reads and surface backtest failures (2026-10-20)
+
+The October 4, 11 and 18 scans reported DONE with zero survivors, but all
+30 candidate backtest attempts failed technically. `backtest_mirror.js`
+opened the newest WAL-mode daily backup directly under the container's
+read-only `/app` mount; SQLite could not create its sidecar files and the
+first query failed with `SQLITE_CANTOPEN`. `runBacktest` discarded the
+child's diagnostics and treated this like an ordinary strategy rejection.
+
+At the operator's request, `lowfreq_scan.js` now copies the newest standalone
+daily backup once into a unique writable directory under the run's WORK.
+Both exclusions and every backtest use that same snapshot; the fourth
+backtest argument carries its path. The scratch directory is removed in a
+finally block on normal success or failure. A missing backup or a non-empty
+source WAL fails explicitly. The live DB and the read-only project mount
+are untouched.
+
+Each child preserves stdout/stderr under `btlogs/`. Process failures record
+exit code, signal, killed flag, elapsed time and stderr tail in report.json.
+Missing, malformed or incomplete result files are technical errors, and a
+stale result cannot satisfy a new run. Counts distinguish attempts
+(`backtested`), valid results (`backtestSucceeded`), technical errors
+(`backtestErrors`), strategy rejections (`rejected`) and passes. A shortlist
+with zero valid results is `error`; mixed success/failure is `partial`;
+either saves the report, skips auto-addition and exits nonzero. An empty
+shortlist is still a successful scan, not an infrastructure failure.
+
+The wrapper preserves the child's exit code and SUMMARY in its ERROR line,
+so failed runs no longer become DONE. `LOWFREQ_NOTIFY=0` disables Telegram
+and its credential loading/checks for manual verification; the default is
+still 1 for cron. Use it together with `LOWFREQ_AUTO_ADD=0` for a report-only
+run with no external writes. No trading filters or risk thresholds changed.
+
+Regression coverage includes a WAL-mode backup in an unwritable directory,
+scratch cleanup, child exit/timeout/output errors, stale-result rejection,
+normal losing strategies, and an all-failed scan through its real entry
+point. The full existing + new suite passed (190 tests).
+
+## [SUPERSEDED by 2026-10-21 v2] Release-watch measurement (2026-10-20, `scripts/release_watch.js`, `scripts/release-watch.sh`, `scripts/release_watch_report.js`)
+
+> Superseded: hash change no longer starts K, and the book check is full-depth. The "104/104" below was a best-ask match only; the stricter check on the same `test-b` capture found 296/304 full matches (see v2).
+
+**Decision:** at the operator's request, measure with no orders whether this
+server could buy the confirmed bracket seconds after a scheduled US release.
+Five runs, one cron line each:
+- FOMC 10-28, the rehearsal (the rate market is low-margin, the dissent count is not);
+- GDP/PCE 10-29;
+- JOLTS 11-03, an extra BLS latency sample;
+- jobs 11-06;
+- CPI 11-10.
+
+The bot and DRY_RUN are untouched.
+
+**Reason:** the 2026-10-20 review found that most of LowFreq-Events' sim profit
+came from post-release fills a copier cannot get: the book was empty after the
+trader. Market tapes of 13 releases (08-26..10-14) show ~$19.5k taken by fast
+takers in 7 weeks, about 75% of it from FOMC Sep and CPI Sep.
+- CPI, jobs and PCE fills kept coming until about +30s.
+- ISM, JOLTS and earnings were 0-3s races over $2-190 pools.
+
+Whether we would be fast enough is unknown, and that is what this measures.
+
+**How:**
+- The `sources` part runs on the host network, the route a live version would
+  read the pages on.
+  - BLS answers 403 to generic and browser user agents and 200 to a descriptive one.
+  - A release is a change of the normalized page hash. The marker regex is only a
+    sanity check.
+  - A change before the hot window re-baselines.
+- The `book` part runs in the gluetun namespace.
+  - It logs every CLOB websocket message with its server timestamp and receive time.
+  - It takes REST `/books` snapshots around T; their round trip approximates the
+    order latency.
+- The report rebuilds the book by server time.
+  - Winning tokens are YES of the winning bracket plus NO of every losing bracket,
+    the pool the tape analysis counted.
+  - It prints the cheap-ask profit at T+L and at our detection K+L, all and capped
+    at $800.
+- Dry run with live CPI markets: a flip page was detected at +0.14s, and the rebuilt
+  best ask matched the REST snapshot 104/104.
+
+**Alternatives considered:**
+- The BLS API v1: 25 queries a day is too few to poll.
+- Paid news wires: not tried before a free source is measured.
+- Building order execution now: premature until the measurement shows a reachable window.
+
+
+## Weekly discovery: full-run verification (2026-10-21)
+
+The report-only run `20261020T193022Z` completed at 2026-10-20 19:38:10 UTC
+and was checked the following morning. It used fresh Bullpen and Polymarket
+leaderboards: 1,334 stage-2 candidates, 30 activity-qualified, 12 backtested.
+All 12 backtests produced valid results; technical errors 0, strategy
+rejections 12, passes 0, additions 0. Each child retained its stdout/stderr,
+and the temporary database directory was removed. The wrapper recorded DONE
+with the separate success/error/rejection counts; the dashboard's existing
+`/api/discovery` endpoint exposes those counts correctly.
+
+The wrapper was also exercised with local command fixtures: a child exit 7
+propagated as exit 7 and ERROR without a DONE line; exit 0 recorded DONE.
+`LOWFREQ_NOTIFY=0` made no Telegram calls in either case. The real run used
+`LOWFREQ_AUTO_ADD=0 LOWFREQ_NOTIFY=0` and recorded zero messages.
+The existing Sunday 05:30 UTC cron reads these host scripts directly through
+the scan container's bind mount; no bot restart is required.
+
+
+## Manual copy addition: LowFreq-Football-1021 (2026-10-21)
+
+At the operator's explicit request, added
+`0x46072f22bc5624f7ff43489d570fdc7e745ad542` as
+`LowFreq-Football-1021`, with copy enabled and a $5 simulated amount per BUY.
+The choice follows `docs/slow_signal_review_2026-10-21.md`: all nine valid
+recent price-history samples stayed within the trader's entry price +2 cents
+at 30/60/300 seconds. This is research evidence for latency tolerance, not
+proof of executable profitability; the trader did not pass the automatic
+backtest confidence gate. The addition is a manual watchlist decision.
+
+Initialization used the existing dashboard API: added in observation mode at
+11:06:17 UTC, allowed the first poll to ingest history and advance its cursor,
+then enabled copying at 11:21:28 UTC. The cursor had reached
+2026-10-21T00:18:02Z, beyond the latest checked source trade; nine historical
+observation rows were resolved and zero copy rows existed at activation.
+This keeps initial historical ingestion out of the copy performance record.
+
+The dashboard and persisted SQLite row both confirmed copy_enabled=1 and
+copy_amount=5. DRY_RUN remains true. The normal copy rules apply; no new delay,
+price-gap limit or pre-match-only filter was introduced.
+
+
+## Release-watch measurement v2 and unknown-book copies (2026-10-21)
+
+**Authorization:** operator requested the changes proposed in the Codex review and, on 2026-10-21, explicitly confirmed that `book_unavailable` stays.
+This intentionally changes the watchlist depth gate: an unreadable entry book
+now skips the BUY (`book_unavailable`) and marks the signal processed. Trader
+history retains the raw observation; it cannot be retried later at an old price.
+Wallet/risk thresholds, watchlist membership, observation rules and DRY_RUN are
+unchanged. Historical records are retained. Dashboard/API `executionEvidence`
+separates entry-book documented simulated PnL from absent/backfilled evidence.
+Neither group is actual trading PnL.
+
+**Measurement:** hash change, marker and validated numeric knowledge are separate.
+Only period-specific numeric knowledge starts K. Deterministic readers cover
+CPI headline/core MoM/YoY, payroll/unemployment, precise SA JOLTS table levels,
+GDP advance estimate, monthly core PCE and explicit Fed decision/vote statements.
+Feeds and general release indexes are discovery only. Distinct payloads are
+stored compressed and linked to evidence. Parsed values select tokens against
+captured bracket labels/rules, before learning future resolutions. Unsupported
+wording or ambiguous brackets fail closed.
+
+**Execution:** a single $800 cash ledger across events includes captured fees,
+minimum order size, tick size, limit prices, FAK partial fills and a FOK comparison.
+Orders are selected from received books; later server books can only fill the
+previously selected orders within their limits. Latency 0/250/500/1000/2000/5000 ms,
+25/50/100% participation and price caps .90/.95/.99 are sensitivity assumptions,
+not measured execution probabilities. Fixed hosting/funding/redemption costs and
+competitors' reactions to our hypothetical orders are not modeled.
+
+**Validation:** compare all bid/ask prices AND quantities. REST book timestamps
+are last-change timestamps: compare possible complete WS states within each
+captured HTTP request interval, not an assumed generation timestamp. Initial
+book age is not a network-latency sample. Connection epochs, close/error events,
+PONGs and a 20-second liveness bound prevent use of disconnected books; fresh
+full snapshots are required after reconnection. Old captures are diagnostic only.
+Only Gamma closed + resolved status + exact binary payouts may confirm simulated
+PnL. No best-bid winner fallback. A wrong parsed selection can lose money against
+confirmed payouts. Invalid input suppresses profit; it is never silently zeroed.
+
+**Operations:** separate run directories and latest pointer, flock, per-request
+timeouts, hard process timeout/cleanup, quality-aware nonzero exits, and one
+best-effort Telegram summary. RW_NOTIFY=0 also avoids loading shared credentials.
+Existing UTC cron dates stay unchanged. Full implementation, validation results
+and operator commands are in `docs/release_watch_handoff_2026-10-21.md`.
