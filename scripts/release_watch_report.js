@@ -1,217 +1,121 @@
 /**
- * Release-watch report (2026-10-20): what a buyer who learned the number when
- * this server did could have bought, rebuilt from the recorded CLOB websocket
- * book (scripts/release_watch.js). Run in the VPN namespace once the markets
- * resolve; before that the winners are provisional (last recorded prices):
- *
- *   docker run --rm -u 1000:1000 --network container:gluetun \
- *     -v "$PWD":/app:ro -v ~/polymarket_bot/logs/release-watch:/out \
- *     node:20-alpine node /app/scripts/release_watch_report.js <release-id>
- *
- * Winning tokens: per market the outcome that pays $1, i.e. YES of the winning
- * bracket and NO of every losing bracket. Cheap asks on either are the pool the
- * 2026-10-20 race analysis counted. /out/<id>/winners.json (["<token>", ...])
- * overrides the winners.
- *
- * Times: K = our detection, per event: the first changed response of the pages
- * that resolve it (a source's `events`, else every source). Host clock. The
- * book is replayed by server timestamp, assuming the NTP-synced host clock
- * matches the CLOB's; the min(receive - server ts) line bounds the offset.
- *
- * Bands: asks <= CHEAP_PRICE are the stale orders a release race is about; asks
- * above it up to MAX_PRICE are the routine near-par discount on near-certain
- * outcomes, there with or without a release, so they are reported apart.
+ * No-money report: node scripts/release_watch_report.js <release-id> [run-id] [--offline]
+ * RELEASE_WATCH_OUT defaults to /out. Omit run-id to read <id>/latest; legacy
+ * captures remain readable as INVALID diagnostics. Writes report-v2.json only.
+ * --offline requires an existing resolution-v2.json for confirmed PnL; absent
+ * resolution never falls back to best bid, 0.99 prices or winners.json.
  */
 const fs = require('fs');
 const path = require('path');
-
-const OUT_ROOT = process.env.RELEASE_WATCH_OUT || '/out';
-const GAMMA = 'https://gamma-api.polymarket.com';
-const CHEAP_PRICE = 0.90;
-const MAX_PRICE = 0.99;       // a fill above this earns < 1 cent per share
-const WALLET_CAP = 800;       // SIMULATED_WALLET_SIZE * WALLET_CAP_UTILIZATION
-const LATENCIES_MS = [0, 250, 500, 1000, 2000, 5000];
-
-const id = process.argv[2];
-const dir = path.join(OUT_ROOT, id || '');
-if (!id || !fs.existsSync(path.join(dir, 'meta.json'))) {
-  console.error(`usage: release_watch_report.js <release-id>  (needs ${dir}/meta.json)`);
-  process.exit(2);
+const { getJson } = require('./release_watch');
+const { createReplay, validateSnapshots, signalsFromSources, simulatePortfolio } = require('./release_watch_model');
+const readJson = (dir, file, fallback) => { try { return JSON.parse(fs.readFileSync(path.join(dir,file),'utf8')); } catch { return fallback; } };
+const dollars = n => n == null ? 'N/A' : `$${n.toFixed(2)}`;
+function confirmedResolution(m) {
+  if (!m.closed || m.umaResolutionStatus !== 'resolved') return null;
+  let prices, tokens;
+  try { prices=JSON.parse(m.outcomePrices); tokens=JSON.parse(m.clobTokenIds); } catch { return null; }
+  if (prices.length!==2 || tokens.length!==2 || prices.filter(p=>Number(p)===1).length!==1 || prices.filter(p=>Number(p)===0).length!==1) return null;
+  return Object.fromEntries(tokens.map((t,i)=>[t,Number(prices[i])]));
 }
-const readJson = (f, dflt = null) => { try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')); } catch { return dflt; } };
-const usd = x => '$' + Math.round(x).toLocaleString('en-US');
-const secs = ms => (ms >= 0 ? '+' : '') + (ms / 1000).toFixed(2) + 's';
-
-const meta = readJson('meta.json');
-const sources = readJson('sources_summary.json', { sources: [] });
-const book = readJson('book_summary.json', {});
-const T = Date.parse(meta.at);
-const tokenInfo = new Map();
-for (const m of meta.markets) for (const t of m.tokens) tokenInfo.set(t.token, { market: m, outcome: t.outcome });
-
-// ── websocket log -> server-time event list ─────────────────────────────────
-const events = [];
-let offsets = [];
-for (const line of fs.readFileSync(path.join(dir, 'ws.jsonl'), 'utf8').split('\n')) {
-  if (!line) continue;
-  let rec, msgs;
-  try { rec = JSON.parse(line); msgs = JSON.parse(rec.d); } catch { continue; }
-  for (const m of Array.isArray(msgs) ? msgs : [msgs]) {
-    const ts = Number(m.timestamp);
-    if (!ts) continue;
-    offsets.push(rec.r - ts);
-    if (m.event_type === 'book') events.push({ ts, type: 'book', asset: m.asset_id, bids: m.bids || [], asks: m.asks || [] });
-    else if (m.event_type === 'price_change') {
-      for (const pc of m.price_changes || m.changes || []) {
-        events.push({ ts, type: 'pc', asset: pc.asset_id || m.asset_id, side: pc.side, price: pc.price, size: Number(pc.size) });
+async function resolvePayouts(meta) {
+  const payouts={}, markets=[], errors=[];
+  const ids=[...new Set(meta.markets.map(m=>m.conditionId))];
+  for(let i=0;i<ids.length;i+=20) {
+    const batch=ids.slice(i,i+20), q=batch.map(c=>`condition_ids=${encodeURIComponent(c)}`).join('&');
+    try {
+      const data=await getJson(`https://gamma-api.polymarket.com/markets?${q}&closed=true&limit=100`);
+      if(!Array.isArray(data)) throw Error('invalid Gamma response');
+      for(const m of data) {
+        if(!batch.includes(m.conditionId)) continue;
+        const expected=meta.markets.find(x=>x.conditionId===m.conditionId);
+        const result=confirmedResolution(m);
+        if(result && expected.tokens.every(t=>t.token in result)) { Object.assign(payouts,result); markets.push({conditionId:m.conditionId,payouts:result}); }
       }
-    } else if (m.event_type === 'last_trade_price') {
-      events.push({ ts, type: 'trade', asset: m.asset_id, side: m.side, price: Number(m.price), size: Number(m.size) });
-    }
+    } catch(e) { errors.push(String(e)); }
   }
+  return {schemaVersion:2,release:meta.release,runId:meta.runId,checkedAt:Date.now(),source:'Gamma closed + umaResolutionStatus=resolved + exact 1/0',payouts,markets,errors};
 }
-events.sort((a, b) => a.ts - b.ts);          // stable: same-ts events keep file order
-offsets.sort((a, b) => a - b);
-
-// Level keys are normalized ("0.950" and "0.95" are one level).
-const key = p => String(Number(p));
-function bookAt(S) {
-  const books = new Map();
-  for (const e of events) {
-    if (e.ts > S) break;
-    if (e.type === 'book') {
-      books.set(e.asset, {
-        bids: new Map(e.bids.map(l => [key(l.price), Number(l.size)])),
-        asks: new Map(e.asks.map(l => [key(l.price), Number(l.size)])),
-      });
-    } else if (e.type === 'pc') {
-      const b = books.get(e.asset);
-      if (!b) continue;
-      const side = e.side === 'SELL' ? b.asks : b.bids;
-      if (e.size > 0) side.set(key(e.price), e.size); else side.delete(key(e.price));
+function evaluate(meta, sources, book, records, snapshots, resolution) {
+  const replay=createReplay(records), tokens=meta.markets.flatMap(m=>m.tokens.map(t=>t.token));
+  const validation=validateSnapshots(replay,snapshots,tokens);
+  const {signals,issues:signalIssues}=signalsFromSources(meta,sources);
+  const issues=[...replay.issues,...signalIssues];
+  if(meta.schemaVersion!==2 || sources.schemaVersion!==2 || book.schemaVersion!==2 || !replay.hasLifecycle) issues.push('legacy/incomplete capture: no verifiable connection/knowledge history');
+  if(meta.runId!==sources.runId || meta.runId!==book.runId || meta.release!==sources.release || meta.release!==book.release) issues.push('capture identity mismatch');
+  if(!sources.quality?.ok) issues.push(...(sources.quality?.issues||['source quality missing']));
+  if(!book.quality?.ok) issues.push(...(book.quality?.issues||['book quality missing']));
+  if(!validation.ok) issues.push('full-depth REST/WS validation failed');
+  if(!book.snapshots?.length || book.snapshots.some(s=>!s.ok || !snapshots.some(x=>x.label===s.label))) issues.push('snapshot files incomplete');
+  if(new Set(tokens).size!==tokens.length) issues.push('duplicate token identity across events');
+  const payoutByToken={};
+  if(resolution?.schemaVersion===2 && resolution.runId===meta.runId && resolution.release===meta.release) {
+    for(const m of resolution.markets||[]) {
+      const expected=meta.markets.find(x=>x.conditionId===m.conditionId);
+      if(expected && expected.tokens.every(t=>[0,1].includes(m.payouts?.[t.token])) && expected.tokens.reduce((s,t)=>s+m.payouts[t.token],0)===1) Object.assign(payoutByToken,m.payouts);
     }
   }
-  return books;
+  const resolved=meta.markets.filter(m=>m.tokens.every(t=>t.token in payoutByToken)).length;
+  const scenarios=[];
+  // Explicit sensitivity assumptions, NOT observed execution probabilities.
+  // The read RTT stays a diagnostic and is never promoted to order latency.
+  for(const latencyMs of [0,250,500,1000,2000,5000]) for(const fillFraction of [1,0.5,0.25]) for(const maxPrice of [0.90,0.95,0.99]) {
+    const s=simulatePortfolio(meta,signals,replay,{latencyMs,fillFraction,maxPrice,budget:800,orderType:'FAK'});
+    s.valid=s.valid&&!issues.length;
+    if(!s.valid) s.netIfCorrect=null;
+    s.confirmedNet=s.valid&&resolved===meta.markets.length ? s.fills.reduce((sum,f)=>sum+f.shares*payoutByToken[f.token]-f.cost-f.fee,0) : null;
+    scenarios.push(s);
+  }
+  // A FOK comparison demonstrates the effect of requiring full orders.
+  for(const latencyMs of [250,1000,5000]) {
+    const s=simulatePortfolio(meta,signals,replay,{latencyMs,fillFraction:0.5,maxPrice:0.99,budget:800,orderType:'FOK'});
+    s.valid=s.valid&&!issues.length;if(!s.valid)s.netIfCorrect=null;
+    s.confirmedNet=s.valid&&resolved===meta.markets.length ? s.fills.reduce((sum,f)=>sum+f.shares*payoutByToken[f.token]-f.cost-f.fee,0) : null;
+    scenarios.push(s);
+  }
+  const offsets=replay.offsets.sort((a,b)=>a-b);
+  const validScenarios=scenarios.filter(s=>s.valid).length;
+  if(!validScenarios) issues.push('no scenario has complete decision/arrival data');
+  return {schemaVersion:2,release:meta.release,runId:meta.runId,at:meta.at,createdAt:Date.now(),
+    status:issues.length?'INVALID':validScenarios<scenarios.length?'PARTIAL_DATA':resolved===meta.markets.length?'RESOLVED_SIMULATION':'PENDING_RESOLUTION',
+    quality:{ok:!issues.length,issues:[...new Set(issues)]},validation,signals,resolution:{resolved,total:meta.markets.length,errors:resolution?.errors||[]},
+    coverage:{validScenarios,totalScenarios:scenarios.length},
+    clock:{minReceiveMinusServerMs:offsets[0],medianReceiveMinusServerMs:offsets[Math.floor(offsets.length/2)],readRttMs:book.restRttMs,
+      assumption:'Host and exchange clocks assumed aligned. Receive-server differences include network transit, not a measured clock offset. Latency sensitivity is not a measured execution SLA.'},
+    assumptions:{budget:800,sharedAcrossEvents:true,fillFractions:[1,0.5,0.25],fees:'captured per-market Gamma rate; unknown excludes evaluation',
+      settlement:'No cash reuse until resolution. ConfirmedNet is simulated PnL with confirmed payouts, never actual fills.',
+      selection:'First validated numeric signal, received book at decision, fixed limit at hypothetical arrival. No future-winner/price selection.',
+      limitations:['No submitted orders: fill fractions are scenarios, not calibrated probabilities.','Independent future books cannot fully model competitors reacting to our orders.','Fixed server, redemption and funding costs excluded.','Three or four releases test feasibility, not durable profitability.']},scenarios};
 }
-
-// ── winners ─────────────────────────────────────────────────────────────────
-async function resolvedWinners() {
-  const ids = meta.markets.map(m => m.conditionId);
-  const winners = new Set();
-  let resolved = 0;
-  for (let i = 0; i < ids.length; i += 20) {
-    const q = ids.slice(i, i + 20).map(c => `condition_ids=${c}`).join('&');
-    const seen = new Map();
-    for (const closed of ['true', 'false']) {
-      try {
-        const r = await fetch(`${GAMMA}/markets?${q}&closed=${closed}&limit=100`, { headers: { 'User-Agent': 'curl/8.5.0' } });
-        for (const m of r.ok ? await r.json() : []) seen.set(m.conditionId, m);
-      } catch {}
-    }
-    for (const m of seen.values()) {
-      const prices = JSON.parse(m.outcomePrices || '[]').map(Number);
-      const tokens = JSON.parse(m.clobTokenIds || '[]');
-      const wi = prices.findIndex(p => p >= 0.99);
-      if (m.closed && wi >= 0 && prices.every(p => p >= 0.99 || p <= 0.01)) { resolved++; winners.add(tokens[wi]); }
-    }
+async function main() {
+  const args=process.argv.slice(2), offline=args.includes('--offline'), positional=args.filter(a=>!a.startsWith('--'));
+  const [id,requestedRun]=positional;
+  if(!/^[a-z0-9_-]+$/.test(id||'') || requestedRun&&!/^[a-zA-Z0-9_-]+$/.test(requestedRun)) throw Error('usage: release_watch_report.js <id> [run-id] [--offline]');
+  const root=path.join(process.env.RELEASE_WATCH_OUT||'/out',id);
+  const latest=fs.existsSync(path.join(root,'latest'))?fs.readFileSync(path.join(root,'latest'),'utf8').trim():null;
+  const run=requestedRun||latest;
+  if(run&&!/^[a-zA-Z0-9_-]+$/.test(run))throw Error('invalid latest run');
+  const dir=run?path.join(root,run):root;
+  const meta=readJson(dir,'meta.json');if(!meta)throw Error('missing capture metadata');
+  const sources=readJson(dir,'sources_summary.json',{sources:[]}), book=readJson(dir,'book_summary.json',{});
+  const records=[];
+  for(const line of fs.readFileSync(path.join(dir,'ws.jsonl'),'utf8').split('\n')) {
+    if(!line)continue;
+    try{records.push(JSON.parse(line));}catch{records.push({malformed:true});}
   }
-  return { winners, resolved };
+  const snapshots=fs.readdirSync(dir).filter(f=>/^books_.*\.json$/.test(f)).map(f=>readJson(dir,f,{label:f,books:[]}));
+  let resolution=readJson(dir,'resolution-v2.json');
+  if(!offline){resolution=await resolvePayouts(meta);fs.writeFileSync(path.join(dir,'resolution-v2.json'),JSON.stringify(resolution,null,2));}
+  const report=evaluate(meta,sources,book,records,snapshots,resolution);
+  fs.writeFileSync(path.join(dir,'report-v2.json'),JSON.stringify(report,null,2));
+  console.log(`${id} / ${run||'legacy'}: ${report.status}`);
+  console.log(`Full book validation ${report.validation.fullSame}/${report.validation.checked}; best ask only ${report.validation.bestAskSame}/${report.validation.checked}`);
+  for(const issue of report.quality.issues)console.log(`INVALID: ${issue}`);
+  for(const s of report.signals)console.log(`Signal ${s.event}: ${s.metric}=${s.value}, K=+${((s.at-Date.parse(meta.at))/1000).toFixed(3)}s (${s.source})`);
+  console.log('One shared $800 wallet including fees. Fill fractions and latency are assumptions. No orders submitted.');
+  console.log('delay_ms fill_fraction max_price type spent fees net_if_signal_correct confirmed_simulated_net');
+  for(const s of report.scenarios)console.log(`${s.latencyMs} ${s.fillFraction} ${s.maxPrice} ${s.orderType} ${dollars(s.spent)} ${dollars(s.fees)} ${dollars(s.netIfCorrect)} ${dollars(s.confirmedNet)}${s.valid?'':' INVALID'}`);
+  return report.quality.ok?0:3;
 }
-
-function provisionalWinners() {
-  // Last recorded book: the token whose best bid is >= 0.90.
-  const books = bookAt(Infinity), winners = new Set();
-  for (const m of meta.markets) {
-    for (const t of m.tokens) {
-      const b = books.get(t.token);
-      const bestBid = b && b.bids.size ? Math.max(...[...b.bids.keys()].map(Number)) : 0;
-      if (bestBid >= 0.9) winners.add(t.token);
-    }
-  }
-  return winners;
-}
-
-// ── pool at a server time ───────────────────────────────────────────────────
-function pool(S, tokens) {
-  const books = bookAt(S);
-  const levels = [];
-  for (const tok of tokens) {
-    const b = books.get(tok);
-    if (!b) continue;
-    for (const [p, size] of b.asks) { const price = Number(p); if (price <= MAX_PRICE && size > 0) levels.push({ tok, price, size }); }
-  }
-  levels.sort((a, b) => a.price - b.price);
-  const o = { cheapCost: 0, cheapProfit: 0, parProfit: 0, capProfit: 0, best: '-' };
-  let capCost = 0;
-  for (const l of levels) {
-    if (l.price <= CHEAP_PRICE) { o.cheapCost += l.size * l.price; o.cheapProfit += l.size * (1 - l.price); }
-    else o.parProfit += l.size * (1 - l.price);
-    const room = WALLET_CAP - capCost;
-    if (room > 0) { const sh = Math.min(l.size, room / l.price); capCost += sh * l.price; o.capProfit += sh * (1 - l.price); }
-  }
-  if (levels[0]) { const i = tokenInfo.get(levels[0].tok); o.best = `${levels[0].price} x ${Math.round(levels[0].size)} (${i.market.slug.slice(0, 40)} ${i.outcome})`; }
-  return o;
-}
-
-(async () => {
-  console.log(`# Release watch report: ${id} (T = ${meta.at}, ${meta.markets.length} markets)`);
-  for (const s of sources.sources) {
-    console.log(`  source ${s.name}: ${s.firstChange ? `${secs(s.firstChange.offsetMs)} (sent ${secs(s.firstChange.t0 - T)}), marker ${s.firstChange.marker ? 'yes' : 'NO'}` : 'no change'}; ${s.polls} polls, ${s.errors} errors${s.baseline && s.baseline.markerMatches ? ', marker already in baseline' : ''}`);
-  }
-  console.log(`  clock: receive - server ts min ${offsets[0]}ms, median ${offsets[Math.floor(offsets.length / 2)]}ms over ${offsets.length} msgs; REST /books rtt median ${book.restRttMs ? book.restRttMs.median : '?'}ms`);
-
-  // Winners
-  let winners, how;
-  const override = readJson('winners.json');
-  if (Array.isArray(override)) { winners = new Set(override); how = 'winners.json'; }
-  else {
-    const r = await resolvedWinners();
-    if (r.resolved === meta.markets.length) { winners = r.winners; how = 'resolved on Gamma'; }
-    else { winners = provisionalWinners(); how = `PROVISIONAL (best bid >= 0.90 at the end; ${r.resolved}/${meta.markets.length} resolved)`; }
-  }
-  console.log(`  winning tokens: ${winners.size} (${how})`);
-  for (const tok of winners) { const i = tokenInfo.get(tok); if (i && i.outcome === 'Yes') console.log(`    YES ${i.market.question}`); }
-
-  // Per event: its own detection time K and its winning tokens.
-  const rtt = book.restRttMs && book.restRttMs.median ? book.restRttMs.median : 300;
-  const report = [];
-  for (const ev of meta.events) {
-    const served = sources.sources.filter(s => s.firstChange && (!s.events || s.events.includes(ev))).sort((a, b) => a.firstChange.t1 - b.firstChange.t1);
-    const K = served.length ? served[0].firstChange.t1 : null;
-    const toks = [...winners].filter(t => tokenInfo.get(t) && tokenInfo.get(t).market.event === ev);
-    console.log(`\n## ${ev}: ${toks.length} winning tokens, K = ${K ? secs(K - T) + ' via ' + served[0].name : 'NONE (no page change)'}`);
-    const rows = [['before the release (T-1s)', T - 1000]];
-    for (const L of LATENCIES_MS) rows.push([`knew at T, order +${L}ms`, T + L]);
-    if (K) for (const L of [...LATENCIES_MS, rtt]) rows.push([`our K, order +${L}ms${L === rtt ? ' (rtt)' : ''}`, K + L]);
-    let pre = null;
-    console.log(`  ${''.padEnd(32)} ${'at'.padStart(8)}  asks <= ${CHEAP_PRICE}: profit (gone since T-1s) | ${CHEAP_PRICE}-${MAX_PRICE} | best $${WALLET_CAP} | best ask`);
-    for (const [label, S] of rows) {
-      const p = pool(S, toks);
-      if (pre === null) pre = p.cheapProfit;
-      report.push({ event: ev, label, at: S - T, K: K ? K - T : null, ...p });
-      console.log(`  ${label.padEnd(32)} ${secs(S - T).padStart(8)}  ${usd(p.cheapProfit).padStart(7)} on ${usd(p.cheapCost).padStart(7)} (${usd(pre - p.cheapProfit)} gone) | ${usd(p.parProfit).padStart(5)} | ${usd(p.capProfit).padStart(5)} | ${p.best}`);
-    }
-  }
-
-  // Who took it: trades on winning tokens around T (server time)
-  const taken = events.filter(e => e.type === 'trade' && winners.has(e.asset) && e.ts >= T - 1000 && e.ts <= T + 60_000);
-  const cheapBuys = taken.filter(e => e.side === 'BUY' && e.price <= CHEAP_PRICE);
-  console.log(`\n  trades on winning tokens T-1s..T+60s: ${taken.length}; taker BUYs <= ${CHEAP_PRICE}: ${cheapBuys.length}, profit ${usd(cheapBuys.reduce((s, e) => s + e.size * (1 - e.price), 0))}`);
-  for (const e of taken.slice(0, 12)) console.log(`    ${secs(e.ts - T)} ${e.side} ${e.price} x ${Math.round(e.size)} ${tokenInfo.get(e.asset).market.slug.slice(0, 40)} ${tokenInfo.get(e.asset).outcome}`);
-
-  // Validation: rebuilt book vs REST snapshots
-  let checked = 0, same = 0;
-  for (const f of fs.readdirSync(dir).filter(x => /^books_.*\.json$/.test(x))) {
-    const snap = readJson(f);
-    for (const b of snap.books || []) {
-      if (!winners.has(b.asset_id)) continue;
-      const rebuilt = bookAt(Number(b.timestamp)).get(b.asset_id);
-      const restAsk = (b.asks || []).map(l => Number(l.price)).sort((x, y) => x - y)[0];
-      const wsAsk = rebuilt && rebuilt.asks.size ? Math.min(...[...rebuilt.asks.keys()].map(Number)) : undefined;
-      checked++;
-      if (restAsk === wsAsk) same++;
-    }
-  }
-  console.log(`\n  validation: rebuilt best ask equals the REST snapshot for ${same}/${checked} winning-token snapshots`);
-  fs.writeFileSync(path.join(dir, 'report.json'), JSON.stringify({ id, at: meta.at, winnersHow: how, winners: [...winners], rows: report, validation: { checked, same } }, null, 1));
-})();
+if(require.main===module)main().then(code=>{process.exitCode=code;}).catch(e=>{console.error(e);process.exitCode=1;});
+module.exports={evaluate,confirmedResolution,resolvePayouts};
