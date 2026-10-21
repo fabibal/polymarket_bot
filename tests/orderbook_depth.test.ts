@@ -53,10 +53,18 @@ describe('getOrderbookDepth failure logging', () => {
     expect(logged()).toContain('gamma: outcome not matched (outcomes=["Yes","No"], tokens=2)');
   });
 
-  it('logs an empty book side', async () => {
-    replies.push(GAMMA_OK, { body: { asks: [], bids: [{ price: '0.5', size: '10' }] } });
+  it('reports an empty ask side as data (noAsks), not as a failure', async () => {
+    replies.push(GAMMA_OK, { body: { asks: [], bids: [{ price: '0.5', size: '10' }, { price: '0.4', size: '5' }] } });
+    expect(await getOrderbookDepth('m', 'Yes')).toEqual({
+      bestAsk: 0, bestBid: 0.5, spread: 0, askDepth5: 0, askDepth10: 0, noAsks: true,
+    });
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it('still logs an empty bid side as a failure (a buy is possible, the exit is not priced)', async () => {
+    replies.push(GAMMA_OK, { body: { asks: [{ price: '0.6', size: '10' }], bids: [] } });
     expect(await getOrderbookDepth('m', 'Yes')).toBeNull();
-    expect(logged()).toContain('clob: empty book side (asks=0, bids=1)');
+    expect(logged()).toContain('clob: empty book side (asks=1, bids=0)');
   });
 
   it('logs the HTTP error message', async () => {

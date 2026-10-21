@@ -41,7 +41,7 @@ DRY_RUN simulation-only copy bot. **Watchlist-only** (leaderboard removed
 2. **Per-market entry cap** — two-tier: match-style slugs (ISO date,
    `isMatchStyleSlug` in `filters.ts`) → LIFETIME cap of 1/slug; non-dated
    slugs → `MAX_WATCHLIST_ENTRIES_PER_MARKET` within `MAX_WATCHLIST_ENTRY_WINDOW_MS`.
-3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5`.
+3. **Depth gate** — skip BUY when CLOB `ask_depth_5 < DEPTH_GATE_MIN_DEPTH_5`, or when the ask side is empty (`no_asks`, 2026-10-20; an unreadable book still bypasses).
 
 Plus ONE per-trader carve-out (longshot filter, trader `0x12d6…`) and the
 per-trader decay kill switch. All four constraints + the threshold-resolution,
@@ -117,8 +117,9 @@ Live scripts under `~/polymarket_bot/scripts/`, logs under `~/polymarket_bot/log
 | `git-sync.sh` | `0 3 * * *` | Auto-commits tracked changes (`src/ tests/ scripts/ public/` + root configs) as `chore(sync): daily auto-sync <date>`, pushes `origin/main`. Untracked files NOT auto-added. |
 | `watchdog.sh` | `*/5 * * * *` | Probes `http://localhost:8082/`; ≥2 consecutive non-200 → `docker compose restart bot` + alert. Recovers the gluetun-restart orphan-namespace failure. |
 | `vpn-watch.sh` | `*/5 * * * *` | Polls dashboard `/api/vpn-status`; ≥2 consecutive non-ok → ONE Telegram alert, one more on recovery. Needed because `watchdog.sh` stays green when the WireGuard peer dies (2026-10-20, 5 h blind). |
-| `weekly-lowfreq-scan.sh` | `30 5 * * 0` | Leaderboard pool -> copyability filters -> backtest gate (`scripts/lowfreq_scan.js`, own container in the VPN netns); survivors auto-added as observation (copy_enabled=0, cap 10 standing) via the dashboard API, Telegram per addition. Replaced `weekly-tape-scan.sh` 2026-09-26; the Falcon `weekly-macro-scan.sh` + `check-falcon-expiry.sh` crons were retired 2026-09-27. |
+| `weekly-lowfreq-scan.sh` | `30 5 * * 0` | Leaderboards -> copyability -> backtests, using one writable scratch backup per run. Technical errors save `btlogs/`, fail the run and suppress additions; successful survivors become observation (copy_enabled=0, cap 10), Telegram per addition. Manual report-only check: `LOWFREQ_AUTO_ADD=0 LOWFREQ_NOTIFY=0` (no additions/messages); notifications default on. Replaced the tape scan; Falcon crons retired 2026-09-27. |
 | `update-bullpen.sh` | `0 2 * * *` | `npm install -g @bullpenfi/cli@latest`, before git-sync at 03:00. Log-only (`bullpen-update.log`), no Telegram alert even on failure. |
+| `release-watch.sh <id>` | one line per release, 3 min before T: `57 17 28 10 *` FOMC, `27 12 29 10 *` GDP/PCE, `57 14 3 11 *` JOLTS, `27 13 6 11 *` jobs, `27 13 10 11 *` CPI | No-money release-sniping measurement (2026-10-20), no orders. `release_watch.js` polls the official page (host network) and logs the CLOB book (VPN namespace) into `logs/release-watch/<id>/`. One Telegram line per run: detection per source, ws msgs, REST snapshots. Skips unless the id's date is today. Evaluate with `release_watch_report.js <id>`. |
 
 New alerts: copy `send_telegram()` and the env loading (incl. the
 `POLYMARKET_TELEGRAM_CHAT_ID` line) from `check-bullpen-expiry.sh`. Always log one

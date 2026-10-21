@@ -15,7 +15,8 @@
 # Cron: 30 5 * * 0 ~/polymarket_bot/scripts/weekly-lowfreq-scan.sh
 #   (05:30, not 05:00: the Sunday 05:00 `docker system prune` deleted the
 #   unused node:20-alpine image under the first scheduled run on 2026-09-27.)
-# Test: LOWFREQ_AUTO_ADD=0 ./weekly-lowfreq-scan.sh   (report only, adds nobody)
+# Test: LOWFREQ_AUTO_ADD=0 LOWFREQ_NOTIFY=0 ./weekly-lowfreq-scan.sh
+#       (report only: no additions or Telegram messages)
 #
 # Telegram creds: ~/.env.shared (cross-project, chmod 600).
 # Logs: ~/polymarket_bot/logs/weekly-lowfreq-scan.log (last 200 lines);
@@ -33,6 +34,7 @@ TS="$(date -u +'%F %T') UTC"
 RUN_ID="$(date -u +'%Y%m%dT%H%M%SZ')"
 WORK="${RUNS_DIR}/${RUN_ID}"
 AUTO_ADD="${LOWFREQ_AUTO_ADD:-1}"
+NOTIFY="${LOWFREQ_NOTIFY:-1}"
 BULLPEN_BIN="${BULLPEN_BIN:-$(command -v bullpen || echo "${HOME}/.npm-global/bin/bullpen")}"
 
 mkdir -p "${WORK}/bullpen" "${WORK}/btcache"
@@ -40,7 +42,7 @@ mkdir -p "${WORK}/bullpen" "${WORK}/btcache"
 # ----- Telegram creds (load from shared infra file) ---------------------------
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
-if [ -f "${SHARED_ENV}" ]; then
+if [ "${NOTIFY}" = "1" ] && [ -f "${SHARED_ENV}" ]; then
     # shellcheck disable=SC1090
     set -a; . "${SHARED_ENV}"; set +a
 fi
@@ -57,16 +59,19 @@ fail_infra() {
     exit 2
 }
 
-[ -f "${SHARED_ENV}" ] || fail_infra "shared env file missing at ${SHARED_ENV}"
-[ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ] \
-    || fail_infra "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID empty after sourcing ${SHARED_ENV}"
-[[ "${TELEGRAM_BOT_TOKEN}" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] \
-    || fail_infra "TELEGRAM_BOT_TOKEN failed format check"
-[[ "${TELEGRAM_CHAT_ID}" =~ ^-?[0-9]+$ ]] \
-    || fail_infra "TELEGRAM_CHAT_ID failed format check"
+if [ "${NOTIFY}" = "1" ]; then
+    [ -f "${SHARED_ENV}" ] || fail_infra "shared env file missing at ${SHARED_ENV}"
+    [ -n "${TELEGRAM_BOT_TOKEN}" ] && [ -n "${TELEGRAM_CHAT_ID}" ] \
+        || fail_infra "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID empty after sourcing ${SHARED_ENV}"
+    [[ "${TELEGRAM_BOT_TOKEN}" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] \
+        || fail_infra "TELEGRAM_BOT_TOKEN failed format check"
+    [[ "${TELEGRAM_CHAT_ID}" =~ ^-?[0-9]+$ ]] \
+        || fail_infra "TELEGRAM_CHAT_ID failed format check"
+fi
 
 send_telegram() {
     local msg="$1"
+    [ "${NOTIFY}" = "1" ] || return 0
     curl -fsS --max-time 15 \
         -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
         --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
@@ -107,16 +112,19 @@ for tp in 90d 30d all; do
         done
     done
 done
-echo "${TS} | START | bullpen_queries_ok=${q_ok}/${q} | auto_add=${AUTO_ADD}" >> "${LOG_FILE}"
+echo "${TS} | START | bullpen_queries_ok=${q_ok}/${q} | auto_add=${AUTO_ADD} | notify=${NOTIFY}" >> "${LOG_FILE}"
 
 # ----- 2. Scan + backtest gate in its own container --------------------------
-if ! timeout 3h docker run --rm -u 1000:1000 --network container:gluetun \
+SCAN_EXIT=0
+timeout 3h docker run --rm -u 1000:1000 --network container:gluetun \
         -e LOWFREQ_AUTO_ADD="${AUTO_ADD}" \
         -v "${PROJECT_DIR}:/app:ro" -v "${WORK}:/work" \
-        node:20-alpine node /app/scripts/lowfreq_scan.js > "${WORK}/scan.log" 2>&1; then
-    echo "${TS} | ERROR | lowfreq_scan_failed | log=${WORK}/scan.log" >> "${LOG_FILE}"
-    send_telegram "🚨 [polymarket_bot] weekly-lowfreq-scan: lowfreq_scan.js failed. See ${WORK}/scan.log."
-    exit 1
+        node:20-alpine node /app/scripts/lowfreq_scan.js > "${WORK}/scan.log" 2>&1 || SCAN_EXIT=$?
+SUMMARY="$(grep '^SUMMARY ' "${WORK}/scan.log" | tail -1)"
+if [ "${SCAN_EXIT}" -ne 0 ]; then
+    echo "${TS} | ERROR | lowfreq_scan_failed | exit=${SCAN_EXIT} | ${SUMMARY#SUMMARY } | log=${WORK}/scan.log" >> "${LOG_FILE}"
+    send_telegram "🚨 [polymarket_bot] weekly-lowfreq-scan: scan failed (exit ${SCAN_EXIT}). ${SUMMARY#SUMMARY }. See ${WORK}/scan.log and btlogs/."
+    exit "${SCAN_EXIT}"
 fi
 
 # ----- 3. One Telegram message per added trader ------------------------------
@@ -127,11 +135,11 @@ while IFS= read -r line; do
     [ -z "${b64}" ] && continue
     msg="$(printf '%s' "${b64}" | base64 -d 2>/dev/null)"
     [ -z "${msg}" ] && continue
+    [ "${NOTIFY}" = "1" ] || continue
     ADDED_COUNT=$((ADDED_COUNT + 1))
     send_telegram "${msg}" || SEND_FAILS=$((SEND_FAILS + 1))
 done < <(grep '^TELEGRAM_MSG_B64 ' "${WORK}/scan.log")
 
-SUMMARY="$(grep '^SUMMARY ' "${WORK}/scan.log" | tail -1)"
 echo "${TS} | DONE | ${SUMMARY#SUMMARY } | telegram_sent=${ADDED_COUNT} | telegram_send_fails=${SEND_FAILS}" >> "${LOG_FILE}"
 
 # ----- Trim app log to last 200 lines; drop the bulky caches, prune old runs --

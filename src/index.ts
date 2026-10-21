@@ -24,7 +24,7 @@ async function backfillOpenTradeDepth(): Promise<void> {
   let ok = 0;
   for (const t of targets) {
     const d = await getOrderbookDepth(t.marketSlug, t.outcome);
-    if (d) {
+    if (d && !d.noAsks) {
       updateOpenTradeDepth(t.id, {
         bestAsk: d.bestAsk, bestBid: d.bestBid,
         askDepth5: d.askDepth5, askDepth10: d.askDepth10,

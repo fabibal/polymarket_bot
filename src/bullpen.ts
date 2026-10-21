@@ -195,6 +195,8 @@ export interface OrderbookDepth {
   spread: number;
   askDepth5: number;   // $ within 5% of best_ask
   askDepth10: number;  // $ within 10% of best_ask
+  /** The book was read but nobody sells: a BUY cannot fill. Price and depth fields are 0 then. */
+  noAsks?: boolean;
 }
 
 const CLOB_BASE = 'https://clob.polymarket.com';
@@ -235,9 +237,12 @@ export async function getOrderbookDepth(
       .filter((a: any) => Number.isFinite(a.price) && Number.isFinite(a.size));
     const bids = book.bids.map((b: any) => ({ price: Number(b.price), size: Number(b.size) }))
       .filter((b: any) => Number.isFinite(b.price) && Number.isFinite(b.size));
-    if (asks.length === 0 || bids.length === 0) {
-      return fail(`clob: empty book side (asks=${asks.length}, bids=${bids.length})`);
+    if (asks.length === 0) {
+      // Data, not a failure: the trader's own fill often sweeps the last asks. The copy path refuses the BUY.
+      const bestBid = bids.reduce((m: number, b: any) => Math.max(m, b.price), 0);
+      return { bestAsk: 0, bestBid, spread: 0, askDepth5: 0, askDepth10: 0, noAsks: true };
     }
+    if (bids.length === 0) return fail(`clob: empty book side (asks=${asks.length}, bids=0)`);
 
     asks.sort((a: any, b: any) => a.price - b.price);
     bids.sort((a: any, b: any) => b.price - a.price);

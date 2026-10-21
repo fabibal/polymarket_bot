@@ -124,26 +124,40 @@ async function loadPolymarketPool() {
   return out;
 }
 
-async function loadExclusions() {
+// Daily backups are standalone SQLite snapshots, but retain journal_mode=WAL.
+// Even a readonly connection may need to create -shm/-wal beside the file.
+// Keep one writable scratch copy for exclusions AND every child backtest;
+// never open the live database or make the /app mount writable.
+async function withBacktestSnapshot(run, { work = WORK, backupsDir = path.join(__dirname, '../data/backups') } = {}) {
+  fs.mkdirSync(work, { recursive: true });
+  const latest = fs.readdirSync(backupsDir).filter(f => /^store-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort().pop();
+  if (!latest) throw new Error(`No daily database backup found in ${backupsDir}`);
+  const source = path.join(backupsDir, latest);
+  // A non-empty WAL means this is not a standalone snapshot; copying just
+  // the .db would silently omit committed rows.
+  if (fs.existsSync(source + '-wal') && fs.statSync(source + '-wal').size > 0) {
+    throw new Error(`Backup still has a non-empty WAL: ${source}`);
+  }
+  const dir = fs.mkdtempSync(path.join(work, '.backtest-db-'));
+  const dbPath = path.join(dir, latest);
+  try {
+    fs.copyFileSync(source, dbPath);
+    return await run(dbPath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function loadExclusions(dbPath) {
   const skip = new Set();
   const wl = await getJson(`${DASH}/api/watchlist`);
   for (const w of wl.items || []) skip.add(String(w.address).toLowerCase());
-  // excluded_traders from the newest daily backup (never the live WAL file).
-  const Database = require('/app/node_modules/better-sqlite3');
-  const dir = '/app/data/backups';
-  const f = fs.readdirSync(dir).filter(x => /^store-\d{4}-\d{2}-\d{2}\.db$/.test(x)).sort().pop();
-  if (f) {
-    // Backups are WAL-mode: even a readonly open must create a -shm next to the
-    // file, which fails on the :ro /app mount. Open a scratch copy in WORK instead.
-    const tmp = path.join(WORK, 'exclusions.db');
-    fs.copyFileSync(path.join(dir, f), tmp);
-    try {
-      const db = new Database(tmp, { readonly: true, fileMustExist: true });
-      for (const r of db.prepare('SELECT address FROM excluded_traders').all()) skip.add(r.address.toLowerCase());
-      db.close();
-    } finally {
-      for (const s of ['', '-shm', '-wal']) fs.rmSync(tmp + s, { force: true });
-    }
+  const Database = require('better-sqlite3');
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+  try {
+    for (const r of db.prepare('SELECT address FROM excluded_traders').all()) skip.add(r.address.toLowerCase());
+  } finally {
+    db.close();
   }
   return { skip, watchlist: wl.items || [] };
 }
@@ -216,23 +230,66 @@ async function quality(a) {
 const stage4Pass = q => q.closed180 >= S4_MIN_CLOSED_180D && q.top1Share <= S4_MAX_TOP1_SHARE && q.net > 0;
 
 // ── Stage 5: backtest gate ──────────────────────────────────────────────────
-function runBacktest(a, since) {
-  return new Promise(resolve => {
-    execFile('node', ['/app/scripts/backtest_mirror.js', a, since],
-      { env: { ...process.env, BACKTEST_CACHE: path.join(WORK, 'btcache') }, timeout: BACKTEST_TIMEOUT_MS, maxBuffer: 16 << 20 },
-      err => {
-        const file = path.join(WORK, 'btcache', `results_${a.slice(0, 10)}_${since}.json`);
-        if (err || !fs.existsSync(file)) return resolve(null);
-        resolve(JSON.parse(fs.readFileSync(file, 'utf8')));
+function runBacktest(a, since, dbPath, {
+  work = WORK, script = path.join(__dirname, 'backtest_mirror.js'), timeoutMs = BACKTEST_TIMEOUT_MS,
+} = {}) {
+  const cache = path.join(work, 'btcache');
+  const logs = path.join(work, 'btlogs');
+  fs.mkdirSync(cache, { recursive: true });
+  fs.mkdirSync(logs, { recursive: true });
+  const file = path.join(cache, `results_${a.slice(0, 10)}_${since}.json`);
+  const stdoutLog = path.join(logs, `${a}_${since}.stdout.log`);
+  const stderrLog = path.join(logs, `${a}_${since}.stderr.log`);
+  // A successful process must produce a NEW result, never reuse a stale one.
+  fs.rmSync(file, { force: true });
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    execFile(process.execPath, [script, a, since, dbPath],
+      { env: { ...process.env, BACKTEST_CACHE: cache }, timeout: timeoutMs, maxBuffer: 16 << 20 },
+      (err, stdout, stderr) => {
+        try {
+          fs.writeFileSync(stdoutLog, stdout);
+          fs.writeFileSync(stderrLog, stderr);
+          const diagnostics = {
+            code: err?.code ?? null,
+            exitCode: typeof err?.code === 'number' ? err.code : err ? null : 0,
+            signal: err?.signal ?? null,
+            killed: err?.killed === true,
+            durationMs: Date.now() - started,
+            stdoutLog: path.relative(work, stdoutLog),
+            stderrLog: path.relative(work, stderrLog),
+            stderrTail: stderr.slice(-4000),
+          };
+          let result;
+          try {
+            if (err) throw err;
+            if (!fs.existsSync(file)) throw new Error('Backtest exited without a result file');
+            result = evaluateBacktest(JSON.parse(fs.readFileSync(file, 'utf8')));
+          } catch (error) {
+            const message = err
+              ? `Backtest process failed (code=${err.code ?? 'none'}, signal=${err.signal ?? 'none'}, killed=${err.killed === true})`
+              : error.message;
+            result = { pass: false, failed: ['backtest technical error'], technicalError: { message, ...diagnostics } };
+          }
+          resolve(result);
+        } catch (error) {
+          reject(error); // e.g. cannot preserve logs: fail the scan visibly
+        }
       });
   });
 }
 
 /** Gate on the live copy model ('A  live') at measured (x1) and double (x2) cost. */
 function evaluateBacktest(res) {
-  const live = k => res.results.find(r => r.k === k)?.models.find(m => m.name.startsWith('A '))?.s;
+  const live = k => res?.results?.find(r => r.k === k)?.models?.find(m => typeof m.name === 'string' && m.name.startsWith('A '))?.s;
   const a1 = live(1), a2 = live(2);
-  if (!a1 || !a2) return { pass: false, reason: 'no live-model result' };
+  if (!a1 || !a2) throw new Error('Missing live-model result at cost x1 or x2');
+  if (![a1.total, a1.markets, a1.fees, a1.top1, a2.total].every(Number.isFinite)
+      || !Array.isArray(a1.ci) || a1.ci.length !== 2 || !a1.ci.every(Number.isFinite)
+      || !a1.byMonth || typeof a1.byMonth !== 'object' || Array.isArray(a1.byMonth)
+      || !Object.values(a1.byMonth).every(Number.isFinite)) {
+    throw new Error('Invalid live-model backtest metrics');
+  }
   const months = Object.keys(a1.byMonth).sort();
   const vals = months.map(m => a1.byMonth[m]);
   const half = Math.floor(vals.length / 2);
@@ -255,6 +312,16 @@ function evaluateBacktest(res) {
   };
 }
 
+function summarizeBacktests(evaluated) {
+  const backtestErrors = evaluated.filter(c => c.bt.technicalError).length;
+  const passed = evaluated.filter(c => !c.bt.technicalError && c.bt.pass).length;
+  const backtestSucceeded = evaluated.length - backtestErrors;
+  return {
+    status: backtestErrors === 0 ? 'done' : backtestSucceeded === 0 ? 'error' : 'partial',
+    counts: { backtested: evaluated.length, backtestSucceeded, backtestErrors, rejected: backtestSucceeded - passed, passed },
+  };
+}
+
 // ── Stage 6: auto-add as observation ────────────────────────────────────────
 async function addObservation(a, label) {
   const r = await fetch(`${DASH}/api/watchlist`, {
@@ -266,10 +333,10 @@ async function addObservation(a, label) {
 
 const usd = v => (v >= 0 ? '+$' : '-$') + Math.abs(v).toFixed(0);
 
-async function main() {
+async function main(dbPath) {
   const t0 = Date.now();
   const since = new Date((NOW_S - 365 * DAY_S) * 1000).toISOString().slice(0, 10);
-  const { skip, watchlist } = await loadExclusions();
+  const { skip, watchlist } = await loadExclusions(dbPath);
   const bullpen = loadBullpenPool();
   const polymarket = await loadPolymarketPool();
   console.log(`[lowfreq] stage1 pool: bullpen ${bullpen.size}, data-api ${polymarket.size}, excluded ${skip.size}`);
@@ -295,18 +362,20 @@ async function main() {
 
   const evaluated = [];
   for (const c of shortlist) { // sequential: Gamma's rate limit is shared with the bot's price sweep
-    const res = await runBacktest(c.a, since);
-    const ev = res ? evaluateBacktest(res) : { pass: false, failed: ['backtest failed'] };
+    console.log(`[lowfreq] backtest ${evaluated.length + 1}/${shortlist.length}: ${c.a}`);
+    const ev = await runBacktest(c.a, since, dbPath);
     evaluated.push({ ...c, bt: ev });
-    console.log(`  ${c.a} ${ev.pass ? 'PASS' : 'fail'} ` + (res
+    console.log(`  ${c.a} ${ev.technicalError ? 'ERROR' : ev.pass ? 'PASS' : 'reject'} ` + (!ev.technicalError
       ? `pnl ${usd(ev.pnl)} ci [${usd(ev.ci[0])}, ${usd(ev.ci[1])}] x2 ${usd(ev.pnl2x)} mkts ${ev.markets} months ${ev.months}` +
         (ev.pass ? '' : ` | failed: ${ev.failed.join(',')}`)
-      : '| backtest failed'));
+      : `| ${ev.technicalError.message} | stderr=${ev.technicalError.stderrLog}`));
   }
+  const summary = summarizeBacktests(evaluated);
   const survivors = evaluated.filter(c => c.bt.pass).sort((x, y) => y.bt.ci[0] - x.bt.ci[0]);
 
   const added = [];
-  if (AUTO_ADD && survivors.length) {
+  // Preserve the report but do not mutate the watchlist after an incomplete scan.
+  if (AUTO_ADD && summary.status === 'done' && survivors.length) {
     const standing = watchlist.filter(w => w.copyEnabled === false).length;
     let slots = Math.max(0, AUTO_OBS_MAX_TOTAL - standing);
     console.log(`[lowfreq] observation traders ${standing}/${AUTO_OBS_MAX_TOTAL}, slots ${slots}`);
@@ -327,12 +396,15 @@ async function main() {
   }
 
   fs.writeFileSync(path.join(WORK, 'report.json'), JSON.stringify({
-    ranAt: new Date().toISOString(), since, autoAdd: AUTO_ADD,
-    counts: { bullpen: bullpen.size, polymarket: polymarket.size, stage2: s2.size, stage3: s3.length, stage4: s4.length, backtested: evaluated.length, passed: survivors.length, added: added.length },
+    ranAt: new Date().toISOString(), since, autoAdd: AUTO_ADD, status: summary.status,
+    counts: { bullpen: bullpen.size, polymarket: polymarket.size, stage2: s2.size, stage3: s3.length, stage4: s4.length, ...summary.counts, added: added.length },
     evaluated,
   }, null, 2));
-  console.log(`SUMMARY stage2=${s2.size} stage3=${s3.length} stage4=${s4.length} backtested=${evaluated.length} passed=${survivors.length} added=${added.length} minutes=${((Date.now() - t0) / 60000).toFixed(1)}`);
+  console.log(`SUMMARY status=${summary.status} stage2=${s2.size} stage3=${s3.length} stage4=${s4.length} backtested=${evaluated.length} backtestSucceeded=${summary.counts.backtestSucceeded} backtestErrors=${summary.counts.backtestErrors} rejected=${summary.counts.rejected} passed=${survivors.length} added=${added.length} minutes=${((Date.now() - t0) / 60000).toFixed(1)}`);
+  if (summary.counts.backtestErrors > 0) {
+    throw new Error(`${summary.counts.backtestErrors}/${evaluated.length} backtests failed technically; report and btlogs saved in ${WORK}`);
+  }
 }
 
-module.exports = { evaluateBacktest };
-if (require.main === module) main().catch(e => { console.error(e); process.exit(1); });
+module.exports = { evaluateBacktest, runBacktest, summarizeBacktests, withBacktestSnapshot };
+if (require.main === module) withBacktestSnapshot(main).catch(e => { console.error(e); process.exitCode = 1; });

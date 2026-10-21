@@ -297,6 +297,15 @@ async function processActivity(
       // Runs before the wallet cap since dynamic sizing needs ask_depth_5 to know
       // the final amount (costs two HTTP calls on wallet-capped skips — rare).
       const watchlistDepth = await getOrderbookDepth(activity.marketSlug, activity.outcome);
+      // Nobody is selling (the trader's fill swept the last asks): a real BUY cannot fill.
+      if (watchlistDepth?.noAsks) {
+        console.log(
+          `[monitor] Skip BUY ${activity.marketSlug} — no_asks: nobody is selling ${activity.outcome} ` +
+          `(best bid $${watchlistDepth.bestBid.toFixed(2)}), a buy cannot fill`
+        );
+        markProcessed(activity.id);
+        continue;
+      }
       if (watchlistDepth && watchlistDepth.askDepth5 < CONFIG.DEPTH_GATE_MIN_DEPTH_5) {
         console.log(
           `[monitor] Skip BUY ${activity.marketSlug} — depth_gate: ` +
