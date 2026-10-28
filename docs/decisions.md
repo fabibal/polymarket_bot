@@ -1033,3 +1033,26 @@ timeouts, hard process timeout/cleanup, quality-aware nonzero exits, and one
 best-effort Telegram summary. RW_NOTIFY=0 also avoids loading shared credentials.
 Existing UTC cron dates stay unchanged. Full implementation, validation results
 and operator commands are in `docs/release_watch_handoff_2026-10-21.md`.
+
+## Release-watch report: exclude a disagreeing market, not the whole run (2026-10-28, `scripts/release_watch_report.js`, `scripts/release_watch_model.js`, `scripts/release-watch.sh`)
+
+**Decision:** one market whose REST snapshot disagrees with the rebuilt WS book at
+full depth is excluded from the simulation (both of its tokens, never bought); the
+run stays valid and carries a warning. Any other mismatch kind (missing REST token,
+no healthy WS baseline, unknown token) or more than max(1, 10%) of the markets
+disagreeing still makes the run INVALID. The Telegram line now also carries the
+offline report summary (`report <status>, book check x/y, scenarios n/m`), because
+capture status and report status are different things.
+
+**Reason:** the FOMC rehearsal (10-28) had 119/120 full matches. The one miss was a
+near-par token requoted by a bot every 10-50 ms: the REST book equalled the WS state
+at its own last-change time, while the WS showed three more requotes in the next 25 ms.
+Which side lagged is unknown. The all-or-nothing rule blanked all 57 scenarios, and
+Telegram still said OK. Busier CPI/jobs books would likely hit this more often.
+
+**Cost:** the excluded market can be exactly the interesting one (here the winning
+"2 dissents" bracket), so the result understates. It never overstates.
+
+**Alternatives considered:** a size tolerance on the compared levels (rejected: hides
+real missing updates); validating against the REST timestamp instead of the request
+interval (rejected: weaker check).

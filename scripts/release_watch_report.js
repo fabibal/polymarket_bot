@@ -45,7 +45,17 @@ function evaluate(meta, sources, book, records, snapshots, resolution) {
   if(meta.runId!==sources.runId || meta.runId!==book.runId || meta.release!==sources.release || meta.release!==book.release) issues.push('capture identity mismatch');
   if(!sources.quality?.ok) issues.push(...(sources.quality?.issues||['source quality missing']));
   if(!book.quality?.ok) issues.push(...(book.quality?.issues||['book quality missing']));
-  if(!validation.ok) issues.push('full-depth REST/WS validation failed');
+  // One disagreeing market is excluded from the simulation, not the whole run.
+  // Anything else (other mismatch kinds, unknown tokens, more than ~10% of the
+  // markets) means the capture itself cannot be trusted.
+  const marketOf=new Map(meta.markets.flatMap(m=>m.tokens.map(t=>[t.token,m])));
+  const soft=validation.mismatches.filter(x=>x.reason==='depth mismatch'&&marketOf.has(x.token));
+  const excludedMarkets=new Set(soft.map(x=>marketOf.get(x.token).conditionId));
+  const excluded=meta.markets.filter(m=>excludedMarkets.has(m.conditionId)).flatMap(m=>m.tokens.map(t=>t.token));
+  const warnings=[];
+  if(!validation.checked || soft.length!==validation.mismatches.length || excludedMarkets.size>Math.max(1,Math.floor(meta.markets.length*0.1))) issues.push('full-depth REST/WS validation failed');
+  else if(excludedMarkets.size) warnings.push(`${excludedMarkets.size} market(s) excluded: REST/WS depth mismatch (${[...excludedMarkets].map(c=>meta.markets.find(m=>m.conditionId===c).slug).join(', ')})`);
+  validation.excludedTokens=excluded;
   if(!book.snapshots?.length || book.snapshots.some(s=>!s.ok || !snapshots.some(x=>x.label===s.label))) issues.push('snapshot files incomplete');
   if(new Set(tokens).size!==tokens.length) issues.push('duplicate token identity across events');
   const payoutByToken={};
@@ -60,7 +70,7 @@ function evaluate(meta, sources, book, records, snapshots, resolution) {
   // Explicit sensitivity assumptions, NOT observed execution probabilities.
   // The read RTT stays a diagnostic and is never promoted to order latency.
   for(const latencyMs of [0,250,500,1000,2000,5000]) for(const fillFraction of [1,0.5,0.25]) for(const maxPrice of [0.90,0.95,0.99]) {
-    const s=simulatePortfolio(meta,signals,replay,{latencyMs,fillFraction,maxPrice,budget:800,orderType:'FAK'});
+    const s=simulatePortfolio(meta,signals,replay,{latencyMs,fillFraction,maxPrice,budget:800,orderType:'FAK',excluded});
     s.valid=s.valid&&!issues.length;
     if(!s.valid) s.netIfCorrect=null;
     s.confirmedNet=s.valid&&resolved===meta.markets.length ? s.fills.reduce((sum,f)=>sum+f.shares*payoutByToken[f.token]-f.cost-f.fee,0) : null;
@@ -68,7 +78,7 @@ function evaluate(meta, sources, book, records, snapshots, resolution) {
   }
   // A FOK comparison demonstrates the effect of requiring full orders.
   for(const latencyMs of [250,1000,5000]) {
-    const s=simulatePortfolio(meta,signals,replay,{latencyMs,fillFraction:0.5,maxPrice:0.99,budget:800,orderType:'FOK'});
+    const s=simulatePortfolio(meta,signals,replay,{latencyMs,fillFraction:0.5,maxPrice:0.99,budget:800,orderType:'FOK',excluded});
     s.valid=s.valid&&!issues.length;if(!s.valid)s.netIfCorrect=null;
     s.confirmedNet=s.valid&&resolved===meta.markets.length ? s.fills.reduce((sum,f)=>sum+f.shares*payoutByToken[f.token]-f.cost-f.fee,0) : null;
     scenarios.push(s);
@@ -78,7 +88,7 @@ function evaluate(meta, sources, book, records, snapshots, resolution) {
   if(!validScenarios) issues.push('no scenario has complete decision/arrival data');
   return {schemaVersion:2,release:meta.release,runId:meta.runId,at:meta.at,createdAt:Date.now(),
     status:issues.length?'INVALID':validScenarios<scenarios.length?'PARTIAL_DATA':resolved===meta.markets.length?'RESOLVED_SIMULATION':'PENDING_RESOLUTION',
-    quality:{ok:!issues.length,issues:[...new Set(issues)]},validation,signals,resolution:{resolved,total:meta.markets.length,errors:resolution?.errors||[]},
+    quality:{ok:!issues.length,issues:[...new Set(issues)],warnings},validation,signals,resolution:{resolved,total:meta.markets.length,errors:resolution?.errors||[]},
     coverage:{validScenarios,totalScenarios:scenarios.length},
     clock:{minReceiveMinusServerMs:offsets[0],medianReceiveMinusServerMs:offsets[Math.floor(offsets.length/2)],readRttMs:book.restRttMs,
       assumption:'Host and exchange clocks assumed aligned. Receive-server differences include network transit, not a measured clock offset. Latency sensitivity is not a measured execution SLA.'},
@@ -86,6 +96,15 @@ function evaluate(meta, sources, book, records, snapshots, resolution) {
       settlement:'No cash reuse until resolution. ConfirmedNet is simulated PnL with confirmed payouts, never actual fills.',
       selection:'First validated numeric signal, received book at decision, fixed limit at hypothetical arrival. No future-winner/price selection.',
       limitations:['No submitted orders: fill fractions are scenarios, not calibrated probabilities.','Independent future books cannot fully model competitors reacting to our orders.','Fixed server, redemption and funding costs excluded.','Three or four releases test feasibility, not durable profitability.']},scenarios};
+}
+// One line for the Telegram message: the capture can be fine while the report is not.
+function summaryLine(r) {
+  const v=r.validation, parts=[`report ${r.status}`, `book check ${v.fullSame}/${v.checked}`];
+  const ex=new Set(v.excludedTokens||[]).size;
+  if(ex) parts[1]+=` (${ex} tokens excluded)`;
+  if(r.quality.issues.length) parts.push(r.quality.issues[0]);
+  else parts.push(`scenarios ${r.coverage.validScenarios}/${r.coverage.totalScenarios}`);
+  return parts.join(', ');
 }
 async function main() {
   const args=process.argv.slice(2), offline=args.includes('--offline'), positional=args.filter(a=>!a.startsWith('--'));
@@ -108,9 +127,11 @@ async function main() {
   if(!offline){resolution=await resolvePayouts(meta);fs.writeFileSync(path.join(dir,'resolution-v2.json'),JSON.stringify(resolution,null,2));}
   const report=evaluate(meta,sources,book,records,snapshots,resolution);
   fs.writeFileSync(path.join(dir,'report-v2.json'),JSON.stringify(report,null,2));
+  if(args.includes('--line')){console.log(summaryLine(report));return 0;}
   console.log(`${id} / ${run||'legacy'}: ${report.status}`);
   console.log(`Full book validation ${report.validation.fullSame}/${report.validation.checked}; best ask only ${report.validation.bestAskSame}/${report.validation.checked}`);
   for(const issue of report.quality.issues)console.log(`INVALID: ${issue}`);
+  for(const w of report.quality.warnings)console.log(`WARNING: ${w}`);
   for(const s of report.signals)console.log(`Signal ${s.event}: ${s.metric}=${s.value}, K=+${((s.at-Date.parse(meta.at))/1000).toFixed(3)}s (${s.source})`);
   console.log('One shared $800 wallet including fees. Fill fractions and latency are assumptions. No orders submitted.');
   console.log('delay_ms fill_fraction max_price type spent fees net_if_signal_correct confirmed_simulated_net');
@@ -118,4 +139,4 @@ async function main() {
   return report.quality.ok?0:3;
 }
 if(require.main===module)main().then(code=>{process.exitCode=code;}).catch(e=>{console.error(e);process.exitCode=1;});
-module.exports={evaluate,confirmedResolution,resolvePayouts};
+module.exports={evaluate,confirmedResolution,resolvePayouts,summaryLine};

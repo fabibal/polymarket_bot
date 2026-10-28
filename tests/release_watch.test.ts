@@ -9,7 +9,7 @@ const { parseRelease, selectTokens } = require('../scripts/release_watch_parsers
 const { createReplay, validateSnapshots, signalsFromSources, simulatePortfolio } = require('../scripts/release_watch_model');
 const { observeSource, getJson, runSources } = require('../scripts/release_watch');
 const { releaseConfig } = require('../scripts/release_watch_config');
-const { evaluate, confirmedResolution } = require('../scripts/release_watch_report');
+const { evaluate, confirmedResolution, summaryLine } = require('../scripts/release_watch_report');
 const fixture = (name: string) => fs.readFileSync(path.join(__dirname, 'fixtures/release-watch', name + '.html'), 'utf8');
 const T = Date.parse('2026-10-29T12:30:00Z');
 const specs: Record<string, any> = {
@@ -88,11 +88,30 @@ function data() {
 
 describe('book integrity and hypothetical execution', () => {
   it('rejects the old best-price-only false positive when size or deeper levels differ', () => {
-    const d=data();d.snapshots[0].books[0].asks[0].size='1';
+    const d=data();d.snapshots[0].books[0].asks[0].size='1';d.snapshots[0].books[2].asks[0].size='1';
     const v=validateSnapshots(createReplay(d.records),d.snapshots,['a','an','b','bn']);
-    expect(v.bestAskSame).toBe(4);expect(v.fullSame).toBe(3);expect(v.ok).toBe(false);
+    expect(v.bestAskSame).toBe(4);expect(v.fullSame).toBe(2);expect(v.ok).toBe(false);
     const r=evaluate(d.meta,d.sources,d.book,d.records,d.snapshots,null);
     expect(r.status).toBe('INVALID');expect(r.scenarios.every((s:any)=>s.netIfCorrect===null&&s.confirmedNet===null)).toBe(true);
+  });
+  it('excludes one disagreeing market instead of blanking the whole run', () => {
+    const clean=data(), d=data();d.snapshots[0].books[0].asks[0].size='1';
+    const v=validateSnapshots(createReplay(d.records),d.snapshots,['a','an','b','bn']);
+    expect(v.fullSame).toBe(3);expect(v.ok).toBe(false);
+    const r=evaluate(d.meta,d.sources,d.book,d.records,d.snapshots,null);
+    expect(r.status).not.toBe('INVALID');expect(r.quality.ok).toBe(true);
+    expect(r.quality.warnings).toHaveLength(1);expect(r.validation.excludedTokens.sort()).toEqual(['a','an']);
+    const ok=r.scenarios.filter((s:any)=>s.valid);expect(ok.length).toBeGreaterThan(0);
+    expect(ok.every((s:any)=>s.fills.every((f:any)=>!['a','an'].includes(f.token)))).toBe(true);
+    // Without the exclusion the same capture does buy the excluded token.
+    const base=evaluate(clean.meta,clean.sources,clean.book,clean.records,clean.snapshots,null);
+    expect(base.scenarios.some((s:any)=>s.fills.some((f:any)=>f.token==='a'))).toBe(true);
+    expect(summaryLine(r)).toMatch(/book check 3\/4 \(2 tokens excluded\)/);
+  });
+  it('still invalidates when the REST snapshot is missing a token', () => {
+    const d=data();d.snapshots[0].books=d.snapshots[0].books.filter((b:any)=>b.asset_id!=='b');
+    const r=evaluate(d.meta,d.sources,d.book,d.records,d.snapshots,null);
+    expect(r.status).toBe('INVALID');expect(r.quality.issues).toContain('full-depth REST/WS validation failed');
   });
   it('cannot report an empty REST and missing WS book as a successful empty-book match', () => {
     const d=data();d.snapshots[0].books[0].asks=[];

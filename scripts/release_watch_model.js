@@ -116,7 +116,9 @@ function signalsFromSources(meta, sources) {
 }
 
 const feePerShare = (price, rate) => price * (1-price) * rate;
-function simulatePortfolio(meta, signals, replay, { latencyMs, fillFraction, budget = 800, maxPrice = 0.99, orderType = 'FAK' }) {
+// excluded: tokens whose REST/WS book check disagreed. They are never bought (understates, never inflates).
+function simulatePortfolio(meta, signals, replay, { latencyMs, fillFraction, budget = 800, maxPrice = 0.99, orderType = 'FAK', excluded = [] }) {
+  const excludedSet = new Set(excluded);
   if (!(budget>0) || !(fillFraction>=0 && fillFraction<=1) || !(latencyMs>=0) || !(maxPrice>0 && maxPrice<1) || !['FAK','FOK'].includes(orderType)) throw new Error('invalid simulation assumptions');
   const info = new Map(meta.markets.flatMap(m=>m.tokens.map(t=>[t.token,m])));
   const queue = [], fills = [], skips = [], reasons = [];
@@ -132,6 +134,7 @@ function simulatePortfolio(meta, signals, replay, { latencyMs, fillFraction, bud
     if (task.kind === 'decision') {
       const candidates = [];
       for (const signal of task.signals) for (const token of signal.tokens) {
+        if (excludedSet.has(token)) continue;
         const m = info.get(token), b = state.books.get(token);
         if (!b) { reasons.push(`no complete decision book: ${token}`); continue; }
         const tick = b.tick || m.tick;

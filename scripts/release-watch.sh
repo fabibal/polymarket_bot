@@ -99,7 +99,14 @@ JS
 then RESULT=1; STATUS="FAIL"; fi
 printf '{"runId":"%s","bookExit":%d,"sourcesExit":%d,"exitCode":%d,"status":"%s"}\n' \
     "${RUN_ID}" "${BOOK_EXIT}" "${SRC_EXIT}" "${RESULT}" "${STATUS}" > "${OUT}/run.json"
-log "${STATUS} | ${ID} | run=${RUN_ID} | ${SRC_LINE} | ${BOOK_LINE} | ${PRE}"
-send_telegram "[polymarket_bot] release-watch ${ID} ${STATUS} (${RUN_ID}): ${SRC_LINE} | ${BOOK_LINE}${PRE:+ | ${PRE}}" || true
+# STATUS is the capture; the offline report (full-depth book check, scenarios) can
+# disagree with it, so say both. Best effort and bounded: never changes the result.
+RLINE=""
+if [ -f "${PROJECT_DIR}/scripts/release_watch_report.js" ]; then
+    RLINE="$(RELEASE_WATCH_OUT="${OUT_ROOT}" timeout -k 2s 90s node "${PROJECT_DIR}/scripts/release_watch_report.js" "${ID}" "${RUN_ID}" --offline --line 2>/dev/null | tail -1)"
+fi
+[ -n "${RLINE}" ] || RLINE="report unavailable"
+log "${STATUS} | ${ID} | run=${RUN_ID} | ${SRC_LINE} | ${BOOK_LINE} | ${RLINE} | ${PRE}"
+send_telegram "[polymarket_bot] release-watch ${ID} ${STATUS} (${RUN_ID}): ${SRC_LINE} | ${BOOK_LINE} | ${RLINE}${PRE:+ | ${PRE}}" || true
 FINISHED=1
 exit "${RESULT}"

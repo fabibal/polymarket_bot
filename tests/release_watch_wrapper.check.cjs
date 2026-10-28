@@ -55,6 +55,14 @@ test('Telegram failure does not destroy a successful measurement',()=>{
  f.env.RW_NOTIFY='1';fs.writeFileSync(f.env.SHARED_ENV,'TELEGRAM_BOT_TOKEN=fixture\nTELEGRAM_CHAT_ID=fixture\nPOLYMARKET_TELEGRAM_CHAT_ID=fixture\n');
  try{assert.equal(run(f).status,0);assert.match(log(f),/telegram_send_failed/);assert.match(log(f),/\| OK \|/);}finally{fs.rmSync(f.dir,{recursive:true,force:true});}
 });
+test('the report line is logged next to the capture status, and a broken report changes nothing',()=>{
+ for(const [body,expected] of [["console.log('report STUB, book check 119/120 (2 tokens excluded)')",/\| OK \|.*report STUB, book check 119\/120 \(2 tokens excluded\)/],["throw new Error('boom')",/\| OK \|.*report unavailable/]]){
+  const f=setup('ok');try{
+   fs.mkdirSync(path.join(f.dir,'scripts'));fs.writeFileSync(path.join(f.dir,'scripts/release_watch_report.js'),body);
+   assert.equal(run(f).status,0);assert.match(log(f),expected);
+  }finally{fs.rmSync(f.dir,{recursive:true,force:true});}
+ }
+});
 test('overlapping invocation cannot touch the active run',async()=>{
  const f=setup('block');
  try{
