@@ -4,7 +4,8 @@ const ADDRS = {
   'DrPufferfish':    '0x45c9c799e0e6ddf19c50e9dac5ab5a925f9b414b',
   'Macro-90d':       '0xd9875d4a0573dd3890738aab990938a53c360041',
 };
-const DATA = 'https://data-api.polymarket.com';
+// Data API v2 (v1 retired 2026-11-02): rows come in {data: [...]}.
+const DATA = 'https://data-api.polymarket.com/v2';
 
 async function getJson(url) {
   const r = await fetch(url, { headers: { 'accept': 'application/json' } });
@@ -16,7 +17,8 @@ async function getJson(url) {
   for (const [label, addr] of Object.entries(ADDRS)) {
     console.log(`\n=== ${label} ${addr} ===`);
     try {
-      const t = await getJson(`${DATA}/trades?user=${addr}&limit=10&takerOnly=false`);
+      const body = await getJson(`${DATA}/trades?user=${addr}&limit=10&takerOnly=false`);
+      const t = Array.isArray(body && body.data) ? body.data : null;
       if (!Array.isArray(t) || t.length === 0) { console.log('  no trades returned (empty)'); continue; }
       const newest = t[0]?.timestamp;
       console.log(`  trades returned: ${t.length} | newest ts: ${newest} -> ${newest ? new Date(newest * 1000).toISOString() : '?'}`);

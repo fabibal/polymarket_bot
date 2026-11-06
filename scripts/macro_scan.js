@@ -6,7 +6,9 @@ const https = require('https');
 const Database = require('better-sqlite3');
 
 const FALCON_URL = 'https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized';
-const DATA_API   = 'https://data-api.polymarket.com';
+// Data API v2 (v1 retired 2026-11-02): cursor paging, snake_case rows.
+const DATA_API   = 'https://data-api.polymarket.com/v2';
+const { nextCursor, rowsOf } = require('./dataapi_v2');
 const KEY = process.env.POLYMARKET_ANALYTICS_API_KEY || '';
 if (!KEY) { console.error('POLYMARKET_ANALYTICS_API_KEY missing'); process.exit(1); }
 
@@ -87,12 +89,14 @@ async function fetchFalconLeaderboard(period, maxItems=500) {
 async function fetchActivity(address, maxTrades=1500) {
   const out = [];
   const PAGE = 500;
+  let cursor = null;
   for (let page=0; page*PAGE < maxTrades; page++) {
-    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=${PAGE}&offset=${page*PAGE}`;
-    let data;
-    try { data = await get(url); }
+    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=${PAGE}`
+      + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+    let body, data;
+    try { body = await get(url); data = rowsOf(body); }
     catch(e){ console.error(`[activity ${address.slice(0,10)}] page ${page}: ${e.message}`); break; }
-    if (!Array.isArray(data) || data.length === 0) break;
+    if (data.length === 0) break;
     for (const it of data) {
       if (it.type !== 'TRADE') continue;
       out.push({
@@ -102,10 +106,11 @@ async function fetchActivity(address, maxTrades=1500) {
         side: String(it.side || '').toUpperCase(),
         price: Number(it.price || 0),
         size: Number(it.size || 0),
-        usd: Number(it.usdcSize || 0),
+        usd: Number(it.usdc_size || 0),
       });
     }
-    if (data.length < PAGE) break;
+    cursor = nextCursor(body);
+    if (!cursor) break;
   }
   return out;
 }
@@ -116,9 +121,8 @@ async function isMarketMaker(address) {
   // Sample 500 (one page max): MAKER_REBATE events are sparse (~3/500 for 0xef27) so a 50-row
   // window misses them and lets the MM through. Non-blocking on fetch error.
   try {
-    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=500&offset=0`;
-    const data = await get(url);
-    if (!Array.isArray(data)) return false;
+    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=500`;
+    const data = rowsOf(await get(url));
     return data.some(it => String(it.type || '').toUpperCase() === 'MAKER_REBATE');
   } catch (e) {
     console.error(`[mm-check ${address.slice(0,10)}] ${e.message}`);

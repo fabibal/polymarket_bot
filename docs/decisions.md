@@ -1056,3 +1056,29 @@ Telegram still said OK. Busier CPI/jobs books would likely hit this more often.
 **Alternatives considered:** a size tolerance on the compared levels (rejected: hides
 real missing updates); validating against the REST timestamp instead of the request
 interval (rejected: weaker check).
+
+## 2026-11-06 Data API v1 -> v2 (production path)
+
+**Decision:** `src/bullpen.ts` (activity poll, trader position size) and the three
+`src/dashboard.ts` calls moved to `/v2`. Activity pages by `next_cursor` (v2 rejects
+`offset`), still 3 x 500 max; a response without a `data` array throws, so a cursor is
+never advanced on a wrong-shaped body. Positions rows are mapped back to the v1
+camelCase names (`mapPositionV2`) so `public/index.html` is unchanged.
+
+**Reason:** v1 answered HTTP 410 from 2026-11-02 ~22:20 UTC. For four days every poll
+failed silently; copying continued only through RTDS and the chain feed, with no
+backfill for missed fills.
+
+**Follow-up, same day:** every script moved to v2 through `scripts/dataapi_v2.js`
+(cursor `collect`, and adapters that add the v1 camelCase names so the analysis code
+and the `backtest_mirror` activity cache keep their format): `lowfreq_scan`,
+`backtest_mirror`, `tape_scan`, `macro_scan`, `macro_scan_90d`, `macro_verify`,
+`check_dormant`. v2 mapping used: `/closed-positions` -> `/positions?status=CLOSED`
+(`last_event_at` = closing time), leaderboard `user_id`/`volume`, trades filter
+`condition=` (not `market=`). `backtest_mirror` no longer splits time slices at an
+offset cap: cursor paging has no depth cap (25 000 rows walked without error).
+
+**Cost / unverified:** CONVERSION rows (negRisk) in v2 activity were not available on a
+test trader, only the type name is accepted; `backtest_mirror` decodes them on chain by
+transaction hash, which is unchanged. `/v2/positions` default list is OPEN + REDEEMABLE,
+so unredeemed losers stay in the "open" netting of `lowfreq_scan` stage 4, as in v1.

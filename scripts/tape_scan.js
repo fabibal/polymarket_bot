@@ -44,7 +44,7 @@ const UNIVERSE_DAYS   = 45;    // resolved markets newer than this
 const MAX_MARKETS     = 1200;  // safety cap per run
 const CONCURRENCY     = 6;     // parallel markets (≈10-14 req/s total, proven safe)
 const PAGE_LIMIT      = 1000;  // API silently caps limit at 1000
-const MAX_OFFSET      = 3000;  // API hard cap (400 beyond) → max 4000 rows/market
+const MAX_ROWS        = 4000;  // v1 offset cap kept as the per-market bound: more -> truncated
 const MIN_NOTIONAL    = 100;   // $ net invested per market to count that market
 const GAMMA_PAGE_LIMIT = 100;  // /markets listing hard-caps limit at 100 regardless of
                                 // what's requested (empirically verified 2026-07-21 --
@@ -87,7 +87,8 @@ const AUTO_ADD_ENABLED   = process.env.TAPE_SCAN_AUTO_ADD === '1';
 const AUTO_OBS_MAX_TOTAL = 10;  // standing cap across all copy_enabled=0 rows, not per-run
 
 const GAMMA = 'https://gamma-api.polymarket.com';
-const DATA  = 'https://data-api.polymarket.com';
+// Data API v2 (v1 retired 2026-11-02): cursor paging, snake_case rows (mapped to v1 names).
+const { V2: DATA, nextCursor, v1Activity } = require('./dataapi_v2');
 
 async function getJson(url, tries = 3) {
   for (let i = 0; i < tries; i++) {
@@ -125,15 +126,17 @@ async function resolveMarket(slug) {
 // Walk the tape. Returns { prints } or { truncated: true } or { error }.
 async function fetchTape(conditionId) {
   const prints = [];
-  for (let offset = 0; offset <= MAX_OFFSET; offset += PAGE_LIMIT) {
-    const r = await getJson(`${DATA}/trades?market=${conditionId}&limit=${PAGE_LIMIT}&offset=${offset}&takerOnly=false`);
+  let cursor = null;
+  for (;;) {
+    const r = await getJson(`${DATA}/trades?condition=${conditionId}&limit=${PAGE_LIMIT}&takerOnly=false`
+      + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''));
     if (r.error) return { error: r.error };
-    if (!Array.isArray(r.data)) return { error: 'non-array tape page' };
-    prints.push(...r.data);
-    if (r.data.length < PAGE_LIMIT) return { prints };
-    if (offset === MAX_OFFSET) return { truncated: true }; // full page at the cap → deeper tape unreachable
+    if (!r.data || !Array.isArray(r.data.data)) return { error: 'non-array tape page' };
+    prints.push(...r.data.data.map(v1Activity));
+    cursor = nextCursor(r.data);
+    if (!cursor) return { prints };
+    if (prints.length >= MAX_ROWS) return { truncated: true }; // more tape beyond the bound
   }
-  return { prints };
 }
 
 // Broad, all-category resolved-market discovery via Gamma (added 2026-07-21).
@@ -171,10 +174,10 @@ async function fetchBroadUniverse(days) {
 // set), never against the full scanned universe.
 async function isMarketMaker(address) {
   try {
-    const url = `${DATA}/activity?user=${encodeURIComponent(address)}&limit=500&offset=0`;
+    const url = `${DATA}/activity?user=${encodeURIComponent(address)}&limit=500`;
     const r = await getJson(url);
-    if (r.error || !Array.isArray(r.data)) return false;
-    return r.data.some(it => String(it.type || '').toUpperCase() === 'MAKER_REBATE');
+    if (r.error || !r.data || !Array.isArray(r.data.data)) return false;
+    return r.data.data.some(it => String(it.type || '').toUpperCase() === 'MAKER_REBATE');
   } catch (e) {
     return false;
   }

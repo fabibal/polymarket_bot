@@ -47,9 +47,48 @@ export interface RawPriceResponse {
 // Public API
 // ---------------------------------------------------------------------------
 
-const DATA_API_BASE = 'https://data-api.polymarket.com';
-const ACTIVITY_PAGE_SIZE = 500; // API max per request
+// Data API v2 (v1 retired, HTTP 410 since 2026-11-02): snake_case rows wrapped
+// in `{data, pagination:{has_more, next_cursor}}`; paging is cursor-only
+// (`offset` is rejected with HTTP 400), `limit` max 1000.
+const DATA_API_BASE = 'https://data-api.polymarket.com/v2';
+const ACTIVITY_PAGE_SIZE = 500;
 const ACTIVITY_MAX_PAGES = 3;   // 3 × 500 = 1 500 trades max
+
+/** Unwrap a v2 `{data: [...]}` envelope; non-array / missing data -> []. */
+export function unwrapV2<T = Record<string, unknown>>(body: unknown): T[] {
+  const data = (body as { data?: unknown } | null)?.data;
+  return Array.isArray(data) ? data as T[] : [];
+}
+
+/** The v2 `next_cursor` when another page exists, else null. */
+export function nextCursorV2(body: unknown): string | null {
+  const p = (body as { pagination?: { has_more?: unknown; next_cursor?: unknown } } | null)?.pagination;
+  return p && p.has_more === true && typeof p.next_cursor === 'string' && p.next_cursor ? p.next_cursor : null;
+}
+
+/**
+ * Map a v2 /positions row to the v1 camelCase shape the dashboard frontend
+ * reads (size, avgPrice, currentValue, cashPnl, ...), so public/index.html is
+ * untouched. `cashPnl` is the unrealized PnL of the currently held position.
+ */
+export function mapPositionV2(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...row,
+    size: row.current_size,
+    avgPrice: row.avg_price,
+    initialValue: row.entry_cost_usdc,
+    currentValue: row.current_value,
+    curPrice: row.current_price,
+    cashPnl: row.unrealized_pnl,
+    unrealizedPnl: row.unrealized_pnl,
+    realizedPnl: row.realized_pnl,
+    percentPnl: row.percent_pnl,
+    conditionId: row.condition_id,
+    asset: row.token_id,
+    outcomeIndex: row.outcome_index,
+    endDate: row.end_date,
+  };
+}
 
 export async function getTraderActivity(
   address: string,
@@ -61,13 +100,19 @@ export async function getTraderActivity(
   let reachedSince = false;
   let exhaustedPageCap = false;
 
+  let cursor: string | null = null;
   for (let page = 0; page < ACTIVITY_MAX_PAGES; page++) {
-    const offset = page * ACTIVITY_PAGE_SIZE;
-    const url = `${DATA_API_BASE}/activity?user=${encodeURIComponent(address)}&limit=${ACTIVITY_PAGE_SIZE}&offset=${offset}`;
+    const url: string = `${DATA_API_BASE}/activity?user=${encodeURIComponent(address)}&limit=${ACTIVITY_PAGE_SIZE}`
+      + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
 
     let data: Array<Record<string, unknown>>;
+    let body: unknown;
     try {
-      data = await httpsGet(url) as Array<Record<string, unknown>>;
+      body = await httpsGet(url);
+      if (!Array.isArray((body as { data?: unknown } | null)?.data)) {
+        throw new Error(`Unexpected v2 activity response from ${url}`);
+      }
+      data = unwrapV2(body);
     } catch (err) {
       // Mid-pagination failure while a cursor is active: returning partial
       // results would let the caller advance the cursor to the newest fetched
@@ -76,7 +121,7 @@ export async function getTraderActivity(
       if (sinceMs > 0) throw err;
       break; // no cursor (first poll): a partial backfill is acceptable
     }
-    if (!Array.isArray(data) || data.length === 0) break;
+    if (data.length === 0) break;
 
     for (const item of data) {
       // API returns newest-first; stop once we reach items strictly older than
@@ -87,7 +132,7 @@ export async function getTraderActivity(
       if (sinceMs > 0 && tsMs < sinceMs) { reachedSince = true; break; }
 
       results.push({
-        transaction_hash: item.transactionHash != null ? String(item.transactionHash) : undefined,
+        transaction_hash: item.transaction_hash != null ? String(item.transaction_hash) : undefined,
         timestamp: typeof item.timestamp === 'number'
           ? new Date(item.timestamp * 1000).toISOString()
           : String(item.timestamp ?? ''),
@@ -98,7 +143,7 @@ export async function getTraderActivity(
         type:      item.type      != null ? String(item.type)      : undefined,
         price:     item.price     != null ? Number(item.price)     : undefined,
         size:      item.size      != null ? Number(item.size)      : undefined,
-        usdc_size: item.usdcSize  != null ? Number(item.usdcSize)  : undefined,
+        usdc_size: item.usdc_size != null ? Number(item.usdc_size) : undefined,
       });
     }
 
@@ -106,7 +151,8 @@ export async function getTraderActivity(
     // truncated paging before reaching `since`, so the caller's cursor could
     // advance past unseen trades and drop them permanently (H1). Page until we
     // actually reach an item older than `since` or exhaust the pages.
-    if (reachedSince || data.length < ACTIVITY_PAGE_SIZE) break;
+    cursor = nextCursorV2(body);
+    if (reachedSince || !cursor) break;
     if (page === ACTIVITY_MAX_PAGES - 1) exhaustedPageCap = true;
   }
 
@@ -342,13 +388,14 @@ export async function getTraderPositionSize(
     const conditionId = (markets[0] as Record<string, unknown>).conditionId;
     if (typeof conditionId !== 'string' || !conditionId) return null;
 
-    const positions = await httpsGet(
-      `${DATA_API_BASE}/positions?user=${encodeURIComponent(address)}&market=${encodeURIComponent(conditionId)}&sizeThreshold=0`
-    ) as Array<Record<string, unknown>>;
-    if (!Array.isArray(positions)) return null;
+    const body = await httpsGet(
+      `${DATA_API_BASE}/positions?user=${encodeURIComponent(address)}&condition=${encodeURIComponent(conditionId)}`
+    );
+    if (!body || !Array.isArray((body as { data?: unknown }).data)) return null;
+    const positions = unwrapV2(body);
     const row = positions.find(p => String(p.outcome ?? '').toLowerCase() === outcome.toLowerCase());
     if (!row) return 0;
-    const size = Number(row.size);
+    const size = Number(row.current_size);
     return Number.isFinite(size) && size > 0 ? size : 0;
   } catch {
     return null;

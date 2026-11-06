@@ -8,7 +8,7 @@ import {
 } from './store';
 import { DashboardStats, SimulatedTrade } from './types';
 import { CONFIG } from './config';
-import { checkVpnConnectivity, RawActivityItem } from './bullpen';
+import { checkVpnConnectivity, RawActivityItem, unwrapV2, mapPositionV2 } from './bullpen';
 import { detectCategory } from './categories';
 import { tradeCostAdjustedPnl, tradeTotalCosts, costBreakdown } from './simulator';
 import { getCircuitBreakerStatus, resetCircuitBreaker, rollingNetForTrader } from './risk';
@@ -676,9 +676,9 @@ export function startDashboard(): void {
     }
     try {
       const raw = await httpsGet(
-        `https://data-api.polymarket.com/positions?user=${addr}&sizeThreshold=.1`
+        `https://data-api.polymarket.com/v2/positions?user=${addr}&limit=500`
       );
-      const positions = Array.isArray(raw) ? raw : [];
+      const positions = unwrapV2(raw).map(mapPositionV2);
       positionsCache.set(addr, { data: positions, ts: Date.now() });
       res.json(positions);
     } catch (err) {
@@ -700,9 +700,9 @@ export function startDashboard(): void {
     }
     try {
       const raw = await httpsGet(
-        `https://data-api.polymarket.com/positions?user=${addr}&limit=500`
+        `https://data-api.polymarket.com/v2/positions?user=${addr}&limit=500`
       );
-      const positions = Array.isArray(raw) ? raw as Record<string, unknown>[] : [];
+      const positions = unwrapV2(raw).map(mapPositionV2);
 
       const totalPositions = positions.length;
 
@@ -742,9 +742,9 @@ export function startDashboard(): void {
       let activeSince: string | null = null;
       try {
         const earliestRaw = await httpsGet(
-          `https://data-api.polymarket.com/activity?user=${addr}&limit=1&type=TRADE&sortDirection=ASC`
+          `https://data-api.polymarket.com/v2/activity?user=${addr}&limit=1&type=TRADE&sortDirection=ASC`
         );
-        const earliest = Array.isArray(earliestRaw) ? earliestRaw as Record<string, unknown>[] : [];
+        const earliest = unwrapV2(earliestRaw);
         if (earliest[0] && earliest[0].timestamp) {
           activeSince = new Date(Number(earliest[0].timestamp) * 1000).toISOString();
         }

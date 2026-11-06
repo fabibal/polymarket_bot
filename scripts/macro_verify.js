@@ -1,6 +1,8 @@
 // Verify top "low-trade-count" Falcon candidates are actually macro (not scalpers).
 const https = require('https');
-const DATA_API = 'https://data-api.polymarket.com';
+// Data API v2 (v1 retired 2026-11-02): cursor paging, snake_case rows.
+const DATA_API = 'https://data-api.polymarket.com/v2';
+const { nextCursor, rowsOf } = require('./dataapi_v2');
 
 function get(url, timeoutMs=15000) {
   return new Promise((resolve,reject) => {
@@ -17,15 +19,18 @@ function get(url, timeoutMs=15000) {
 }
 async function fetchActivity(address, maxTrades=1500) {
   const out = []; const PAGE = 500;
+  let cursor = null;
   for (let page=0; page*PAGE < maxTrades; page++) {
-    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=${PAGE}&offset=${page*PAGE}`;
-    let data; try { data = await get(url); } catch(e){ console.error(e.message); break; }
-    if (!Array.isArray(data) || data.length === 0) break;
+    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=${PAGE}`
+      + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+    let body, data; try { body = await get(url); data = rowsOf(body); } catch(e){ console.error(e.message); break; }
+    if (data.length === 0) break;
     for (const it of data) {
       if (it.type !== 'TRADE') continue;
       out.push({ ts: typeof it.timestamp==='number'?it.timestamp*1000:0, slug:String(it.slug||''), outcome:String(it.outcome||''), side:String(it.side||'').toUpperCase(), price:Number(it.price||0), size:Number(it.size||0) });
     }
-    if (data.length < PAGE) break;
+    cursor = nextCursor(body);
+    if (!cursor) break;
   }
   return out;
 }

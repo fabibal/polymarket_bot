@@ -3,7 +3,9 @@
 const https = require('https');
 const Database = require('better-sqlite3');
 
-const DATA_API = 'https://data-api.polymarket.com';
+// Data API v2 (v1 retired 2026-11-02): cursor paging, snake_case rows.
+const DATA_API = 'https://data-api.polymarket.com/v2';
+const { nextCursor, rowsOf } = require('./dataapi_v2');
 const FALCON_URL = 'https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized';
 const KEY = process.env.POLYMARKET_ANALYTICS_API_KEY || '';
 const CONCURRENCY = 8;
@@ -66,12 +68,14 @@ async function fetchFalcon(period) {
 // Fetch activity, stop when items pre-date 90d cutoff.
 async function fetch90dActivity(address) {
   const out=[];
+  let cursor = null;
   for (let p=0; p<MAX_PAGES; p++) {
-    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=${PAGE}&offset=${p*PAGE}`;
-    let data;
-    try { data = await get(url); }
+    const url = `${DATA_API}/activity?user=${encodeURIComponent(address)}&limit=${PAGE}`
+      + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '');
+    let body, data;
+    try { body = await get(url); data = rowsOf(body); }
     catch(e){ return { error: e.message, trades: out }; }
-    if (!Array.isArray(data) || data.length === 0) break;
+    if (data.length === 0) break;
     let hitCutoff=false;
     for (const it of data) {
       if (it.type !== 'TRADE') continue;
@@ -79,7 +83,8 @@ async function fetch90dActivity(address) {
       if (ts < CUTOFF) { hitCutoff=true; continue; }
       out.push({ ts, slug:String(it.slug||''), outcome:String(it.outcome||''), side:String(it.side||'').toUpperCase(), price:Number(it.price||0), size:Number(it.size||0) });
     }
-    if (hitCutoff || data.length < PAGE) break;
+    cursor = nextCursor(body);
+    if (hitCutoff || !cursor) break;
   }
   return { trades: out };
 }

@@ -49,6 +49,7 @@ observation-ledger, risk-control, persistence, and sizing-research designs are
 documented in `docs/decisions.md`.
 
 ## Bullpen API gotchas
+- **Data API v1 is retired (HTTP 410 since 2026-11-02).** Use `https://data-api.polymarket.com/v2/...`: rows are snake_case in `{data, pagination:{has_more,next_cursor}}`, paging is cursor-only (`offset` -> HTTP 400), `limit` max 1000, positions filter is `condition=` (not `market=`), `current_size` replaces `size`. `/v2/positions` lists unredeemed lost positions (`REDEEMABLE`, price 0). Adapters: `unwrapV2`/`mapPositionV2` in `src/bullpen.ts`, `scripts/dataapi_v2.js` for the scripts (v1 field names kept). `/closed-positions` is `/v2/positions?status=CLOSED`; leaderboard rows use `user_id`/`volume`.
 - `data leaderboard` and `activity` return direct JSON arrays, **not** `{items: []}`.
 - `price` returns `{outcomes: [{outcome, midpoint, last_trade, best_bid, best_ask}]}` — `outcomes` is an ARRAY, not a keyed map.
 - Leaderboard `pnl` / `volume` are STRINGS → wrap in `Number()`.

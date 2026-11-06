@@ -59,7 +59,9 @@ const CACHE = process.env.BACKTEST_CACHE || '/cache';
 const REFRESH = process.env.BACKTEST_REFRESH === '1';
 const FEES = process.env.BACKTEST_FEES !== '0'; // current per-market taker fees on every copy leg
 
-const DATA = 'https://data-api.polymarket.com';
+// Data API v2 (v1 retired 2026-11-02): cursor paging, no depth cap; rows are mapped
+// back to v1 names so the cached activity files keep their format.
+const { V2: DATA, collect, rowsOf, v1Activity } = require('./dataapi_v2');
 const GAMMA = 'https://gamma-api.polymarket.com';
 const CLOB = 'https://clob.polymarket.com';
 // drpc serves archive receipts; publicnode is pruned (null for txs older than ~weeks).
@@ -78,8 +80,7 @@ const MAX_HOLD_MS = 7 * 86_400_000;
 const MIN_ORDER_SHARES = 5;
 const MIRROR_PEAK_CAPITAL = WALLET_CAP;
 
-const ACTIVITY_PAGE = 500;       // /activity silently caps limit at 500
-const ACTIVITY_MAX_OFFSET = 4500; // offset 5000 still works, 10000 is HTTP 400
+const ACTIVITY_PAGE = 1000;      // v2 /activity: limit max 1000, cursor paging has no depth cap
 const COST_MULTS = [0, 0.8, 1, 2];
 const BOOT_ITERS = 10_000;
 
@@ -125,23 +126,15 @@ const KEEP = ['timestamp', 'type', 'side', 'conditionId', 'outcomeIndex', 'outco
 const slim = r => Object.fromEntries(KEEP.map(k => [k, r[k]]));
 
 async function fetchSlice(start, end) {
-  const out = [];
-  for (let offset = 0; offset <= ACTIVITY_MAX_OFFSET; offset += ACTIVITY_PAGE) {
-    const page = await getJson(`${DATA}/activity?user=${ADDRESS}&start=${start}&end=${end}&limit=${ACTIVITY_PAGE}&offset=${offset}`);
-    out.push(...page.map(slim));
-    if (page.length < ACTIVITY_PAGE) return out;
-  }
-  // Slice denser than the offset cap: split it (re-fetches the slice, rare).
-  const mid = Math.floor((start + end) / 2);
-  if (mid <= start) throw new Error(`activity slice ${start}-${end} exceeds the offset cap`);
-  return [...await fetchSlice(start, mid), ...await fetchSlice(mid + 1, end)];
+  const { rows } = await collect(getJson,
+    `${DATA}/activity?user=${ADDRESS}&start=${start}&end=${end}&limit=${ACTIVITY_PAGE}`);
+  return rows.map(r => slim(v1Activity(r)));
 }
 
 async function fetchActivity() {
-  const first = await getJson(`${DATA}/activity?user=${ADDRESS}&limit=1&sortDirection=ASC`);
+  const first = rowsOf(await getJson(`${DATA}/activity?user=${ADDRESS}&limit=1&sortDirection=ASC`));
   if (!first.length) return [];
-  // 30-day slices (unix seconds): one page for quiet traders; fetchSlice
-  // halves any slice that hits the offset cap.
+  // 30-day slices (unix seconds), fetched in parallel; each pages by cursor.
   const SLICE = 30 * 86400;
   const t0 = Math.floor(first[0].timestamp / 86400) * 86400;
   const now = Math.floor(Date.now() / 1000);

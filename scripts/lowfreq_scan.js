@@ -41,7 +41,8 @@ const { execFile } = require('child_process');
 const WORK = process.env.LOWFREQ_WORK || '/work';
 const AUTO_ADD = process.env.LOWFREQ_AUTO_ADD === '1';
 const DASH = 'http://localhost:8080';
-const DATA = 'https://data-api.polymarket.com';
+// Data API v2 (v1 retired 2026-11-02); adapters keep the v1 field names below.
+const { V2: DATA, collect, nextCursor, rowsOf, v1Activity, v1Position, v1Leaderboard } = require('./dataapi_v2');
 const NOW_S = Date.now() / 1000;
 const DAY_S = 86400;
 
@@ -110,15 +111,21 @@ async function loadPolymarketPool() {
     for (const cat of ['OVERALL', 'POLITICS', 'SPORTS', 'CRYPTO', 'ECONOMICS', 'CULTURE']) queries.push({ tp, cat });
   }
   await pool(queries, async ({ tp, cat }) => {
-    for (let off = 0; off < 1000; off += 50) {
-      let rows;
-      try { rows = await getJson(`${DATA}/v1/leaderboard?timePeriod=${tp}&orderBy=PNL&category=${cat}&limit=50&offset=${off}`); }
-      catch { break; }
-      for (const r of rows || []) {
+    let cursor = null;
+    for (let seen = 0; seen < 1000;) {
+      let body, rows;
+      try {
+        body = await getJson(`${DATA}/leaderboard?timePeriod=${tp}&orderBy=PNL&category=${cat}&limit=100`
+          + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''));
+        rows = rowsOf(body).map(v1Leaderboard);
+      } catch { break; }
+      for (const r of rows) {
         const a = String(r.proxyWallet || '').toLowerCase();
         if (a) out.set(a, { pnl: Number(r.pnl) || 0, vol: Number(r.vol) || 0, name: r.userName || null });
       }
-      if (!rows || rows.length < 50) break;
+      seen += rows.length;
+      cursor = nextCursor(body);
+      if (!cursor || !rows.length) break;
     }
   }, 3);
   return out;
@@ -183,12 +190,12 @@ function stage2(bullpen, polymarket, skip) {
 
 // ── Stage 3: activity profile ───────────────────────────────────────────────
 async function profile(a) {
-  const act = await getJson(`${DATA}/activity?user=${a}&limit=500`);
-  if (!Array.isArray(act) || !act.length) return null;
+  const act = rowsOf(await getJson(`${DATA}/activity?user=${a}&limit=500`)).map(v1Activity);
+  if (!act.length) return null;
   const trades30 = act.filter(x => x.type === 'TRADE' && x.timestamp >= NOW_S - 30 * DAY_S);
   const count = t => act.filter(x => x.type === t).length;
-  const all = await getJson(`${DATA}/trades?user=${a}&limit=500&takerOnly=false`);
-  const taker = await getJson(`${DATA}/trades?user=${a}&limit=500&takerOnly=true`);
+  const all = rowsOf(await getJson(`${DATA}/trades?user=${a}&limit=500&takerOnly=false`)).map(v1Activity);
+  const taker = rowsOf(await getJson(`${DATA}/trades?user=${a}&limit=500&takerOnly=true`)).map(v1Activity);
   const since = Math.min(...all.map(x => x.timestamp), NOW_S);
   return {
     idleDays: (NOW_S - Math.max(...act.map(x => x.timestamp))) / DAY_S,
@@ -210,16 +217,18 @@ function stage3Pass(p) {
 // ── Stage 4: realised quality (closed + open netted) ────────────────────────
 async function quality(a) {
   const horizon = NOW_S - 180 * DAY_S;
-  const closed = [];
-  for (let off = 0; off < 5000; off += 50) {
-    const page = await getJson(`${DATA}/closed-positions?user=${a}&limit=50&offset=${off}&sortBy=TIMESTAMP&sortDirection=DESC`);
-    closed.push(...page);
-    if (page.length < 50 || page[page.length - 1].timestamp < horizon) break;
-  }
+  // v2 has no /closed-positions: closed positions are /positions?status=CLOSED,
+  // newest closing time first (v1 walked up to 5000 rows, newest first).
+  const { rows: closedRows } = await collect(getJson,
+    `${DATA}/positions?user=${a}&status=CLOSED&limit=500&sortBy=TIMESTAMP&sortDirection=DESC`,
+    { maxRows: 5000, stop: page => page.length > 0 && page[page.length - 1].last_event_at < horizon });
+  const closed = closedRows.map(v1Position);
   const pnl = closed.filter(x => x.timestamp >= horizon).map(x => Number(x.realizedPnl) || 0);
   const gains = pnl.filter(v => v > 0).reduce((s, v) => s + v, 0);
-  const open = await getJson(`${DATA}/positions?user=${a}&sizeThreshold=1&limit=500`);
-  const openPnl = (open || []).reduce((s, x) => s + (Number(x.cashPnl) || 0), 0);
+  // Held positions incl. unredeemed losers (REDEEMABLE at price 0), as v1 returned them.
+  const open = rowsOf(await getJson(`${DATA}/positions?user=${a}&limit=500`)).map(v1Position)
+    .filter(x => Number(x.size) >= 1); // v1 sizeThreshold=1
+  const openPnl = open.reduce((s, x) => s + (Number(x.cashPnl) || 0), 0);
   const closedPnl = pnl.reduce((s, v) => s + v, 0);
   return {
     closed180: pnl.length, closedPnl, openPnl, net: closedPnl + openPnl,
